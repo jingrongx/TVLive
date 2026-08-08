@@ -1,0 +1,25 @@
+# Gradle
+.gradle/
+build/
+app/build/
+gradle-8.2-bin.zip
+
+# Local config
+local.properties
+
+# Logs
+*.log
+app_log.txt
+logcat.txt
+logcat_full.txt
+
+# Screenshots
+*.png
+
+# IDE
+.idea/
+*.iml
+
+# Keystore
+*.keystore
+*.jks
