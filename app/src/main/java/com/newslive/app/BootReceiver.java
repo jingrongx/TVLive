@@ -25,7 +25,10 @@ public class BootReceiver extends BroadcastReceiver {
                 || action.equals("android.intent.action.LOCKED_BOOT_COMPLETED")
                 || action.equals("android.intent.action.USER_PRESENT")
                 || action.equals("android.intent.action.SCREEN_ON")
-                || action.equals("com.android.launcher.action.INSTALL_SHORTCUT")) {
+                || action.equals("com.android.launcher.action.INSTALL_SHORTCUT")
+                // 调试用：可用 adb 模拟发送验证 BootReceiver 拉起 MainActivity 的链路
+                // am broadcast -a com.newslive.app.TEST_BOOT -n com.newslive.app/.BootReceiver
+                || action.equals("com.newslive.app.TEST_BOOT")) {
             launchMainActivity(context);
         }
     }

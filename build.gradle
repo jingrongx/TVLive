@@ -2,6 +2,11 @@ plugins {
     id 'com.android.application' version '8.2.0' apply false
 }
 
+// 将 buildDir 重定向到英文路径，绕过 Windows 中文路径文件锁 bug
+allprojects {
+    buildDir = file("D:/code/tmplive/" + name + "_build")
+}
+
 task clean(type: Delete) {
     delete rootProject.buildDir
 }

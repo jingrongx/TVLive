@@ -196,28 +196,24 @@
         android:layout_gravity="center"
         android:visibility="gone" />
 
-    <!-- 右上角信息面板：农历/节气/时间/地点/天气 -->
+    <!-- 顶部信息横幅条：28dp 超窄，三栏铺开（农历/时辰/节气 | 日期时间 | 地点+天气） -->
     <LinearLayout
         android:id="@+id/info_overlay"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="top|end"
-        android:layout_marginTop="10dp"
-        android:layout_marginEnd="10dp"
-        android:orientation="vertical"
-        android:gravity="end"
-        android:background="#8C000000"
+        android:layout_width="match_parent"
+        android:layout_height="28dp"
+        android:layout_gravity="top"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="#A6000000"
         android:paddingStart="12dp"
         android:paddingEnd="12dp"
-        android:paddingTop="8dp"
-        android:paddingBottom="8dp"
         android:clickable="false"
         android:focusable="false">
 
-        <!-- 第一行：农历 + 节气胶囊 -->
+        <!-- 左栏：农历 + 时辰 + 节气胶囊 -->
         <LinearLayout
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:layout_height="match_parent"
             android:orientation="horizontal"
             android:gravity="center_vertical">
 
@@ -225,75 +221,72 @@
                 android:id="@+id/tv_lunar"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="丙午年 五月廿九"
-                android:textColor="#FFD54F"
-                android:textSize="14sp"
+                android:text="丙午年 六月廿六"
+                android:textColor="#FFD600"
+                android:textSize="13sp"
                 android:textStyle="bold"
                 android:shadowColor="#000000"
                 android:shadowDx="1"
                 android:shadowDy="1"
-                android:shadowRadius="2" />
+                android:shadowRadius="3" />
+
+            <TextView
+                android:id="@+id/tv_shichen"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="未正二刻"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:shadowColor="#000000"
+                android:shadowDx="1"
+                android:shadowDy="1"
+                android:shadowRadius="3" />
 
             <TextView
                 android:id="@+id/tv_jieqi"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="6dp"
+                android:layout_marginStart="8dp"
                 android:text="距处暑 15天"
-                android:textColor="#81D4FA"
-                android:textSize="11sp"
+                android:textColor="#FF6D00"
+                android:textSize="12sp"
                 android:textStyle="bold"
-                android:paddingStart="7dp"
-                android:paddingEnd="7dp"
-                android:paddingTop="1dp"
-                android:paddingBottom="1dp" />
+                android:paddingStart="5dp"
+                android:paddingEnd="5dp"
+                android:paddingTop="0dp"
+                android:paddingBottom="0dp"
+                android:background="#26FF6D00"
+                android:shadowColor="#000000"
+                android:shadowDx="1"
+                android:shadowDy="1"
+                android:shadowRadius="2" />
 
         </LinearLayout>
 
-        <!-- 第二行：公历日期 -->
+        <!-- 中栏：公历日期时间（弹性占据中间空间，居中） -->
         <TextView
-            android:id="@+id/tv_solar_date"
-            android:layout_width="wrap_content"
+            android:id="@+id/tv_date_time"
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:layout_marginTop="1dp"
-            android:text="2026年08月08日 周五"
+            android:layout_weight="1"
+            android:layout_marginStart="12dp"
+            android:layout_marginEnd="12dp"
+            android:text="2026年08月08日 周五 14:30:25"
             android:textColor="#FFFFFF"
-            android:textSize="14sp"
+            android:textSize="13sp"
             android:textStyle="bold"
-            android:gravity="end"
-            android:shadowColor="#000000"
-            android:shadowDx="1"
-            android:shadowDy="1"
-            android:shadowRadius="2" />
-
-        <!-- 第三行：时间 -->
-        <TextView
-            android:id="@+id/tv_time"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="1dp"
-            android:text="14:30:25"
-            android:textColor="#FFFFFF"
-            android:textSize="24sp"
-            android:textStyle="bold"
-            android:gravity="end"
+            android:gravity="center"
             android:shadowColor="#000000"
             android:shadowDx="1"
             android:shadowDy="1"
             android:shadowRadius="3" />
 
-        <!-- 分隔线 -->
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="1dp"
-            android:layout_marginTop="5dp"
-            android:layout_marginBottom="4dp"
-            android:background="#33FFFFFF" />
-
-        <!-- 第四行：地点 + 天气三列并排 -->
+        <!-- 右栏：地点 + 分隔线 + 天气三列 -->
         <LinearLayout
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:layout_height="match_parent"
             android:orientation="horizontal"
             android:gravity="center_vertical">
 
@@ -302,119 +295,159 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="📍 定位中..."
-                android:textColor="#FFD54F"
-                android:textSize="11sp"
+                android:textColor="#FFD600"
+                android:textSize="13sp"
                 android:textStyle="bold"
                 android:shadowColor="#000000"
                 android:shadowDx="1"
                 android:shadowDy="1"
-                android:shadowRadius="2" />
+                android:shadowRadius="3" />
 
+            <View
+                android:layout_width="1dp"
+                android:layout_height="12dp"
+                android:layout_marginStart="8dp"
+                android:layout_marginEnd="8dp"
+                android:background="#4DFFFFFF" />
+
+            <!-- 天气三列横排：今/明/后 -->
             <LinearLayout
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
+                android:layout_height="match_parent"
                 android:orientation="horizontal"
                 android:gravity="center_vertical">
 
                 <!-- 今天 -->
                 <LinearLayout
                     android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginEnd="8dp"
-                    android:orientation="vertical"
-                    android:gravity="center">
+                    android:layout_height="match_parent"
+                    android:layout_marginEnd="6dp"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
 
                     <TextView
                         android:id="@+id/tv_w0_label"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="今天"
-                        android:textColor="#B3FFFFFF"
-                        android:textSize="9sp" />
+                        android:text="今"
+                        android:textColor="#D9FFFFFF"
+                        android:textSize="11sp"
+                        android:textStyle="bold"
+                        android:shadowColor="#000000"
+                        android:shadowDx="1"
+                        android:shadowDy="1"
+                        android:shadowRadius="2" />
 
                     <TextView
                         android:id="@+id/tv_w0_icon"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
+                        android:layout_marginStart="2dp"
                         android:text="☀️"
-                        android:textSize="14sp" />
+                        android:textSize="15sp" />
 
                     <TextView
                         android:id="@+id/tv_w0_temp"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
+                        android:layout_marginStart="2dp"
                         android:text="--°/--°"
-                        android:textColor="#81D4FA"
-                        android:textSize="10sp"
-                        android:textStyle="bold" />
+                        android:textColor="#FF6D00"
+                        android:textSize="12sp"
+                        android:textStyle="bold"
+                        android:shadowColor="#000000"
+                        android:shadowDx="1"
+                        android:shadowDy="1"
+                        android:shadowRadius="2" />
 
                 </LinearLayout>
 
                 <!-- 明天 -->
                 <LinearLayout
                     android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginEnd="8dp"
-                    android:orientation="vertical"
-                    android:gravity="center">
+                    android:layout_height="match_parent"
+                    android:layout_marginEnd="6dp"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
 
                     <TextView
                         android:id="@+id/tv_w1_label"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="明天"
-                        android:textColor="#B3FFFFFF"
-                        android:textSize="9sp" />
+                        android:text="明"
+                        android:textColor="#D9FFFFFF"
+                        android:textSize="11sp"
+                        android:textStyle="bold"
+                        android:shadowColor="#000000"
+                        android:shadowDx="1"
+                        android:shadowDy="1"
+                        android:shadowRadius="2" />
 
                     <TextView
                         android:id="@+id/tv_w1_icon"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
+                        android:layout_marginStart="2dp"
                         android:text="⛅"
-                        android:textSize="14sp" />
+                        android:textSize="15sp" />
 
                     <TextView
                         android:id="@+id/tv_w1_temp"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
+                        android:layout_marginStart="2dp"
                         android:text="--°/--°"
-                        android:textColor="#81D4FA"
-                        android:textSize="10sp"
-                        android:textStyle="bold" />
+                        android:textColor="#FF6D00"
+                        android:textSize="12sp"
+                        android:textStyle="bold"
+                        android:shadowColor="#000000"
+                        android:shadowDx="1"
+                        android:shadowDy="1"
+                        android:shadowRadius="2" />
 
                 </LinearLayout>
 
                 <!-- 后天 -->
                 <LinearLayout
                     android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:orientation="vertical"
-                    android:gravity="center">
+                    android:layout_height="match_parent"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
 
                     <TextView
                         android:id="@+id/tv_w2_label"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="后天"
-                        android:textColor="#B3FFFFFF"
-                        android:textSize="9sp" />
+                        android:text="后"
+                        android:textColor="#D9FFFFFF"
+                        android:textSize="11sp"
+                        android:textStyle="bold"
+                        android:shadowColor="#000000"
+                        android:shadowDx="1"
+                        android:shadowDy="1"
+                        android:shadowRadius="2" />
 
                     <TextView
                         android:id="@+id/tv_w2_icon"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
+                        android:layout_marginStart="2dp"
                         android:text="🌧️"
-                        android:textSize="14sp" />
+                        android:textSize="15sp" />
 
                     <TextView
                         android:id="@+id/tv_w2_temp"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
+                        android:layout_marginStart="2dp"
                         android:text="--°/--°"
-                        android:textColor="#81D4FA"
-                        android:textSize="10sp"
-                        android:textStyle="bold" />
+                        android:textColor="#FF6D00"
+                        android:textSize="12sp"
+                        android:textStyle="bold"
+                        android:shadowColor="#000000"
+                        android:shadowDx="1"
+                        android:shadowDy="1"
+                        android:shadowRadius="2" />
 
                 </LinearLayout>
 
