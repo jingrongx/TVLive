@@ -46,6 +46,7 @@
                 <action android:name="com.huawei.powergenie.manager.STATE_CHANGE" />
                 <action android:name="android.intent.action.USER_PRESENT" />
                 <action android:name="android.intent.action.SCREEN_ON" />
+                <action android:name="com.newslive.app.TEST_BOOT" />
             </intent-filter>
         </receiver>
 

@@ -84,6 +84,9 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_LOCK_ORIENTATION = "lock_orientation";
     private static final String KEY_PLAYER_MODE_ENABLED = "player_mode_enabled";
     private static final String KEY_PLAYER_VIDEO_URLS = "player_video_urls";
+    private static final String KEY_BANNER_VISIBLE = "banner_visible";
+    private static final String KEY_BANNER_FONT_SIZE = "banner_font_size";
+    private static final String KEY_BANNER_HEIGHT = "banner_height";
     private static final int HTTP_PORT = 8765;
     
     private static final String DEFAULT_REMOTE_URL = "https://gitee.com/xujingrong/tv-live-config/raw/master/tv-live-source.json";
@@ -150,22 +153,30 @@ public class MainActivity extends AppCompatActivity {
     // 右上角信息面板
     private TextView tvLunar;
     private TextView tvJieqi;
-    private TextView tvSolarDate;
-    private TextView tvTime;
+    private TextView tvShichen;
+    private TextView tvDateTime;
     private TextView tvLocation;
     private TextView tvW0Label, tvW0Icon, tvW0Temp;
     private TextView tvW1Label, tvW1Icon, tvW1Temp;
     private TextView tvW2Label, tvW2Icon, tvW2Temp;
     private Handler clockHandler;
     private Runnable clockRunnable;
+    private Handler weatherRefreshHandler;
+    private Runnable weatherRefreshRunnable;
     private double lastLatitude = 0;
     private double lastLongitude = 0;
     private int lastComputedDay = -1;
+    private int lastShichenMinute = -1;
     private int errorRetryCount = 0;
     private static final int MAX_RETRY_COUNT = 3;
 
     private boolean useWebMode = true;
     private boolean isStreamListEnabled = true;
+    // 顶部信息横幅设置
+    private android.view.View infoOverlay;
+    private boolean bannerVisible = true;
+    private int bannerFontSize = 13;   // 基准字号 sp
+    private int bannerHeight = 28;      // 横幅高度 dp
     private String webSourceUrl = DEFAULT_WEB_SOURCE_URL;
     private String currentVideoUrl = "";
     private String currentVideoName = "";
@@ -181,6 +192,8 @@ public class MainActivity extends AppCompatActivity {
     private ConnectivityManager.NetworkCallback networkCallback;
     private ConnectivityManager connectivityManager;
     private boolean isNetworkAvailable = true;
+    private boolean wasNetworkLostWhilePaused = false;
+    private long pausedAt = 0;
     
     private ExecutorService executorService;
     
@@ -232,10 +245,11 @@ public class MainActivity extends AppCompatActivity {
         controlPanel = findViewById(R.id.control_panel);
 
         // 初始化右上角信息面板
+        infoOverlay = findViewById(R.id.info_overlay);
         tvLunar = findViewById(R.id.tv_lunar);
         tvJieqi = findViewById(R.id.tv_jieqi);
-        tvSolarDate = findViewById(R.id.tv_solar_date);
-        tvTime = findViewById(R.id.tv_time);
+        tvShichen = findViewById(R.id.tv_shichen);
+        tvDateTime = findViewById(R.id.tv_date_time);
         tvLocation = findViewById(R.id.tv_location);
         tvW0Label = findViewById(R.id.tv_w0_label);
         tvW0Icon = findViewById(R.id.tv_w0_icon);
@@ -247,7 +261,9 @@ public class MainActivity extends AppCompatActivity {
         tvW2Icon = findViewById(R.id.tv_w2_icon);
         tvW2Temp = findViewById(R.id.tv_w2_temp);
         startClock();
+        applyBannerStyle();
         requestLocationAndWeather();
+        startWeatherRefresh();
 
         btnNextSource.setOnClickListener(v -> {
             if (useWebMode) {
@@ -386,6 +402,7 @@ public class MainActivity extends AppCompatActivity {
     
     private void onNetworkLost() {
         Toast.makeText(this, "网络已断开", Toast.LENGTH_SHORT).show();
+        wasNetworkLostWhilePaused = true;
         
         if (player != null && player.isPlaying()) {
             player.setPlayWhenReady(false);
@@ -579,6 +596,9 @@ public class MainActivity extends AppCompatActivity {
         bufferMaxMs = prefs.getInt(KEY_BUFFER_MAX, 60000);
         useWebMode = prefs.getBoolean(KEY_USE_WEB_MODE, true);
         isStreamListEnabled = prefs.getBoolean(KEY_PLAYER_MODE_ENABLED, true);
+        bannerVisible = prefs.getBoolean(KEY_BANNER_VISIBLE, true);
+        bannerFontSize = prefs.getInt(KEY_BANNER_FONT_SIZE, 13);
+        bannerHeight = prefs.getInt(KEY_BANNER_HEIGHT, 28);
         webSourceUrl = prefs.getString(KEY_WEB_SOURCE_URL, DEFAULT_WEB_SOURCE_URL);
         isOrientationLocked = prefs.getBoolean(KEY_LOCK_ORIENTATION, false);
         currentSiteIndex = prefs.getInt(KEY_CURRENT_SITE_INDEX, 0);
@@ -683,6 +703,41 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ==================== 右上角时钟 ====================
+    // 应用顶部信息横幅样式：可见性、字号、高度
+    private void applyBannerStyle() {
+        if (infoOverlay == null) return;
+        infoOverlay.setVisibility(bannerVisible ? android.view.View.VISIBLE : android.view.View.GONE);
+        if (!bannerVisible) return;
+        // 高度（dp→px）
+        float density = getResources().getDisplayMetrics().density;
+        int heightPx = (int) (bannerHeight * density + 0.5f);
+        android.view.ViewGroup.LayoutParams lp = infoOverlay.getLayoutParams();
+        if (lp != null && lp.height != heightPx) {
+            lp.height = heightPx;
+            infoOverlay.setLayoutParams(lp);
+        }
+        // 字号：基准 = bannerFontSize
+        // 主文字=基准；节气/温度=基准-1；标签=基准-2；图标=基准+2
+        float base = bannerFontSize;
+        float sub = Math.max(base - 1, 8);
+        float label = Math.max(base - 2, 8);
+        float icon = base + 2;
+        if (tvLunar != null) tvLunar.setTextSize(base);
+        if (tvShichen != null) tvShichen.setTextSize(base);
+        if (tvDateTime != null) tvDateTime.setTextSize(base);
+        if (tvLocation != null) tvLocation.setTextSize(base);
+        if (tvJieqi != null) tvJieqi.setTextSize(sub);
+        for (TextView tv : new TextView[]{tvW0Label, tvW1Label, tvW2Label}) {
+            if (tv != null) tv.setTextSize(label);
+        }
+        for (TextView tv : new TextView[]{tvW0Icon, tvW1Icon, tvW2Icon}) {
+            if (tv != null) tv.setTextSize(icon);
+        }
+        for (TextView tv : new TextView[]{tvW0Temp, tvW1Temp, tvW2Temp}) {
+            if (tv != null) tv.setTextSize(sub);
+        }
+    }
+
     private void startClock() {
         clockHandler = new Handler(Looper.getMainLooper());
         clockRunnable = new Runnable() {
@@ -695,14 +750,53 @@ public class MainActivity extends AppCompatActivity {
         clockHandler.post(clockRunnable);
     }
 
+    // ==================== 天气定时刷新（每30分钟）====================
+    private void startWeatherRefresh() {
+        // 幂等：先移除旧回调，避免重复创建多个定时器
+        if (weatherRefreshHandler == null) {
+            weatherRefreshHandler = new Handler(Looper.getMainLooper());
+        }
+        if (weatherRefreshRunnable == null) {
+            weatherRefreshRunnable = new Runnable() {
+                @Override
+                public void run() {
+                    if (lastLatitude != 0 && lastLongitude != 0) {
+                        android.util.Log.i("NewsLive", "定时刷新天气");
+                        fetchWeather(lastLatitude, lastLongitude);
+                    }
+                    weatherRefreshHandler.postDelayed(this, 30 * 60 * 1000);
+                }
+            };
+        }
+        weatherRefreshHandler.removeCallbacks(weatherRefreshRunnable);
+        weatherRefreshHandler.postDelayed(weatherRefreshRunnable, 30 * 60 * 1000);
+    }
+
     private void updateClock() {
-        if (tvTime == null) return;
+        if (tvDateTime == null) return;
         try {
             java.util.Calendar cal = java.util.Calendar.getInstance();
+            int year = cal.get(java.util.Calendar.YEAR);
+            int month = cal.get(java.util.Calendar.MONTH) + 1;
+            int day = cal.get(java.util.Calendar.DAY_OF_MONTH);
+            int weekday = cal.get(java.util.Calendar.DAY_OF_WEEK);
             int hour = cal.get(java.util.Calendar.HOUR_OF_DAY);
             int minute = cal.get(java.util.Calendar.MINUTE);
             int second = cal.get(java.util.Calendar.SECOND);
-            tvTime.setText(String.format("%02d:%02d:%02d", hour, minute, second));
+            String[] weekNames = {"日", "一", "二", "三", "四", "五", "六"};
+
+            // 合并显示：公历年月日 星期 时分秒
+            tvDateTime.setText(String.format("%d年%02d月%02d日 周%s %02d:%02d:%02d",
+                    year, month, day, weekNames[weekday - 1], hour, minute, second));
+
+            // 时辰：每分钟更新一次
+            int currentMinute = hour * 60 + minute;
+            if (currentMinute != lastShichenMinute) {
+                lastShichenMinute = currentMinute;
+                if (tvShichen != null) {
+                    tvShichen.setText(ShichenUtil.getShichen(cal));
+                }
+            }
 
             // 日期/农历/节气仅在日期变化时更新
             int todayDay = cal.get(java.util.Calendar.DAY_OF_YEAR);
@@ -719,14 +813,8 @@ public class MainActivity extends AppCompatActivity {
         int year = cal.get(java.util.Calendar.YEAR);
         int month = cal.get(java.util.Calendar.MONTH) + 1;
         int day = cal.get(java.util.Calendar.DAY_OF_MONTH);
-        int weekday = cal.get(java.util.Calendar.DAY_OF_WEEK);
-        String[] weekNames = {"日", "一", "二", "三", "四", "五", "六"};
 
-        android.util.Log.i("NewsLive", "updateDateInfo: " + year + "-" + month + "-" + day + " weekday=" + weekday);
-
-        if (tvSolarDate != null) {
-            tvSolarDate.setText(String.format("%d年%02d月%02d日 周%s", year, month, day, weekNames[weekday - 1]));
-        }
+        android.util.Log.i("NewsLive", "updateDateInfo: " + year + "-" + month + "-" + day);
 
         if (tvLunar != null) {
             try {
@@ -818,7 +906,7 @@ public class MainActivity extends AppCompatActivity {
                 if (name.isEmpty()) name = json.optString("addr", "未知");
 
                 final String finalName = name;
-                runOnUiThread(() -> tvLocation.setText("📍 " + finalName));
+                runOnUiThread(() -> tvLocation.setText("📍 " + shortenLocation(finalName)));
 
                 // pconline不返回坐标，直接用ip-api获取坐标（快速），地理编码仅作ip-api失败时的备用
                 android.util.Log.i("NewsLive", "pconline OK, fetching coords from ip-api");
@@ -911,8 +999,8 @@ public class MainActivity extends AppCompatActivity {
                     fetchWeather(lat, lon);
 
                     if (preferredCityName != null && !preferredCityName.isEmpty()) {
-                        // 优先使用pconline的中文城市名
-                        String finalName = preferredCityName;
+                        // 优先使用pconline的中文城市名，去掉省份只显示市
+                        String finalName = shortenLocation(preferredCityName);
                         runOnUiThread(() -> tvLocation.setText("📍 " + finalName));
                     } else {
                         // 无中文名，用坐标逆地理编码获取中文名
@@ -986,7 +1074,7 @@ public class MainActivity extends AppCompatActivity {
                 }
                 if (name.isEmpty()) name = fallbackName != null ? fallbackName : String.format("%.4f,%.4f", lat, lon);
 
-                String finalName = name;
+                String finalName = shortenLocation(name);
                 runOnUiThread(() -> tvLocation.setText("📍 " + finalName));
             } catch (Exception e) {
                 android.util.Log.e("NewsLive", "nominatim failed", e);
@@ -1023,7 +1111,7 @@ public class MainActivity extends AppCompatActivity {
                     else if (!subdivision.isEmpty()) name = subdivision;
                     if (name.isEmpty()) name = fallbackName != null ? fallbackName : String.format("%.4f,%.4f", lat, lon);
 
-                    String finalName = name;
+                    String finalName = shortenLocation(name);
                     runOnUiThread(() -> tvLocation.setText("📍 " + finalName));
                 } catch (Exception e2) {
                     android.util.Log.e("NewsLive", "bigdatacloud failed", e2);
@@ -1065,7 +1153,7 @@ public class MainActivity extends AppCompatActivity {
                 JSONArray maxTemps = daily.getJSONArray("temperature_2m_max");
                 JSONArray minTemps = daily.getJSONArray("temperature_2m_min");
 
-                final String[] labels = {"今天", "明天", "后天"};
+                final String[] labels = {"今", "明", "后"};
                 final String[] icons = new String[3];
                 final String[] temps = new String[3];
 
@@ -1100,6 +1188,25 @@ public class MainActivity extends AppCompatActivity {
                 });
             }
         });
+    }
+
+    // 缩短定位名称用于叠加层显示：去掉省份，只保留城市名
+    private String shortenLocation(String name) {
+        if (name == null || name.isEmpty()) return "未知";
+        // 去掉空格分隔的多段，只保留最后两段（省 市）或最后一段（市）
+        String[] parts = name.trim().split("\\s+");
+        if (parts.length >= 2) {
+            // 取第二段（通常是市）
+            String city = parts[1];
+            // 去掉"市"后缀
+            if (city.endsWith("市")) city = city.substring(0, city.length() - 1);
+            return city;
+        }
+        // 单段：尝试去掉省/市后缀
+        String result = name.trim();
+        if (result.endsWith("市")) result = result.substring(0, result.length() - 1);
+        else if (result.endsWith("省")) result = result.substring(0, result.length() - 1);
+        return result;
     }
 
     private String weatherCodeToIcon(int code) {
@@ -2353,6 +2460,18 @@ public class MainActivity extends AppCompatActivity {
                 isStreamListEnabled = config.optBoolean("playerModeEnabled", true);
                 prefs.edit().putBoolean(KEY_PLAYER_MODE_ENABLED, isStreamListEnabled).apply();
             }
+            if (config.has("bannerVisible")) {
+                bannerVisible = config.optBoolean("bannerVisible", true);
+                prefs.edit().putBoolean(KEY_BANNER_VISIBLE, bannerVisible).apply();
+            }
+            if (config.has("bannerFontSize")) {
+                bannerFontSize = config.optInt("bannerFontSize", 13);
+                prefs.edit().putInt(KEY_BANNER_FONT_SIZE, bannerFontSize).apply();
+            }
+            if (config.has("bannerHeight")) {
+                bannerHeight = config.optInt("bannerHeight", 28);
+                prefs.edit().putInt(KEY_BANNER_HEIGHT, bannerHeight).apply();
+            }
 
             if (config.has("websites")) {
                 JSONArray websites = config.getJSONArray("websites");
@@ -2390,6 +2509,7 @@ public class MainActivity extends AppCompatActivity {
             currentUrlIndex = 0;
             runOnUiThread(() -> {
                 updatePlayerModeButtons();
+                applyBannerStyle();
                 if (useWebMode) {
                     webViewRetryCount = 0;
                     loadWebSource();
@@ -2542,15 +2662,34 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         hideSystemUI();
-        if (useWebMode && player != null && !currentVideoUrl.isEmpty()) {
+        if (useWebMode && webView != null) {
             webView.resumeTimers();
             webView.onResume();
+            // 后台/休眠唤醒后,直播流已失效,重新加载页面
+            // 条件:网络可用 且 (曾断网 或 离开时间超过30秒)
+            if (isNetworkAvailable && wasNetworkLostWhilePaused) {
+                wasNetworkLostWhilePaused = false;
+                loadWebSource();
+            } else if (isNetworkAvailable && pausedAt > 0 && System.currentTimeMillis() - pausedAt > 30000) {
+                loadWebSource();
+            }
+        }
+        // 恢复天气定时刷新，并立即刷新一次（保证从后台/休眠唤醒后天气为最新）
+        startWeatherRefresh();
+        if (isNetworkAvailable && lastLatitude != 0 && lastLongitude != 0) {
+            android.util.Log.i("NewsLive", "onResume 立即刷新天气");
+            fetchWeather(lastLatitude, lastLongitude);
         }
     }
 
     @Override
     protected void onPause() {
         super.onPause();
+        pausedAt = System.currentTimeMillis();
+        // 后台时暂停天气定时刷新，避免无效网络请求
+        if (weatherRefreshHandler != null && weatherRefreshRunnable != null) {
+            weatherRefreshHandler.removeCallbacks(weatherRefreshRunnable);
+        }
         if (useWebMode) {
             webView.pauseTimers();
             webView.onPause();
@@ -2567,6 +2706,11 @@ public class MainActivity extends AppCompatActivity {
         // 停止时钟
         if (clockHandler != null && clockRunnable != null) {
             clockHandler.removeCallbacks(clockRunnable);
+        }
+
+        // 停止天气定时刷新
+        if (weatherRefreshHandler != null && weatherRefreshRunnable != null) {
+            weatherRefreshHandler.removeCallbacks(weatherRefreshRunnable);
         }
 
         // 清理全屏视图
@@ -2838,6 +2982,15 @@ public class MainActivity extends AppCompatActivity {
                 "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上</div>" +
                 "</div>" +
                 "<div class='section'>" +
+                "<div class='section-title'>📊 顶部信息横幅</div>" +
+                "<label><input type='checkbox' id='bannerVisible' " + (bannerVisible ? "checked" : "") + "> 显示顶部信息横幅（农历/时间/天气）</label>" +
+                "<div class='buffer-inputs' style='margin-top:8px'>" +
+                "<div><label style='display:block;margin-bottom:4px'>字号基准 (9-18)</label><input type='number' id='bannerFontSize' min='9' max='18' style='width:100%' value='" + bannerFontSize + "'></div>" +
+                "<div><label style='display:block;margin-bottom:4px'>区域高度 dp (20-60)</label><input type='number' id='bannerHeight' min='20' max='60' style='width:100%' value='" + bannerHeight + "'></div>" +
+                "</div>" +
+                "<div class='tip'>字号基准：主文字=基准，节气/温度=基准-1，标签=基准-2，图标=基准+2</div>" +
+                "</div>" +
+                "<div class='section'>" +
                 "<div class='section-title'>⚙️ 远程配置</div>" +
                 "<input type='url' id='remoteUrl' placeholder='远程配置URL' value='" + remoteConfigUrl + "'>" +
                 "<label><input type='checkbox' id='autoUpdate' " + (autoUpdateConfig ? "checked" : "") + "> 启动时自动更新</label>" +
@@ -2911,7 +3064,7 @@ public class MainActivity extends AppCompatActivity {
                 "function delPlayerVideo(i){if(confirm('确定删除？')){playerVideos.splice(i,1);renderPlayerVideos();}}" +
                 "function addPlayerVideo(){playerVideos.push({name:'',url:''});renderPlayerVideos();}" +
                 "function fetchRemote(){var url=document.getElementById('remoteUrl').value;if(!url){alert('请输入URL');return;}fetch('/proxy?url='+encodeURIComponent(url)).then(r=>r.json()).then(d=>{if(d.error){alert('获取失败:'+d.error);}else if(d.sources){sources=d.sources;renderSources();alert('获取成功');}else{alert('格式错误');}}).catch(e=>alert('获取失败:'+e));}" +
-                "function saveConfig(){var d={sources:sources,websites:websites,playerVideoUrls:playerVideos,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked};fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>alert('保存成功！')).catch(e=>alert('保存失败:'+e));}" +
+                "function saveConfig(){var d={sources:sources,websites:websites,playerVideoUrls:playerVideos,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28};fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>alert('保存成功！')).catch(e=>alert('保存失败:'+e));}" +
                 "renderSources();" +
                 "renderWebsites();" +
                 "renderPlayerVideos();" +
