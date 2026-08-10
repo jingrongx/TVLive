@@ -83,7 +83,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_WEB_SOURCE_URL = "web_source_url";
     private static final String KEY_WEB_SITES = "web_sites";
     private static final String KEY_WEB_SITES_VERSION = "web_sites_version";
-    private static final int CURRENT_WEB_SITES_VERSION = 3; // 版本号递增以触发配置刷新
+    private static final int CURRENT_WEB_SITES_VERSION = 4; // 版本号递增以触发配置刷新
     private static final String KEY_CURRENT_SITE_INDEX = "current_site_index";
     private static final String KEY_LOCK_ORIENTATION = "lock_orientation";
     private static final String KEY_PLAYER_MODE_ENABLED = "player_mode_enabled";
@@ -100,30 +100,30 @@ public class MainActivity extends AppCompatActivity {
     private static final String[][] DEFAULT_WEB_SITES = {
         {"CCTV13新闻", "https://tv.cctv.com/live/cctv13/m/index.shtml", "1"},
         {"央视新闻直播", "https://m-live.cctvnews.cctv.com/live/landscape.html?liveRoomNumber=16265686808730585228", "0"},
-        {"央视直播大全", "https://tv.cctv.com/live/index.shtml", "1"},
+        {"央视直播大全", "https://tv.cctv.com/live/index.shtml", "0"},
         {"CCTV1综合", "https://tv.cctv.com/live/cctv1/m/index.shtml", "1"},
         {"CCTV2财经", "https://tv.cctv.com/live/cctv2/m/index.shtml", "1"},
         {"CCTV3综艺", "https://tv.cctv.com/live/cctv3/m/index.shtml", "1"},
         {"CCTV4中文国际", "https://tv.cctv.com/live/cctv4/m/index.shtml", "1"},
         {"CCTV5体育", "https://tv.cctv.com/live/cctv5/m/index.shtml", "1"},
-        {"CCTV5+体育赛事", "https://tv.cctv.com/live/cctv5plus/m/index.shtml", "1"},
-        {"CCTV6电影", "https://tv.cctv.com/live/cctv6/m/index.shtml", "1"},
+        {"CCTV5+体育赛事", "https://tv.cctv.com/live/cctv5plus/m/index.shtml", "0"},
+        {"CCTV6电影", "https://tv.cctv.com/live/cctv6/m/index.shtml", "0"},
         {"CCTV7国防军事", "https://tv.cctv.com/live/cctv7/m/index.shtml", "1"},
-        {"CCTV8电视剧", "https://tv.cctv.com/live/cctv8/m/index.shtml", "1"},
-        {"央视频", "https://m.yangshipin.cn", "1"},
-        {"B站", "https://www.bilibili.com", "1"},
-        {"优酷", "https://www.youku.com", "1"},
-        {"爱奇艺", "https://www.iqiyi.com", "1"},
-        {"腾讯视频", "https://v.qq.com", "1"},
-        {"抖音", "https://www.douyin.com", "1"},
-        {"快手", "https://www.kuaishou.com", "1"},
-        {"西瓜视频", "https://www.ixigua.com", "1"},
-        {"芒果TV", "https://www.mgtv.com", "1"},
-        {"搜狐视频", "https://tv.sohu.com", "1"},
-        {"斗鱼直播", "https://www.douyu.com", "1"},
-        {"虎牙直播", "https://www.huya.com", "1"},
-        {"1905电影网", "https://www.1905.com", "1"},
-        {"哔哩哔哩番剧", "https://www.bilibili.com/anime", "1"}
+        {"CCTV8电视剧", "https://tv.cctv.com/live/cctv8/m/index.shtml", "0"},
+        {"央视频", "https://m.yangshipin.cn", "0"},
+        {"B站", "https://www.bilibili.com", "0"},
+        {"优酷", "https://www.youku.com", "0"},
+        {"爱奇艺", "https://www.iqiyi.com", "0"},
+        {"腾讯视频", "https://v.qq.com", "0"},
+        {"抖音", "https://www.douyin.com", "0"},
+        {"快手", "https://www.kuaishou.com", "0"},
+        {"西瓜视频", "https://www.ixigua.com", "0"},
+        {"芒果TV", "https://www.mgtv.com", "0"},
+        {"搜狐视频", "https://tv.sohu.com", "0"},
+        {"斗鱼直播", "https://www.douyu.com", "0"},
+        {"虎牙直播", "https://www.huya.com", "0"},
+        {"1905电影网", "https://www.1905.com", "0"},
+        {"哔哩哔哩番剧", "https://www.bilibili.com/anime", "0"}
     };
     
     private static final int CONNECT_TIMEOUT_MS = 8000;
@@ -190,7 +190,7 @@ public class MainActivity extends AppCompatActivity {
     // 顶部信息横幅设置
     private android.view.View infoOverlay;
     private boolean bannerVisible = true;
-    private int bannerFontSize = 13;   // 基准字号 sp
+    private int bannerFontSize = 16;   // 基准字号 sp
     private int bannerHeight = 28;      // 横幅高度 dp
     private String webSourceUrl = DEFAULT_WEB_SOURCE_URL;
     private String currentVideoUrl = "";
@@ -816,13 +816,13 @@ public class MainActivity extends AppCompatActivity {
 
     private void loadSavedConfig() {
         remoteConfigUrl = prefs.getString(KEY_REMOTE_URL, DEFAULT_REMOTE_URL);
-        autoUpdateConfig = prefs.getBoolean(KEY_AUTO_UPDATE, true);
+        autoUpdateConfig = prefs.getBoolean(KEY_AUTO_UPDATE, false);
         bufferMinMs = prefs.getInt(KEY_BUFFER_MIN, 10000);
         bufferMaxMs = prefs.getInt(KEY_BUFFER_MAX, 60000);
         useWebMode = prefs.getBoolean(KEY_USE_WEB_MODE, true);
         isStreamListEnabled = prefs.getBoolean(KEY_PLAYER_MODE_ENABLED, true);
         bannerVisible = prefs.getBoolean(KEY_BANNER_VISIBLE, true);
-        bannerFontSize = prefs.getInt(KEY_BANNER_FONT_SIZE, 13);
+        bannerFontSize = prefs.getInt(KEY_BANNER_FONT_SIZE, 16);
         bannerHeight = prefs.getInt(KEY_BANNER_HEIGHT, 28);
         webSourceUrl = prefs.getString(KEY_WEB_SOURCE_URL, DEFAULT_WEB_SOURCE_URL);
         isOrientationLocked = prefs.getBoolean(KEY_LOCK_ORIENTATION, false);
@@ -1640,12 +1640,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadDefaultConfig() {
-        streamUrls.add("http://120.76.248.139/live/bfgd/4200000067.m3u8");
-        streamNames.add("CCTV13新闻");
-        streamUrls.add("http://120.76.248.139/live/bfgd/4200000484.m3u8");
-        streamNames.add("CCTV1综合");
-        streamUrls.add("http://120.76.248.139/live/bfgd/4200000061.m3u8");
-        streamNames.add("CCTV2经济");
+        streamUrls.add("https://piccpndali.v.myalicdn.com/audio/cctv13_2.m3u8");
+        streamNames.add("CCTV13新闻FM（仅音频）");
+        streamUrls.add("http://ls.qingting.fm/live/3412131.m3u8?bitrate=64");
+        streamNames.add("音乐FM（仅音频）");
     }
 
     private void parseConfig(JSONObject config) {
