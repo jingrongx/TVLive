@@ -23,6 +23,7 @@ import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.OrientationEventListener;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.WebChromeClient;
@@ -48,6 +49,7 @@ import androidx.media3.common.VideoSize;
 import androidx.media3.common.AudioAttributes;
 import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.exoplayer.DefaultLoadControl;
+import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
 import androidx.media3.ui.PlayerView;
@@ -80,6 +82,8 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_USE_WEB_MODE = "use_web_mode";
     private static final String KEY_WEB_SOURCE_URL = "web_source_url";
     private static final String KEY_WEB_SITES = "web_sites";
+    private static final String KEY_WEB_SITES_VERSION = "web_sites_version";
+    private static final int CURRENT_WEB_SITES_VERSION = 3; // 版本号递增以触发配置刷新
     private static final String KEY_CURRENT_SITE_INDEX = "current_site_index";
     private static final String KEY_LOCK_ORIENTATION = "lock_orientation";
     private static final String KEY_PLAYER_MODE_ENABLED = "player_mode_enabled";
@@ -92,23 +96,34 @@ public class MainActivity extends AppCompatActivity {
     private static final String DEFAULT_REMOTE_URL = "https://gitee.com/xujingrong/tv-live-config/raw/master/tv-live-source.json";
     private static final String DEFAULT_WEB_SOURCE_URL = "https://m-live.cctvnews.cctv.com/live/landscape.html?liveRoomNumber=16265686808730585228";
     
+    // [名称, URL, 启用标记] "1"=启用 "0"=停用，启动时加载到 webSiteNames/webSiteUrls/webSiteEnabled
     private static final String[][] DEFAULT_WEB_SITES = {
-        {"央视新闻直播", "https://m-live.cctvnews.cctv.com/live/landscape.html?liveRoomNumber=16265686808730585228"},
-        {"央视直播大全", "https://tv.cctv.com/live/index.shtml"},
-        {"央视频", "https://m.yangshipin.cn"},
-        {"B站", "https://www.bilibili.com"},
-        {"优酷", "https://www.youku.com"},
-        {"爱奇艺", "https://www.iqiyi.com"},
-        {"腾讯视频", "https://v.qq.com"},
-        {"抖音", "https://www.douyin.com"},
-        {"快手", "https://www.kuaishou.com"},
-        {"西瓜视频", "https://www.ixigua.com"},
-        {"芒果TV", "https://www.mgtv.com"},
-        {"搜狐视频", "https://tv.sohu.com"},
-        {"斗鱼直播", "https://www.douyu.com"},
-        {"虎牙直播", "https://www.huya.com"},
-        {"1905电影网", "https://www.1905.com"},
-        {"哔哩哔哩番剧", "https://www.bilibili.com/anime"}
+        {"CCTV13新闻", "https://tv.cctv.com/live/cctv13/m/index.shtml", "1"},
+        {"央视新闻直播", "https://m-live.cctvnews.cctv.com/live/landscape.html?liveRoomNumber=16265686808730585228", "0"},
+        {"央视直播大全", "https://tv.cctv.com/live/index.shtml", "1"},
+        {"CCTV1综合", "https://tv.cctv.com/live/cctv1/m/index.shtml", "1"},
+        {"CCTV2财经", "https://tv.cctv.com/live/cctv2/m/index.shtml", "1"},
+        {"CCTV3综艺", "https://tv.cctv.com/live/cctv3/m/index.shtml", "1"},
+        {"CCTV4中文国际", "https://tv.cctv.com/live/cctv4/m/index.shtml", "1"},
+        {"CCTV5体育", "https://tv.cctv.com/live/cctv5/m/index.shtml", "1"},
+        {"CCTV5+体育赛事", "https://tv.cctv.com/live/cctv5plus/m/index.shtml", "1"},
+        {"CCTV6电影", "https://tv.cctv.com/live/cctv6/m/index.shtml", "1"},
+        {"CCTV7国防军事", "https://tv.cctv.com/live/cctv7/m/index.shtml", "1"},
+        {"CCTV8电视剧", "https://tv.cctv.com/live/cctv8/m/index.shtml", "1"},
+        {"央视频", "https://m.yangshipin.cn", "1"},
+        {"B站", "https://www.bilibili.com", "1"},
+        {"优酷", "https://www.youku.com", "1"},
+        {"爱奇艺", "https://www.iqiyi.com", "1"},
+        {"腾讯视频", "https://v.qq.com", "1"},
+        {"抖音", "https://www.douyin.com", "1"},
+        {"快手", "https://www.kuaishou.com", "1"},
+        {"西瓜视频", "https://www.ixigua.com", "1"},
+        {"芒果TV", "https://www.mgtv.com", "1"},
+        {"搜狐视频", "https://tv.sohu.com", "1"},
+        {"斗鱼直播", "https://www.douyu.com", "1"},
+        {"虎牙直播", "https://www.huya.com", "1"},
+        {"1905电影网", "https://www.1905.com", "1"},
+        {"哔哩哔哩番剧", "https://www.bilibili.com/anime", "1"}
     };
     
     private static final int CONNECT_TIMEOUT_MS = 8000;
@@ -186,6 +201,7 @@ public class MainActivity extends AppCompatActivity {
     
     private List<String> webSiteUrls = new ArrayList<>();
     private List<String> webSiteNames = new ArrayList<>();
+    private List<Boolean> webSiteEnabled = new ArrayList<>();
     private int currentSiteIndex = 0;
     private boolean isOrientationLocked = false;
     
@@ -207,14 +223,32 @@ public class MainActivity extends AppCompatActivity {
     private boolean isPortraitVideo = false;
 
     private View customView;
+    private FrameLayout customViewContainer;
     private WebChromeClient.CustomViewCallback customViewCallback;
     
     private OrientationEventListener orientationEventListener;
     private int lastDeviceOrientation = Configuration.ORIENTATION_PORTRAIT;
     private boolean isAutoFullscreenEnabled = true;
     private String lastDetectedVideoUrl = "";
+    private long lastSniffTime = 0;
+    private int sniffRefreshCount = 0;
+    private static final int MAX_SNIFF_REFRESH = 2;
+    // 嗅探到候选地址后，等待视频真正播放才切换的标志位
+    private boolean pendingAutoSwitch = false;
+    private String candidateVideoUrl = "";
+    private Runnable pendingSwitchTimeoutRunnable = null;
     private boolean isManualOrientationChange = false;
     private long lastManualOrientationTime = 0;
+
+    // WebView视频卡顿检测
+    private Runnable webVideoStallRunnable;
+    private double lastWebVideoTime = -1;
+    private int webVideoStallCount = 0;
+    private static final int WEB_STALL_THRESHOLD = 20; // 停滞20秒判定卡顿
+    private static final int WEB_STALL_CHECK_INTERVAL = 5000; // 每5秒检查一次
+    private static final int STALL_REFRESH_COOLDOWN_MS = 30000; // 刷新冷却30秒，避免连续刷新
+    private long lastStallRefreshTime = 0;
+    private boolean isWebVideoFullscreenRequested = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -261,7 +295,6 @@ public class MainActivity extends AppCompatActivity {
         tvW2Icon = findViewById(R.id.tv_w2_icon);
         tvW2Temp = findViewById(R.id.tv_w2_temp);
         startClock();
-        applyBannerStyle();
         requestLocationAndWeather();
         startWeatherRefresh();
 
@@ -293,6 +326,7 @@ public class MainActivity extends AppCompatActivity {
         initNetworkMonitor();
         initOrientationListener();
         loadSavedConfig();
+        applyBannerStyle();
         startHttpServer();
         updatePlayerModeButtons();
 
@@ -322,6 +356,45 @@ public class MainActivity extends AppCompatActivity {
             View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
             View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
         );
+    }
+
+    /** 递归设置View及其所有子View背景为纯黑，消除视频全屏时的白色边框 */
+    private void applyBlackBackgroundRecursive(View view) {
+        if (view == null) return;
+        try {
+            view.setBackgroundColor(0xFF000000);
+            if (view instanceof ViewGroup) {
+                ViewGroup group = (ViewGroup) view;
+                for (int i = 0; i < group.getChildCount(); i++) {
+                    applyBlackBackgroundRecursive(group.getChildAt(i));
+                }
+            }
+        } catch (Exception e) {
+            android.util.Log.w("NewsLive", "applyBlackBackgroundRecursive: " + e.getMessage());
+        }
+    }
+
+    /** 统一清理WebView全屏视图（customView及其黑色容器） */
+    private void cleanupCustomView() {
+        if (customView != null) {
+            FrameLayout rootLayout = findViewById(R.id.root_layout);
+            if (customViewContainer != null) {
+                customViewContainer.removeView(customView);
+                rootLayout.removeView(customViewContainer);
+                customViewContainer = null;
+            } else {
+                rootLayout.removeView(customView);
+            }
+            customView = null;
+        }
+        if (customViewCallback != null) {
+            try {
+                customViewCallback.onCustomViewHidden();
+            } catch (Exception e) {
+                android.util.Log.w("NewsLive", "cleanupCustomView callback: " + e.getMessage());
+            }
+            customViewCallback = null;
+        }
     }
 
     private void initNetworkMonitor() {
@@ -561,11 +634,163 @@ public class MainActivity extends AppCompatActivity {
             }
         });
     }
-    
+    private void checkVideoPlayingAndSwitch(String sniffedUrl) {
+        if (sniffedUrl == null || sniffedUrl.isEmpty()) return;
+        if (webView == null || webView.getVisibility() != View.VISIBLE) {
+            return;
+        }
+        // 从 video.currentSrc 获取真实地址（视频元素实际使用的地址，比嗅探的更准确）
+        // 并检查播放状态：只有视频真正在播放，地址才确定有效
+        String js = "(function() {" +
+            "try {" +
+            "  var video = document.querySelector('video');" +
+            "  if (video) {" +
+            "    var src = video.currentSrc || video.src || '';" +
+            "    if (video.querySelector('source')) {" +
+            "      src = video.querySelector('source').src || src;" +
+            "    }" +
+            "    return JSON.stringify({" +
+            "      src: src || ''," +
+            "      paused: video.paused," +
+            "      currentTime: video.currentTime," +
+            "      readyState: video.readyState" +
+            "    });" +
+            "  }" +
+            "  return JSON.stringify({src: '', paused: true});" +
+            "} catch(e) { return JSON.stringify({src: '', error: e.message}); }" +
+            "})();";
+        webView.evaluateJavascript(js, result -> {
+            String realUrl = "";
+            boolean isPlaying = false;
+            try {
+                if (result != null && !result.equals("null")) {
+                    String jsonStr = result.replace("\\\"", "\"").replaceAll("^\"|\"$", "");
+                    JSONObject json = new JSONObject(jsonStr);
+                    realUrl = json.optString("src", "");
+                    isPlaying = !json.optBoolean("paused", true)
+                        && json.optDouble("currentTime", 0) > 0;
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+            // 优先使用 currentSrc（视频实际使用的地址），为空或blob时回退到嗅探地址
+            String finalUrl = (realUrl != null && !realUrl.isEmpty() && !realUrl.startsWith("blob:"))
+                ? realUrl : sniffedUrl;
+            android.util.Log.i("NewsLive", "Video check: isPlaying=" + isPlaying
+                + " realUrl=" + realUrl + " sniffedUrl=" + sniffedUrl);
+
+            if (isPlaying) {
+                // 视频在播放，地址确定有效，立即切换
+                pendingAutoSwitch = false;
+                candidateVideoUrl = "";
+                lastDetectedVideoUrl = finalUrl;
+                switchToPlayerMode(finalUrl);
+            } else {
+                // 视频未播放，地址可能只是预加载地址，不可信
+                // 触发自动播放，并注册一次性 playing 事件监听器，等真正播放后再用 currentSrc 切换
+                candidateVideoUrl = sniffedUrl;
+                pendingAutoSwitch = true;
+                autoClickPlayButton();
+                // 注入一次性 playing 监听器，视频开始播放时回调 onVideoPlaying
+                String listenerJs = "(function(){" +
+                    "if (window.__pendingSwitchListener) return;" +
+                    "window.__pendingSwitchListener = true;" +
+                    "function attach(video) {" +
+                    "  if (!video || video.__pendingListener) return;" +
+                    "  video.__pendingListener = true;" +
+                    "  var onPlay = function() {" +
+                    "    var src = video.currentSrc || video.src || '';" +
+                    "    if (video.querySelector('source')) {" +
+                    "      src = video.querySelector('source').src || src;" +
+                    "    }" +
+                    "    if (src && src.indexOf('blob:') === -1 && window.AndroidVideoBridge) {" +
+                    "      window.AndroidVideoBridge.onVideoPlaying(src);" +
+                    "    }" +
+                    "    video.removeEventListener('playing', onPlay, true);" +
+                    "    video.removeEventListener('play', onPlay, true);" +
+                    "    window.__pendingSwitchListener = false;" +
+                    "  };" +
+                    "  video.addEventListener('playing', onPlay, true);" +
+                    "  video.addEventListener('play', onPlay, true);" +
+                    "}" +
+                    "var videos = document.querySelectorAll('video');" +
+                    "videos.forEach(attach);" +
+                    "})();";
+                webView.evaluateJavascript(listenerJs, null);
+
+                // 8秒超时：仍未播放则放弃切换，保持 WebView（地址可能无效）
+                if (pendingSwitchTimeoutRunnable != null) {
+                    handler.removeCallbacks(pendingSwitchTimeoutRunnable);
+                }
+                pendingSwitchTimeoutRunnable = () -> {
+                    if (pendingAutoSwitch && webView != null
+                        && webView.getVisibility() == View.VISIBLE) {
+                        android.util.Log.w("NewsLive",
+                            "Video not playing after 8s, keep WebView (url may be invalid): "
+                                + candidateVideoUrl);
+                    }
+                    pendingAutoSwitch = false;
+                    candidateVideoUrl = "";
+                };
+                handler.postDelayed(pendingSwitchTimeoutRunnable, 8000);
+            }
+        });
+    }
+
     private void switchToPlayerMode(String videoUrl) {
         if (videoUrl == null || videoUrl.isEmpty()) return;
-        
+
+        // CCTV的流含cdrm(DRM加密)，ExoPlayer无法解密；cctvnews/kcdnvip域名的流也常解码失败。
+        // 这些流交给WebView自带播放器播放（网页有解密逻辑），不切换到ExoPlayer，避免黑屏。
+        String lowerUrl = videoUrl.toLowerCase();
+        boolean isCctvStream = lowerUrl.contains("cdrm")
+            || lowerUrl.contains("kcdnvip")
+            || lowerUrl.contains("cctvnews.cctv.com")
+            || lowerUrl.contains("cctv.cn")
+            || (lowerUrl.contains("cctv") && lowerUrl.contains(".m3u8"));
+        if (isCctvStream) {
+            android.util.Log.i("NewsLive", "skip ExoPlayer for CCTV/DRM stream, keep WebView: " + videoUrl);
+            // 确保WebView可见并触发自动播放
+            if (webView != null) {
+                webView.setVisibility(View.VISIBLE);
+                webView.onResume();
+                webView.resumeTimers();
+                playerContainer.setVisibility(View.GONE);
+            }
+            autoClickPlayButton();
+            isWebVideoFullscreenRequested = false;
+            // WebView视频播放后设置isPlaying、隐藏控制面板、触发全屏、启动卡顿检测
+            handler.postDelayed(() -> {
+                if (webView == null) return;
+                String checkJs = "(function(){try{var v=document.querySelector('video');return v&&!v.paused&&v.currentTime>0?'playing':'not-playing';}catch(e){return 'error';}})();";
+                webView.evaluateJavascript(checkJs, r -> {
+                    if (r != null && r.contains("playing")) {
+                        onWebVideoPlaying();
+                    } else {
+                        // 3秒后再检查一次
+                        handler.postDelayed(() -> {
+                            if (webView == null) return;
+                            webView.evaluateJavascript(checkJs, r2 -> {
+                                if (r2 != null && r2.contains("playing")) {
+                                    onWebVideoPlaying();
+                                }
+                            });
+                        }, 3000);
+                    }
+                });
+            }, 2000);
+            return;
+        }
+
+        android.util.Log.i("NewsLive", "switchToPlayerMode: " + videoUrl);
         runOnUiThread(() -> {
+            sniffRefreshCount = 0;
+            // 暂停WebView的所有活动和播放
+            if (webView != null) {
+                webView.onPause();
+                webView.pauseTimers();
+                webView.loadUrl("about:blank");
+            }
             webView.setVisibility(View.GONE);
             playerContainer.setVisibility(View.VISIBLE);
             
@@ -622,8 +847,21 @@ public class MainActivity extends AppCompatActivity {
     private void loadWebSites() {
         webSiteUrls.clear();
         webSiteNames.clear();
-        
+        webSiteEnabled.clear();
+
+        // 检查配置版本号，版本号不匹配时清除旧配置并加载新默认配置
+        int savedVersion = prefs.getInt(KEY_WEB_SITES_VERSION, 0);
+        boolean needRefresh = (savedVersion < CURRENT_WEB_SITES_VERSION);
+
         String savedSites = prefs.getString(KEY_WEB_SITES, "");
+        if (needRefresh || savedSites.isEmpty()) {
+            android.util.Log.i("NewsLive", "loadWebSites: refreshing to defaults, savedVersion=" + savedVersion + " currentVersion=" + CURRENT_WEB_SITES_VERSION);
+            prefs.edit().remove(KEY_WEB_SITES).putInt(KEY_WEB_SITES_VERSION, CURRENT_WEB_SITES_VERSION).apply();
+            currentSiteIndex = 0;
+            prefs.edit().putInt(KEY_CURRENT_SITE_INDEX, 0).apply();
+            savedSites = "";
+        }
+
         if (!savedSites.isEmpty()) {
             try {
                 JSONArray sites = new JSONArray(savedSites);
@@ -631,23 +869,31 @@ public class MainActivity extends AppCompatActivity {
                     JSONObject site = sites.getJSONObject(i);
                     webSiteNames.add(site.optString("name", "网站" + (i + 1)));
                     webSiteUrls.add(site.optString("url", ""));
+                    webSiteEnabled.add(site.optBoolean("enabled", true));
                 }
             } catch (Exception e) {
                 e.printStackTrace();
             }
         }
-        
+
         if (webSiteUrls.isEmpty()) {
             for (String[] site : DEFAULT_WEB_SITES) {
                 webSiteNames.add(site[0]);
                 webSiteUrls.add(site[1]);
+                webSiteEnabled.add(!"0".equals(site[2]));
             }
         }
-        
+
         if (currentSiteIndex < 0 || currentSiteIndex >= webSiteUrls.size()) {
             currentSiteIndex = 0;
         }
-        
+        // 确保当前源是启用的，否则跳到第一个启用的源
+        if (currentSiteIndex < webSiteEnabled.size() && !webSiteEnabled.get(currentSiteIndex)) {
+            for (int i = 0; i < webSiteEnabled.size(); i++) {
+                if (webSiteEnabled.get(i)) { currentSiteIndex = i; break; }
+            }
+        }
+
         if (!webSiteUrls.isEmpty()) {
             webSourceUrl = webSiteUrls.get(currentSiteIndex);
         }
@@ -705,6 +951,7 @@ public class MainActivity extends AppCompatActivity {
     // ==================== 右上角时钟 ====================
     // 应用顶部信息横幅样式：可见性、字号、高度
     private void applyBannerStyle() {
+        android.util.Log.i("NewsLive", "applyBannerStyle: visible=" + bannerVisible + " fontSize=" + bannerFontSize + " height=" + bannerHeight);
         if (infoOverlay == null) return;
         infoOverlay.setVisibility(bannerVisible ? android.view.View.VISIBLE : android.view.View.GONE);
         if (!bannerVisible) return;
@@ -1232,7 +1479,20 @@ public class MainActivity extends AppCompatActivity {
         if (webSiteUrls.isEmpty()) return;
         stopAllPlayback();
         lastDetectedVideoUrl = "";
-        currentSiteIndex = (currentSiteIndex + 1) % webSiteUrls.size();
+        pendingAutoSwitch = false;
+        candidateVideoUrl = "";
+        if (pendingSwitchTimeoutRunnable != null) {
+            handler.removeCallbacks(pendingSwitchTimeoutRunnable);
+            pendingSwitchTimeoutRunnable = null;
+        }
+        // 向后查找下一个启用的源，最多遍历一圈
+        int size = webSiteUrls.size();
+        int next = currentSiteIndex;
+        for (int i = 0; i < size; i++) {
+            next = (next + 1) % size;
+            if (next < webSiteEnabled.size() && webSiteEnabled.get(next)) break;
+        }
+        currentSiteIndex = next;
         webSourceUrl = webSiteUrls.get(currentSiteIndex);
         prefs.edit().putInt(KEY_CURRENT_SITE_INDEX, currentSiteIndex).apply();
 
@@ -1258,7 +1518,20 @@ public class MainActivity extends AppCompatActivity {
         if (webSiteUrls.isEmpty()) return;
         stopAllPlayback();
         lastDetectedVideoUrl = "";
-        currentSiteIndex = (currentSiteIndex - 1 + webSiteUrls.size()) % webSiteUrls.size();
+        pendingAutoSwitch = false;
+        candidateVideoUrl = "";
+        if (pendingSwitchTimeoutRunnable != null) {
+            handler.removeCallbacks(pendingSwitchTimeoutRunnable);
+            pendingSwitchTimeoutRunnable = null;
+        }
+        // 向前查找上一个启用的源，最多遍历一圈
+        int size = webSiteUrls.size();
+        int prev = currentSiteIndex;
+        for (int i = 0; i < size; i++) {
+            prev = (prev - 1 + size) % size;
+            if (prev < webSiteEnabled.size() && webSiteEnabled.get(prev)) break;
+        }
+        currentSiteIndex = prev;
         webSourceUrl = webSiteUrls.get(currentSiteIndex);
         prefs.edit().putInt(KEY_CURRENT_SITE_INDEX, currentSiteIndex).apply();
 
@@ -1280,6 +1553,8 @@ public class MainActivity extends AppCompatActivity {
     }
     
     private void stopAllPlayback() {
+        stopWebVideoStallDetector();
+        isWebVideoFullscreenRequested = false;
         if (player != null) {
             try {
                 player.stop();
@@ -1288,7 +1563,7 @@ public class MainActivity extends AppCompatActivity {
                 e.printStackTrace();
             }
         }
-        
+
         if (webView != null) {
             try {
                 webView.pauseTimers();
@@ -1298,6 +1573,12 @@ public class MainActivity extends AppCompatActivity {
             }
         }
         lastDetectedVideoUrl = "";
+        pendingAutoSwitch = false;
+        candidateVideoUrl = "";
+        if (pendingSwitchTimeoutRunnable != null) {
+            handler.removeCallbacks(pendingSwitchTimeoutRunnable);
+            pendingSwitchTimeoutRunnable = null;
+        }
     }
     
     private void stopWebViewVideo() {
@@ -1310,6 +1591,12 @@ public class MainActivity extends AppCompatActivity {
             }
         }
         lastDetectedVideoUrl = "";
+        pendingAutoSwitch = false;
+        candidateVideoUrl = "";
+        if (pendingSwitchTimeoutRunnable != null) {
+            handler.removeCallbacks(pendingSwitchTimeoutRunnable);
+            pendingSwitchTimeoutRunnable = null;
+        }
     }
     
     private void toggleOrientationLock() {
@@ -1561,6 +1848,45 @@ public class MainActivity extends AppCompatActivity {
                 }
                 return true;
             }
+
+            // 网络层嗅探：截获 m3u8 / mp4 / flv 直播流请求，自动切到 ExoPlayer 全屏播放
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                String url = request.getUrl().toString();
+                if (url != null && url.length() > 0) {
+                    String lower = url.toLowerCase();
+                    // 屏蔽广告和非必要资源，减少卡顿（保留视频流、页面、JS、CSS）
+                    if (lower.contains("admaster") || lower.contains("doubleclick") || lower.contains("googlesyndication")
+                        || lower.contains("umeng") || lower.contains("baidustatic")
+                        || (lower.endsWith(".gif") && !lower.contains("cctv"))
+                        || lower.contains("/ad/") || lower.contains("adserver") || lower.contains("ad delivery")
+                        || lower.contains("imasdk") || lower.contains("pubmatic") || lower.contains("rubiconproject")) {
+                        return new WebResourceResponse("text/plain", "utf-8", new java.io.ByteArrayInputStream("".getBytes()));
+                    }
+                    boolean isStream = lower.endsWith(".m3u8") || lower.contains(".m3u8?")
+                        || lower.endsWith(".mp4") || lower.contains(".mp4?")
+                        || lower.endsWith(".flv") || lower.contains(".flv?");
+                    if (isStream) {
+                        long now = System.currentTimeMillis();
+                        // 防抖：切换频道后允许第一次嗅探，之后10秒内不重复触发（避免master+子流重复）
+                        // 注意：这里只记录候选地址，不立即设为 lastDetectedVideoUrl
+                        // 因为该地址可能是浏览器预加载发起的（视频暂停时也会请求 m3u8）
+                        // 必须在 checkVideoPlayingAndSwitch 中确认视频真正播放后才使用
+                        if (lastDetectedVideoUrl.isEmpty() || now - lastSniffTime > 10000) {
+                            android.util.Log.d("NewsLive", "Sniffed candidate stream: " + url);
+                            candidateVideoUrl = url;
+                            lastSniffTime = now;
+                            // 延迟2秒，等视频元素就绪后检查播放状态
+                            runOnUiThread(() -> {
+                                handler.postDelayed(() -> {
+                                    checkVideoPlayingAndSwitch(url);
+                                }, 2000);
+                            });
+                        }
+                    }
+                }
+                return super.shouldInterceptRequest(view, request);
+            }
         });
         
         webView.setWebChromeClient(new WebChromeClient() {
@@ -1583,12 +1909,12 @@ public class MainActivity extends AppCompatActivity {
             
             @Override
             public void onShowCustomView(View view, CustomViewCallback callback) {
-                // 尝试用ExoPlayer播放直链视频
-                if (useWebMode) {
+                // 视频元素请求全屏时，仅对非DRM流尝试ExoPlayer接管；DRM流直接用WebView全屏渲染
+                if (useWebMode && !isWebVideoFullscreenRequested) {
                     tryExtractAndPlayVideo();
                 }
 
-                // 同时支持WebView内全屏播放（适用于blob:视频）
+                // 同时支持WebView内全屏播放（适用于blob:视频和DRM流）
                 if (customView != null) {
                     callback.onCustomViewHidden();
                     return;
@@ -1597,27 +1923,44 @@ public class MainActivity extends AppCompatActivity {
                 customView = view;
                 customViewCallback = callback;
 
-                FrameLayout rootLayout = findViewById(R.id.root_layout);
-                rootLayout.addView(view, new FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    Gravity.CENTER
-                ));
+                // 创建专门的全屏容器，背景纯黑，彻底消除白色边框
+                customViewContainer = new FrameLayout(MainActivity.this);
+                customViewContainer.setBackgroundColor(0xFF000000);
 
+                // 视频View及其所有子View背景设为黑色（SurfaceView需特别处理）
+                view.setBackgroundColor(0xFF000000);
+                applyBlackBackgroundRecursive(view);
+
+                FrameLayout.LayoutParams videoParams = new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                );
+                customViewContainer.addView(view, videoParams);
+
+                FrameLayout rootLayout = findViewById(R.id.root_layout);
+                FrameLayout.LayoutParams containerParams = new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                );
+                rootLayout.addView(customViewContainer, containerParams);
+
+                // 隐藏控制面板等其他UI元素，保留顶部信息横幅（时间日期、天气节气）
                 if (controlPanel != null) controlPanel.setVisibility(View.GONE);
+                if (playerContainer != null) playerContainer.setVisibility(View.GONE);
+                if (progressBar != null) progressBar.setVisibility(View.GONE);
+                if (tvHintInfo != null) tvHintInfo.setVisibility(View.GONE);
+                // WebView隐藏但仍保持视频播放（全屏View是独立渲染层）
+                if (webView != null) webView.setVisibility(View.INVISIBLE);
                 hideSystemUI();
             }
 
             @Override
             public void onHideCustomView() {
                 if (customView != null) {
-                    FrameLayout rootLayout = findViewById(R.id.root_layout);
-                    rootLayout.removeView(customView);
-                    customView = null;
-                    if (customViewCallback != null) {
-                        customViewCallback.onCustomViewHidden();
-                        customViewCallback = null;
-                    }
+                    cleanupCustomView();
+                    // 恢复UI元素
+                    if (webView != null) webView.setVisibility(View.VISIBLE);
+                    if (infoOverlay != null) infoOverlay.setVisibility(View.VISIBLE);
                     hideSystemUI();
                 }
             }
@@ -1628,8 +1971,20 @@ public class MainActivity extends AppCompatActivity {
             public void onVideoPlaying(String videoUrl) {
                 if (videoUrl != null && !videoUrl.isEmpty() && !videoUrl.startsWith("blob:")) {
                     lastDetectedVideoUrl = videoUrl;
-                    if (lastDeviceOrientation == Configuration.ORIENTATION_LANDSCAPE) {
-                        switchToPlayerMode(videoUrl);
+                    // 横屏自动切全屏；或嗅探后等待播放的标志位为 true 时，视频真正开始播放才切换
+                    if (lastDeviceOrientation == Configuration.ORIENTATION_LANDSCAPE
+                        || pendingAutoSwitch) {
+                        final String finalUrl = videoUrl;
+                        runOnUiThread(() -> {
+                            // 视频真正播放了，地址确定有效，清除等待状态并切换
+                            pendingAutoSwitch = false;
+                            candidateVideoUrl = "";
+                            if (pendingSwitchTimeoutRunnable != null) {
+                                handler.removeCallbacks(pendingSwitchTimeoutRunnable);
+                                pendingSwitchTimeoutRunnable = null;
+                            }
+                            switchToPlayerMode(finalUrl);
+                        });
                     }
                 }
             }
@@ -1767,31 +2122,50 @@ public class MainActivity extends AppCompatActivity {
             "" +
             "function tryAutoPlay(video) {" +
             "  try {" +
-            "    video.muted = true;" +
-            "    var p = video.play();" +
-            "    if (p && p.catch) p.catch(function(){});" +
+            "    if (video.paused || video.ended) {" +
+            "      var p = video.play();" +
+            "      if (p && p.catch) p.catch(function(){" +
+            "        try { video.muted = true; var p2 = video.play(); if (p2 && p2.catch) p2.catch(function(){}); } catch(e) {}" +
+            "      });" +
+            "    }" +
             "  } catch(e) {}" +
             "}" +
             "" +
             "function removeCover() {" +
-            "  var covers = ['.prism-cover','.vjs-cover','.video-cover','.player-cover','.mask-layer','.bp-overlay','.bpx-player-cover','.bilibili-player-video-cover'];" +
+            "  var covers = ['.prism-cover','.vjs-cover','.video-cover','.player-cover','.mask-layer','.bp-overlay','.bpx-player-cover','.bilibili-player-video-cover','.video-mask','.ad-mask','.cover-layer','.player-mask','.vjs-overlay','.poster-layer','.vjs-poster','.bpx-player-cover','.x-player-mask','.player-poster'];" +
             "  covers.forEach(function(sel){" +
-            "    var el = document.querySelector(sel);" +
-            "    if (el) el.style.display = 'none';" +
+            "    try {" +
+            "      var els = document.querySelectorAll(sel);" +
+            "      els.forEach(function(el){ el.style.display = 'none'; });" +
+            "    } catch(e) {}" +
             "  });" +
             "}" +
             "" +
             "function clickPlayButton() {" +
-            "  var btns = ['.custom-play-btn','.vjs-big-play-button','.video-play-btn','.player-play-btn','.bilibili-player-video-btn-start','.bpx-player-video-btn-start','[class*=play-btn]','[class*=playButton]'];" +
+            "  var btns = ['.custom-play-btn','.vjs-big-play-button','.video-play-btn','.player-play-btn','.bilibili-player-video-btn-start','.bpx-player-video-btn-start','[class*=play-btn]','[class*=playButton]','[class*=big-play]','[class*=PlayButton]','button[class*=play]','.vjs-play-control','.jw-icon-playback','.x-play-btn','.player-icon-playback','.art-control-play'];" +
             "  for (var i = 0; i < btns.length; i++) {" +
-            "    var btn = document.querySelector(btns[i]);" +
-            "    if (btn) { btn.click(); return true; }" +
+            "    try {" +
+            "      var found = document.querySelectorAll(btns[i]);" +
+            "      if (found.length > 0) { found[0].click(); return true; }" +
+            "    } catch(e) {}" +
             "  }" +
             "  return false;" +
             "}" +
             "" +
+            "function tryAutoplayAll() {" +
+            "  removeCover();" +
+            "  clickPlayButton();" +
+            "  var videos = document.querySelectorAll('video');" +
+            "  videos.forEach(function(video){" +
+            "    if (video.paused || video.ended) tryAutoPlay(video);" +
+            "  });" +
+            "}" +
+            "" +
             "function handleVideo(video) {" +
-            "  if (video.__handled) return;" +
+            "  if (video.__handled) {" +
+            "    if (video.paused) tryAutoPlay(video);" +
+            "    return;" +
+            "  }" +
             "  video.__handled = true;" +
             "  video.addEventListener('play', function(e) {" +
             "    notifyVideo(video);" +
@@ -1802,6 +2176,12 @@ public class MainActivity extends AppCompatActivity {
             "  video.addEventListener('loadstart', function(e) {" +
             "    notifyVideo(video);" +
             "  }, true);" +
+            "  video.addEventListener('pause', function(e) {" +
+            "    setTimeout(function(){ tryAutoPlay(video); removeCover(); clickPlayButton(); }, 300);" +
+            "  }, true);" +
+            "  video.addEventListener('ended', function(e) {" +
+            "    setTimeout(function(){ tryAutoPlay(video); }, 300);" +
+            "  }, true);" +
             "  video.addEventListener('webkitbeginfullscreen', function() {" +
             "    if (window.AndroidVideoBridge) window.AndroidVideoBridge.onFullscreenRequested();" +
             "  });" +
@@ -1809,6 +2189,9 @@ public class MainActivity extends AppCompatActivity {
             "    if (document.fullscreenElement && window.AndroidVideoBridge) window.AndroidVideoBridge.onFullscreenRequested();" +
             "  });" +
             "  if (video.readyState >= 2) notifyVideo(video);" +
+            "  tryAutoPlay(video);" +
+            "  removeCover();" +
+            "  clickPlayButton();" +
             "}" +
             "" +
             "function checkVideos() {" +
@@ -1823,10 +2206,12 @@ public class MainActivity extends AppCompatActivity {
             "      }" +
             "    } catch(e) {}" +
             "  });" +
+            "  tryAutoplayAll();" +
             "}" +
             "" +
             "checkVideos();" +
             "setInterval(function(){ checkVideos(); }, 800);" +
+            "for (var _i = 1; _i <= 10; _i++) { setTimeout(tryAutoplayAll, _i * 600); }" +
             "" +
             "var observer = new MutationObserver(function(mutations) {" +
             "  mutations.forEach(function(mutation) {" +
@@ -1918,6 +2303,16 @@ public class MainActivity extends AppCompatActivity {
                         // 支持m3u8、mp4、flv等直链格式
                         boolean isDirectLink = videoUrl.contains(".m3u8") || videoUrl.contains(".mp4") || videoUrl.contains(".flv") || videoUrl.contains(".ts");
                         if (!videoUrl.isEmpty() && isDirectLink) {
+                            // CCTV的DRM流ExoPlayer无法解密，交给WebView播放器播放
+                            String lowerVid = videoUrl.toLowerCase();
+                            boolean isCctv = lowerVid.contains("cdrm") || lowerVid.contains("kcdnvip")
+                                || lowerVid.contains("cctvnews.cctv.com") || lowerVid.contains("cctv.cn")
+                                || (lowerVid.contains("cctv") && lowerVid.contains(".m3u8"));
+                            if (isCctv) {
+                                android.util.Log.i("NewsLive", "extractAndPlay: keep WebView for CCTV/DRM stream: " + videoUrl);
+                                autoClickPlayButton();
+                                return;
+                            }
                             String pageName = "网页视频";
                             if (webView.getUrl() != null) {
                                 String host = webView.getUrl();
@@ -1977,12 +2372,14 @@ public class MainActivity extends AppCompatActivity {
             "  var btn = document.querySelector(btns[i]);" +
             "  if (btn) { btn.click(); return 'clicked: ' + btns[i]; }" +
             "}" +
-            // 尝试直接播放video
+            // 尝试直接播放video（有声播放，不静音）
             "var video = document.querySelector('video');" +
             "if (video) {" +
-            "  video.muted = true;" +
+            "  if (video.muted) video.muted = false;" +
             "  var p = video.play();" +
-            "  if (p && p.catch) p.catch(function(){});" +
+            "  if (p && p.catch) p.catch(function(){" +
+            "    try { video.muted = true; video.play().catch(function(){}); } catch(e) {}" +
+            "  });" +
             "  return 'video.play() called';" +
             "}" +
             // 尝试Aliplayer
@@ -2024,13 +2421,22 @@ public class MainActivity extends AppCompatActivity {
 
     private void playVideoUrlWithRetry(String url, String name, int retryCount, boolean isRefreshed) {
         if (player == null || url == null || url.isEmpty()) return;
-        
+
+        android.util.Log.i("NewsLive", "playVideoUrl: " + url + " retry=" + retryCount + " refreshed=" + isRefreshed);
+
         tvSourceInfo.setText(name + (isRefreshed ? " (已刷新)" : ""));
         progressBar.setVisibility(View.VISIBLE);
-        
+
         MediaItem mediaItem = MediaItem.fromUri(Uri.parse(url));
-        player.stop();
-        player.setMediaItem(mediaItem);
+        try {
+            player.stop();
+            player.setMediaItem(mediaItem);
+            player.prepare();
+            player.setPlayWhenReady(true);
+            android.util.Log.i("NewsLive", "prepare() called successfully");
+        } catch (Exception e) {
+            android.util.Log.e("NewsLive", "prepare() failed", e);
+        }
         
         final int[] bufferingTime = {0};
         final boolean[] hasError = {false};
@@ -2047,6 +2453,7 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onPlaybackStateChanged(int playbackState) {
+                android.util.Log.i("NewsLive", "onPlaybackStateChanged: " + playbackState + " url=" + url);
                 switch (playbackState) {
                     case Player.STATE_BUFFERING:
                         progressBar.setVisibility(View.VISIBLE);
@@ -2056,13 +2463,25 @@ public class MainActivity extends AppCompatActivity {
                             public void run() {
                                 if (player != null && player.getPlaybackState() == Player.STATE_BUFFERING) {
                                     bufferingTime[0]++;
-                                    if (bufferingTime[0] > 45) {
+                                    if (bufferingTime[0] % 5 == 0) {
+                                        android.util.Log.w("NewsLive", "Buffering " + bufferingTime[0] + "s, pos=" + player.getCurrentPosition() + " buffered=" + player.getBufferedPosition());
+                                    }
+                                    if (bufferingTime[0] > 15) {
                                         if (!isRefreshed && useWebMode && seekRetryCount[0] >= 2) {
-                                            Toast.makeText(MainActivity.this, "缓冲超时，正在重新获取视频地址...", Toast.LENGTH_SHORT).show();
-                                            refreshVideoFromWeb();
+                                            if (sniffRefreshCount < MAX_SNIFF_REFRESH) {
+                                                sniffRefreshCount++;
+                                                Toast.makeText(MainActivity.this, "缓冲超时，正在重新获取视频地址(" + sniffRefreshCount + "/" + MAX_SNIFF_REFRESH + ")...", Toast.LENGTH_SHORT).show();
+                                                refreshVideoFromWeb();
+                                            } else {
+                                                Toast.makeText(MainActivity.this, "多次重试失败，请尝试切换频道或检查网络", Toast.LENGTH_LONG).show();
+                                                progressBar.setVisibility(View.GONE);
+                                            }
                                         } else if (seekRetryCount[0] < 3) {
                                             seekRetryCount[0]++;
-                                            player.seekTo(Math.max(0, player.getCurrentPosition() - 1000));
+                                            Toast.makeText(MainActivity.this, "缓冲超时，重连中(" + seekRetryCount[0] + "/3)...", Toast.LENGTH_SHORT).show();
+                                            // 直播流 seek 无意义，改为重新 prepare
+                                            player.setMediaItem(MediaItem.fromUri(Uri.parse(url)));
+                                            player.prepare();
                                             bufferingTime[0] = 0;
                                         }
                                     } else {
@@ -2078,6 +2497,7 @@ public class MainActivity extends AppCompatActivity {
                         hasError[0] = false;
                         seekRetryCount[0] = 0;
                         pauseRetryCount[0] = 0;
+                        sniffRefreshCount = 0;
                         startHideControlTimer();
                         break;
                     case Player.STATE_ENDED:
@@ -2094,6 +2514,8 @@ public class MainActivity extends AppCompatActivity {
                 progressBar.setVisibility(View.GONE);
                 hasError[0] = true;
 
+                android.util.Log.e("NewsLive", "onPlayerError: " + error.getMessage() + " errorCode=" + error.errorCode + " cause=" + (error.getCause() != null ? error.getCause().getMessage() : "null"), error);
+
                 int newRetryCount = retryCount + 1;
                 if (newRetryCount <= 3) {
                     final int finalRetryCount = newRetryCount;
@@ -2103,8 +2525,9 @@ public class MainActivity extends AppCompatActivity {
                             playVideoUrlWithRetry(url, name, finalRetryCount, isRefreshed);
                         }
                     }, 2000);
-                } else if (!isRefreshed && useWebMode) {
-                    Toast.makeText(MainActivity.this, "地址可能已过期，正在重新获取...", Toast.LENGTH_SHORT).show();
+                } else if (!isRefreshed && useWebMode && sniffRefreshCount < MAX_SNIFF_REFRESH) {
+                    sniffRefreshCount++;
+                    Toast.makeText(MainActivity.this, "地址可能已过期，正在重新获取(" + sniffRefreshCount + "/" + MAX_SNIFF_REFRESH + ")...", Toast.LENGTH_SHORT).show();
                     refreshVideoFromWeb();
                 } else {
                     Toast.makeText(MainActivity.this, "播放错误，请尝试切换网站或检查网络: " + error.getMessage(), Toast.LENGTH_LONG).show();
@@ -2123,8 +2546,9 @@ public class MainActivity extends AppCompatActivity {
                                 player.setPlayWhenReady(true);
                             }
                         }, 2000);
-                    } else if (!isRefreshed && useWebMode) {
-                        Toast.makeText(MainActivity.this, "视频源不稳定，正在重新获取...", Toast.LENGTH_SHORT).show();
+                    } else if (!isRefreshed && useWebMode && sniffRefreshCount < MAX_SNIFF_REFRESH) {
+                        sniffRefreshCount++;
+                        Toast.makeText(MainActivity.this, "视频源不稳定，正在重新获取(" + sniffRefreshCount + "/" + MAX_SNIFF_REFRESH + ")...", Toast.LENGTH_SHORT).show();
                         refreshVideoFromWeb();
                     }
                 }
@@ -2148,17 +2572,163 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void refreshVideoFromWeb() {
+        stopWebVideoStallDetector();
+        isWebVideoFullscreenRequested = false;
+        // 设置冷却时间：刷新后视频需要加载，30秒内不触发卡顿刷新
+        lastStallRefreshTime = System.currentTimeMillis();
         webView.setVisibility(View.VISIBLE);
         playerContainer.setVisibility(View.GONE);
         tvSourceInfo.setText("正在重新获取视频地址...");
         progressBar.setVisibility(View.VISIBLE);
-        
+
         webViewRetryCount = 0;
-        
+
         if (webView.getUrl() == null || !webView.getUrl().equals(webSourceUrl)) {
             loadWebSource();
         } else {
             webView.reload();
+        }
+    }
+
+    /** WebView视频开始播放后的统一处理：隐藏控制面板（保留顶部信息条）、触发全屏、启动卡顿检测 */
+    private void onWebVideoPlaying() {
+        isPlaying = true;
+        startHideControlTimer();
+        // 仅隐藏控制面板和进度条，保留顶部信息横幅（时间日期、天气节气）
+        if (controlPanel != null) controlPanel.setVisibility(View.GONE);
+        if (progressBar != null) progressBar.setVisibility(View.GONE);
+        // 设置WebView背景为黑色
+        if (webView != null) webView.setBackgroundColor(0xFF000000);
+        android.util.Log.i("NewsLive", "WebView video playing, isPlaying=true, hide control panel, keep info overlay");
+        requestWebVideoFullscreen();
+        startWebVideoStallDetector();
+    }
+
+    /** 触发网页视频元素全屏：注入CSS让video元素及其所有祖先容器铺满整个WebView视口，消除白色边框 */
+    private void requestWebVideoFullscreen() {
+        if (isWebVideoFullscreenRequested || webView == null) return;
+        isWebVideoFullscreenRequested = true;
+        // 注入CSS和JS：让video元素及其所有祖先容器都fixed定位铺满整个视口
+        // 不依赖Fullscreen API（需要用户手势），直接通过CSS实现网页内全屏
+        String js = "(function(){try{var v=document.querySelector('video');if(!v)return 'no-video';" +
+            // 设置html和body背景为黑色，消除margin
+            "document.documentElement.style.background='#000000';" +
+            "document.documentElement.style.margin='0';" +
+            "document.documentElement.style.padding='0';" +
+            "document.body.style.background='#000000';" +
+            "document.body.style.margin='0';" +
+            "document.body.style.padding='0';" +
+            "document.body.style.overflow='hidden';" +
+            // 注入全局CSS样式
+            "var style=document.getElementById('news-live-fullscreen-style');" +
+            "if(!style){style=document.createElement('style');style.id='news-live-fullscreen-style';" +
+            "style.textContent='video,video *{position:fixed!important;top:0!important;left:0!important;" +
+            "width:100vw!important;height:100vh!important;min-width:100vw!important;min-height:100vh!important;" +
+            "max-width:100vw!important;max-height:100vh!important;z-index:2147483647!important;" +
+            "object-fit:contain!important;background:#000000!important;outline:none!important;border:none!important;}" +
+            "video::-webkit-media-controls{display:none!important;}" +
+            "body,html{margin:0!important;padding:0!important;overflow:hidden!important;background:#000!important;}';" +
+            "document.head.appendChild(style);}" +
+            // 遍历video元素的所有祖先元素，设置fixed铺满全屏
+            "var el=v.parentNode;var depth=0;" +
+            "while(el&&el!==document.body&&depth<20){" +
+            "el.style.position='fixed';el.style.top='0';el.style.left='0';" +
+            "el.style.width='100vw';el.style.height='100vh';" +
+            "el.style.minWidth='100vw';el.style.minHeight='100vh';" +
+            "el.style.maxWidth='100vw';el.style.maxHeight='100vh';" +
+            "el.style.margin='0';el.style.padding='0';el.style.zIndex='2147483646';" +
+            "el.style.background='#000000';el.style.overflow='hidden';" +
+            "el=el.parentNode;depth++;}" +
+            // 确保video元素本身的样式
+            "v.style.position='fixed';v.style.top='0';v.style.left='0';" +
+            "v.style.width='100vw';v.style.height='100vh';" +
+            "v.style.minWidth='100vw';v.style.minHeight='100vh';" +
+            "v.style.maxWidth='100vw';v.style.maxHeight='100vh';" +
+            "v.style.zIndex='2147483647';v.style.objectFit='contain';v.style.background='#000000';" +
+            // 隐藏body直接子元素中不包含video的元素（广告、分享、导航等干扰内容）
+            "var bodyChildren=document.body.children;" +
+            "for(var i=0;i<bodyChildren.length;i++){" +
+            "var child=bodyChildren[i];if(child===v)continue;" +
+            "if(!child.contains(v)){child.style.display='none';}" +
+            "}" +
+            // 尝试Fullscreen API（如果支持），失败也无妨，CSS已确保全屏
+            "try{if(v.requestFullscreen&&document.fullscreenEnabled){v.requestFullscreen().catch(function(){});}" +
+            "else if(v.webkitEnterFullscreen){v.webkitEnterFullscreen();}}catch(e){}" +
+            "return 'css-fullscreen';}catch(e){return 'err:'+e.message;}})();";
+        webView.evaluateJavascript(js, r -> {
+            android.util.Log.i("NewsLive", "requestWebVideoFullscreen: " + r);
+        });
+    }
+
+    /** 启动WebView视频卡顿检测：定时检查currentTime是否推进
+     *  关键策略：readyState<3（加载/缓冲中）不判卡顿；刷新后30秒冷却期避免连续刷新 */
+    private void startWebVideoStallDetector() {
+        stopWebVideoStallDetector();
+        lastWebVideoTime = -1;
+        webVideoStallCount = 0;
+        webVideoStallRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (webView == null) return;
+                String checkJs = "(function(){try{var v=document.querySelector('video');if(!v)return 'no-video';" +
+                    "return JSON.stringify({t:v.currentTime,paused:v.paused,ready:v.readyState});}catch(e){return 'err';}})();";
+                webView.evaluateJavascript(checkJs, result -> {
+                    if (result == null || result.contains("no-video") || result.contains("err")) {
+                        webVideoStallCount++;
+                    } else {
+                        try {
+                            String jsonStr = result.replace("\\\"", "\"").replaceAll("^\"|\"$", "");
+                            JSONObject json = new JSONObject(jsonStr);
+                            double currentTime = json.optDouble("t", 0);
+                            boolean paused = json.optBoolean("paused", true);
+                            int readyState = json.optInt("ready", 0);
+                            android.util.Log.d("NewsLive", "StallCheck: t=" + currentTime + " paused=" + paused + " ready=" + readyState + " stallCount=" + webVideoStallCount);
+                            // readyState < 3 (HAVE_FUTURE_DATA)：视频正在加载/缓冲，不判定卡顿
+                            if (readyState < 3) {
+                                webVideoStallCount = 0;
+                            } else if (paused) {
+                                // 视频暂停且能播放，可能卡住
+                                webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
+                            } else if (lastWebVideoTime >= 0 && currentTime == lastWebVideoTime) {
+                                // 非暂停但currentTime没推进，真正卡顿
+                                webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
+                            } else {
+                                // 正常推进，重置计数
+                                webVideoStallCount = 0;
+                            }
+                            lastWebVideoTime = currentTime;
+                        } catch (Exception e) {
+                            webVideoStallCount++;
+                        }
+                    }
+                    if (webVideoStallCount >= WEB_STALL_THRESHOLD) {
+                        // 冷却期内不刷新，避免连续刷新（视频加载需要时间）
+                        long now = System.currentTimeMillis();
+                        if (now - lastStallRefreshTime < STALL_REFRESH_COOLDOWN_MS) {
+                            android.util.Log.d("NewsLive", "Stall detected but in cooldown (" + (now - lastStallRefreshTime) / 1000 + "s since last refresh), skip");
+                            webVideoStallCount = 0;
+                            handler.postDelayed(this, WEB_STALL_CHECK_INTERVAL);
+                        } else {
+                            android.util.Log.w("NewsLive", "WebView video stalled " + webVideoStallCount + "s, refreshing page");
+                            Toast.makeText(MainActivity.this, "视频卡顿，正在刷新...", Toast.LENGTH_SHORT).show();
+                            webVideoStallCount = 0;
+                            lastStallRefreshTime = now;
+                            refreshVideoFromWeb();
+                        }
+                    } else {
+                        handler.postDelayed(this, WEB_STALL_CHECK_INTERVAL);
+                    }
+                });
+            }
+        };
+        handler.postDelayed(webVideoStallRunnable, WEB_STALL_CHECK_INTERVAL);
+    }
+
+    /** 停止WebView视频卡顿检测 */
+    private void stopWebVideoStallDetector() {
+        if (webVideoStallRunnable != null) {
+            handler.removeCallbacks(webVideoStallRunnable);
+            webVideoStallRunnable = null;
         }
     }
 
@@ -2185,25 +2755,38 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void initPlayer() {
+        // 为CCTV等需要Referer的流添加请求头
+        java.util.Map<String, String> requestHeaders = new java.util.HashMap<>();
+        requestHeaders.put("Referer", "https://tv.cctv.com/");
+        requestHeaders.put("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+
         DefaultHttpDataSource.Factory httpDataSourceFactory = new DefaultHttpDataSource.Factory()
             .setConnectTimeoutMs(CONNECT_TIMEOUT_MS)
             .setReadTimeoutMs(READ_TIMEOUT_MS)
-            .setAllowCrossProtocolRedirects(true);
-        
+            .setAllowCrossProtocolRedirects(true)
+            .setUserAgent("Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+            .setDefaultRequestProperties(requestHeaders);
+
         int minBuffer = Math.max(bufferMinMs, 10000);
         int maxBuffer = Math.max(bufferMaxMs, 60000);
-        
+
         DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
             .setBufferDurationsMs(minBuffer, maxBuffer, 1000, minBuffer)
             .setPrioritizeTimeOverSizeThresholds(true)
             .setBackBuffer(maxBuffer, true)
             .setTargetBufferBytes(-1)
             .build();
-        
-        DefaultMediaSourceFactory mediaSourceFactory = new DefaultMediaSourceFactory(httpDataSourceFactory);
-        mediaSourceFactory.setDataSourceFactory(httpDataSourceFactory);
-        
-        player = new ExoPlayer.Builder(this)
+
+        // 启用解码器回退：硬件解码失败时自动切换到软件解码
+        DefaultRenderersFactory renderersFactory = new DefaultRenderersFactory(this)
+            .setEnableDecoderFallback(true)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER);
+
+        // 使用Context构造，自动包含HLS/ Dash/ SmoothStreaming等支持
+        DefaultMediaSourceFactory mediaSourceFactory = new DefaultMediaSourceFactory(this)
+            .setDataSourceFactory(httpDataSourceFactory);
+
+        player = new ExoPlayer.Builder(this, renderersFactory)
             .setMediaSourceFactory(mediaSourceFactory)
             .setLoadControl(loadControl)
             .build();
@@ -2477,15 +3060,21 @@ public class MainActivity extends AppCompatActivity {
                 JSONArray websites = config.getJSONArray("websites");
                 webSiteNames.clear();
                 webSiteUrls.clear();
+                webSiteEnabled.clear();
                 for (int i = 0; i < websites.length(); i++) {
                     JSONObject site = websites.getJSONObject(i);
                     webSiteNames.add(site.optString("name", "网站" + (i + 1)));
                     webSiteUrls.add(site.optString("url", ""));
+                    webSiteEnabled.add(site.optBoolean("enabled", true));
                 }
                 saveWebSites();
-                if (!webSiteUrls.isEmpty()) {
-                    webSourceUrl = webSiteUrls.get(0);
-                    currentSiteIndex = 0;
+                // 切换到第一个启用的源
+                currentSiteIndex = 0;
+                for (int i = 0; i < webSiteEnabled.size(); i++) {
+                    if (webSiteEnabled.get(i)) { currentSiteIndex = i; break; }
+                }
+                if (!webSiteUrls.isEmpty() && currentSiteIndex < webSiteUrls.size()) {
+                    webSourceUrl = webSiteUrls.get(currentSiteIndex);
                 }
             }
 
@@ -2536,9 +3125,10 @@ public class MainActivity extends AppCompatActivity {
                 JSONObject site = new JSONObject();
                 site.put("name", webSiteNames.get(i));
                 site.put("url", webSiteUrls.get(i));
+                site.put("enabled", i < webSiteEnabled.size() ? webSiteEnabled.get(i) : true);
                 sites.put(site);
             }
-            prefs.edit().putString(KEY_WEB_SITES, sites.toString()).apply();
+            prefs.edit().putString(KEY_WEB_SITES, sites.toString()).putInt(KEY_WEB_SITES_VERSION, CURRENT_WEB_SITES_VERSION).apply();
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -2567,17 +3157,19 @@ public class MainActivity extends AppCompatActivity {
                     return true;
 
                 case KeyEvent.KEYCODE_DPAD_UP:
-                    if (useWebMode && webView != null) {
-                        return super.dispatchKeyEvent(event);
+                    if (useWebMode) {
+                        switchToPrevWebSite();
+                    } else {
+                        switchToPrevSource();
                     }
-                    switchToPrevSource();
                     return true;
 
                 case KeyEvent.KEYCODE_DPAD_DOWN:
-                    if (useWebMode && webView != null) {
-                        return super.dispatchKeyEvent(event);
+                    if (useWebMode) {
+                        switchToNextWebSite();
+                    } else {
+                        switchToNextSource();
                     }
-                    switchToNextSource();
                     return true;
 
                 case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
@@ -2614,13 +3206,9 @@ public class MainActivity extends AppCompatActivity {
                 case KeyEvent.KEYCODE_BACK:
                     // 先退出WebView全屏视图
                     if (customView != null) {
-                        if (customViewCallback != null) {
-                            customViewCallback.onCustomViewHidden();
-                        }
-                        FrameLayout rootLayout = findViewById(R.id.root_layout);
-                        rootLayout.removeView(customView);
-                        customView = null;
-                        customViewCallback = null;
+                        cleanupCustomView();
+                        if (webView != null) webView.setVisibility(View.VISIBLE);
+                        if (infoOverlay != null) infoOverlay.setVisibility(View.VISIBLE);
                         return true;
                     }
                     if (webView != null && webView.canGoBack() && useWebMode) {
@@ -2713,14 +3301,11 @@ public class MainActivity extends AppCompatActivity {
             weatherRefreshHandler.removeCallbacks(weatherRefreshRunnable);
         }
 
+        // 停止WebView视频卡顿检测
+        stopWebVideoStallDetector();
+
         // 清理全屏视图
-        if (customView != null) {
-            if (customViewCallback != null) {
-                customViewCallback.onCustomViewHidden();
-            }
-            customView = null;
-            customViewCallback = null;
-        }
+        cleanupCustomView();
 
         if (orientationEventListener != null) {
             orientationEventListener.disable();
@@ -2754,13 +3339,9 @@ public class MainActivity extends AppCompatActivity {
     public void onBackPressed() {
         // 先退出WebView全屏视图
         if (customView != null) {
-            if (customViewCallback != null) {
-                customViewCallback.onCustomViewHidden();
-            }
-            FrameLayout rootLayout = findViewById(R.id.root_layout);
-            rootLayout.removeView(customView);
-            customView = null;
-            customViewCallback = null;
+            cleanupCustomView();
+            if (webView != null) webView.setVisibility(View.VISIBLE);
+            if (infoOverlay != null) infoOverlay.setVisibility(View.VISIBLE);
             return;
         }
 
@@ -2890,7 +3471,8 @@ public class MainActivity extends AppCompatActivity {
             for (int i = 0; i < webSiteUrls.size(); i++) {
                 if (i > 0) webSitesJson.append(",");
                 webSitesJson.append("{\"name\":\"").append(webSiteNames.get(i))
-                    .append("\",\"url\":\"").append(webSiteUrls.get(i)).append("\"}");
+                    .append("\",\"url\":\"").append(webSiteUrls.get(i))
+                    .append("\",\"enabled\":").append(i < webSiteEnabled.size() && webSiteEnabled.get(i) ? "true" : "false").append("}");
             }
             webSitesJson.append("]");
 
@@ -2912,6 +3494,8 @@ public class MainActivity extends AppCompatActivity {
                 ".source-item{background:#f9f9f9;padding:15px;margin:10px 0;border-radius:8px;border:1px solid #e0e0e0;position:relative}" +
                 ".source-item.dragging{opacity:0.5;box-shadow:0 4px 8px rgba(0,0,0,0.2)}" +
                 ".source-item.drag-over{border:2px dashed #2196F3}" +
+                ".source-item.disabled-item{background:#f0f0f0;opacity:0.6;border-color:#ccc}" +
+                ".enable-label{display:inline-flex;align-items:center;gap:4px;margin:4px 0;font-size:14px;color:#333}" +
                 ".item-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}" +
                 ".drag-handle{color:#999;font-size:20px;cursor:grab}" +
                 ".item-index{background:#2196F3;color:#fff;padding:2px 8px;border-radius:4px;font-size:12px}" +
@@ -3020,10 +3604,12 @@ public class MainActivity extends AppCompatActivity {
                 "function renderWebsites(){" +
                 "  var html='';" +
                 "  for(var i=0;i<websites.length;i++){" +
-                "    html+='<div class=\"source-item website-item\" draggable=\"true\" data-index=\"'+i+'\" data-type=\"website\" ondragstart=\"dragStart(event)\" ondragover=\"dragOver(event)\" ondrop=\"drop(event)\" ondragend=\"dragEnd(event)\">';" +
+                "    var en=websites[i].enabled!==false;" +
+                "    html+='<div class=\"source-item website-item'+(en?'':' disabled-item')+'\" draggable=\"true\" data-index=\"'+i+'\" data-type=\"website\" ondragstart=\"dragStart(event)\" ondragover=\"dragOver(event)\" ondrop=\"drop(event)\" ondragend=\"dragEnd(event)\">';" +
                 "    html+='<div class=\"item-header\"><span class=\"drag-handle\">☰</span><span class=\"item-index\" style=\"background:#2196F3\">'+(i+1)+'</span></div>';" +
                 "    html+='<input type=\"text\" placeholder=\"网站名称\" value=\"'+websites[i].name+'\" onchange=\"websites['+i+'].name=this.value\">';" +
                 "    html+='<input type=\"url\" placeholder=\"网站地址\" value=\"'+websites[i].url+'\" onchange=\"websites['+i+'].url=this.value\">';" +
+                "    html+='<label class=\"enable-label\"><input type=\"checkbox\" '+(en?'checked':'')+' onchange=\"websites['+i+'].enabled=this.checked;renderWebsites();\"> 启用</label>';" +
                 "    html+='<div class=\"btn-group\">';" +
                 "    html+='<button class=\"btn-up\" onclick=\"moveWebsiteUp('+i+')\" '+(i===0?'disabled style=\"opacity:0.5\"':'')+'>↑</button>';" +
                 "    html+='<button class=\"btn-down\" onclick=\"moveWebsiteDown('+i+')\" '+(i===websites.length-1?'disabled style=\"opacity:0.5\"':'')+'>↓</button>';" +
@@ -3058,7 +3644,7 @@ public class MainActivity extends AppCompatActivity {
                 "function moveWebsiteUp(i){if(i>0){var t=websites[i];websites[i]=websites[i-1];websites[i-1]=t;renderWebsites();}}" +
                 "function moveWebsiteDown(i){if(i<websites.length-1){var t=websites[i];websites[i+1]=websites[i];websites[i+1]=t;renderWebsites();}}" +
                 "function delWebsite(i){if(confirm('确定删除？')){websites.splice(i,1);renderWebsites();}}" +
-                "function addWebsite(){websites.push({name:'',url:''});renderWebsites();}" +
+                "function addWebsite(){websites.push({name:'',url:'',enabled:true});renderWebsites();}" +
                 "function movePlayerVideoUp(i){if(i>0){var t=playerVideos[i];playerVideos[i]=playerVideos[i-1];playerVideos[i-1]=t;renderPlayerVideos();}}" +
                 "function movePlayerVideoDown(i){if(i<playerVideos.length-1){var t=playerVideos[i];playerVideos[i+1]=playerVideos[i];playerVideos[i+1]=t;renderPlayerVideos();}}" +
                 "function delPlayerVideo(i){if(confirm('确定删除？')){playerVideos.splice(i,1);renderPlayerVideos();}}" +
