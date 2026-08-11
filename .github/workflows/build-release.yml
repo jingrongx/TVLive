@@ -63,7 +63,7 @@ jobs:
             echo "ERROR: APK not found!"
             exit 1
           fi
-          echo "apk_path=$APK_PATH" >> $GITHUB_ENV
+          echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
           ls -lh "$APK_PATH"
 
       # 7. 生成 release notes（使用本次 push 的所有 commit 消息）
