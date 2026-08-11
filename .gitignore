@@ -23,3 +23,15 @@ logcat_full.txt
 # Keystore
 *.keystore
 *.jks
+
+# 构建日志和临时文件
+*.txt
+!version.properties
+commit_msg.txt
+gh_*.ps1
+gh_*.json
+blob_*.json
+tree_*.json
+commit_*.json
+ref_*.json
+keystore_b64.txt

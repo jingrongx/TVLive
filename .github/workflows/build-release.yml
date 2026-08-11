@@ -1,0 +1,157 @@
+name: Build & Release APK
+
+# 触发条件：push 到 main 分支时自动构建发版，也支持手动触发
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write      # 创建 Release 和提交 version.properties
+      packages: write
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # 获取完整历史，用于生成 release notes
+          token: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
+
+      # 2. 配置 JDK
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # 3. 读取当前版本号
+      - name: Read version
+        id: read_version
+        run: |
+          VERSION_CODE=$(grep VERSION_CODE version.properties | cut -d'=' -f2)
+          VERSION_NAME=$(grep VERSION_NAME version.properties | cut -d'=' -f2)
+          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "Current version: $VERSION_NAME ($VERSION_CODE)"
+
+      # 4. 解码签名 keystore
+      - name: Decode keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > app/newslive-release.jks
+          echo "KEYSTORE_PATH=app/newslive-release.jks" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+          echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_ENV
+
+      # 5. 构建 release APK
+      - name: Build release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      # 6. 验证 APK 生成
+      - name: Verify APK
+        run: |
+          APK_PATH=$(find . -name "newslive-v*.apk" -path "*/release/*" | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "ERROR: APK not found!"
+            exit 1
+          fi
+          echo "apk_path=$APK_PATH" >> $GITHUB_ENV
+          ls -lh "$APK_PATH"
+
+      # 7. 生成 release notes（使用本次 push 的所有 commit 消息）
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          # 获取本次 push 的所有 commit 消息（从上一个 commit 到 HEAD）
+          # 如果是首次构建或手动触发，使用最新 commit 的完整消息
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BEFORE="${{ github.event.before }}"
+            if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              # 首次推送，用 HEAD commit
+              COMMIT_MSG=$(git log -1 --format="%B")
+            else
+              # 多个 commit 的消息汇总
+              COMMIT_MSG=$(git log $BEFORE..HEAD --format="* %s" --no-merges)
+            fi
+          else
+            # 手动触发，用 HEAD commit
+            COMMIT_MSG=$(git log -1 --format="%B")
+          fi
+
+          # 构建完整的 release notes
+          {
+            echo "## 版本 ${{ steps.read_version.outputs.version_name }} (build ${{ steps.read_version.outputs.version_code }})"
+            echo ""
+            echo "### 更新内容"
+            echo "$COMMIT_MSG"
+            echo ""
+            echo "### 安装方法"
+            echo "下载下方 APK 文件，在手机/电视上点击安装（需允许\"安装未知来源应用\"）。"
+          } > release_notes.md
+
+          echo "Release notes generated:"
+          cat release_notes.md
+
+      # 8. 创建 GitHub Release 并上传 APK
+      - name: Create Release and Upload APK
+        env:
+          GH_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.read_version.outputs.version_name }}"
+          echo "Creating release with tag: $TAG"
+
+          gh release create "$TAG" \
+            "$APK_PATH" \
+            --title "NewsLive $TAG" \
+            --notes-file release_notes.md \
+            --target main
+
+      # 9. 递增版本号并提交回仓库
+      - name: Bump version
+        run: |
+          CURRENT_CODE=${{ steps.read_version.outputs.version_code }}
+          CURRENT_NAME=${{ steps.read_version.outputs.version_name }}
+
+          # versionCode +1
+          NEW_CODE=$((CURRENT_CODE + 1))
+
+          # versionName patch 部分 +1（如 1.0.0 → 1.0.1，1.0.9 → 1.0.10）
+          MAJOR=$(echo $CURRENT_NAME | cut -d'.' -f1)
+          MINOR=$(echo $CURRENT_NAME | cut -d'.' -f2)
+          PATCH=$(echo $CURRENT_NAME | cut -d'.' -f3)
+          NEW_PATCH=$((PATCH + 1))
+          NEW_NAME="$MAJOR.$MINOR.$NEW_PATCH"
+
+          echo "VERSION_CODE=$NEW_CODE" > version.properties
+          echo "VERSION_NAME=$NEW_NAME" >> version.properties
+
+          echo "Bumped version: $CURRENT_NAME ($CURRENT_CODE) → $NEW_NAME ($NEW_CODE)"
+          cat version.properties
+
+      # 10. 提交递增后的 version.properties
+      - name: Commit version bump
+        env:
+          GH_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.properties
+          git commit -m "chore: bump version to $(grep VERSION_NAME version.properties | cut -d'=' -f2) [skip ci]"
+          git push
+
+      # 11. 构建结果摘要
+      - name: Build summary
+        run: |
+          echo "## 构建完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 版本: ${{ steps.read_version.outputs.version_name }} (build ${{ steps.read_version.outputs.version_code }})" >> $GITHUB_STEP_SUMMARY
+          echo "- APK: $(basename $APK_PATH)" >> $GITHUB_STEP_SUMMARY
+          echo "- Release: v${{ steps.read_version.outputs.version_name }}" >> $GITHUB_STEP_SUMMARY
