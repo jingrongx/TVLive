@@ -83,7 +83,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_WEB_SOURCE_URL = "web_source_url";
     private static final String KEY_WEB_SITES = "web_sites";
     private static final String KEY_WEB_SITES_VERSION = "web_sites_version";
-    private static final int CURRENT_WEB_SITES_VERSION = 4; // 版本号递增以触发配置刷新
+    private static final int CURRENT_WEB_SITES_VERSION = 6; // 版本号递增以触发配置刷新
     private static final String KEY_CURRENT_SITE_INDEX = "current_site_index";
     private static final String KEY_LOCK_ORIENTATION = "lock_orientation";
     private static final String KEY_PLAYER_MODE_ENABLED = "player_mode_enabled";
@@ -98,12 +98,12 @@ public class MainActivity extends AppCompatActivity {
     
     // [名称, URL, 启用标记] "1"=启用 "0"=停用，启动时加载到 webSiteNames/webSiteUrls/webSiteEnabled
     private static final String[][] DEFAULT_WEB_SITES = {
-        {"CCTV13新闻", "https://tv.cctv.com/live/cctv13/m/index.shtml", "1"},
-        {"央视新闻直播", "https://m-live.cctvnews.cctv.com/live/landscape.html?liveRoomNumber=16265686808730585228", "0"},
+        {"央视新闻直播", "https://m-live.cctvnews.cctv.com/live/landscape.html?liveRoomNumber=16265686808730585228", "1"},
+        {"CCTV13新闻", "https://tv.cctv.com/live/cctv13/m/index.shtml", "0"},
         {"央视直播大全", "https://tv.cctv.com/live/index.shtml", "0"},
         {"CCTV1综合", "https://tv.cctv.com/live/cctv1/m/index.shtml", "1"},
         {"CCTV2财经", "https://tv.cctv.com/live/cctv2/m/index.shtml", "1"},
-        {"CCTV3综艺", "https://tv.cctv.com/live/cctv3/m/index.shtml", "1"},
+        {"CCTV3综艺", "https://tv.cctv.com/live/cctv3/m/index.shtml", "0"},
         {"CCTV4中文国际", "https://tv.cctv.com/live/cctv4/m/index.shtml", "1"},
         {"CCTV5体育", "https://tv.cctv.com/live/cctv5/m/index.shtml", "1"},
         {"CCTV5+体育赛事", "https://tv.cctv.com/live/cctv5plus/m/index.shtml", "0"},
@@ -740,14 +740,14 @@ public class MainActivity extends AppCompatActivity {
     private void switchToPlayerMode(String videoUrl) {
         if (videoUrl == null || videoUrl.isEmpty()) return;
 
-        // CCTV的流含cdrm(DRM加密)，ExoPlayer无法解密；cctvnews/kcdnvip域名的流也常解码失败。
+        // CCTV的流含cdrm(DRM加密)，ExoPlayer无法解密；kcdnvip域名的流也常解码失败。
         // 这些流交给WebView自带播放器播放（网页有解密逻辑），不切换到ExoPlayer，避免黑屏。
+        // 注意：cctvnews.cctv.com（央视新闻直播）的流可以被ExoPlayer正常播放，不在此列。
         String lowerUrl = videoUrl.toLowerCase();
         boolean isCctvStream = lowerUrl.contains("cdrm")
             || lowerUrl.contains("kcdnvip")
-            || lowerUrl.contains("cctvnews.cctv.com")
             || lowerUrl.contains("cctv.cn")
-            || (lowerUrl.contains("cctv") && lowerUrl.contains(".m3u8"));
+            || (lowerUrl.contains("cctv") && lowerUrl.contains(".m3u8") && !lowerUrl.contains("cctvnews"));
         if (isCctvStream) {
             android.util.Log.i("NewsLive", "skip ExoPlayer for CCTV/DRM stream, keep WebView: " + videoUrl);
             // 确保WebView可见并触发自动播放
@@ -760,24 +760,9 @@ public class MainActivity extends AppCompatActivity {
             autoClickPlayButton();
             isWebVideoFullscreenRequested = false;
             // WebView视频播放后设置isPlaying、隐藏控制面板、触发全屏、启动卡顿检测
+            // 检查逻辑支持iframe内的视频（央视新闻直播等页面可能将video放在iframe中）
             handler.postDelayed(() -> {
-                if (webView == null) return;
-                String checkJs = "(function(){try{var v=document.querySelector('video');return v&&!v.paused&&v.currentTime>0?'playing':'not-playing';}catch(e){return 'error';}})();";
-                webView.evaluateJavascript(checkJs, r -> {
-                    if (r != null && r.contains("playing")) {
-                        onWebVideoPlaying();
-                    } else {
-                        // 3秒后再检查一次
-                        handler.postDelayed(() -> {
-                            if (webView == null) return;
-                            webView.evaluateJavascript(checkJs, r2 -> {
-                                if (r2 != null && r2.contains("playing")) {
-                                    onWebVideoPlaying();
-                                }
-                            });
-                        }, 3000);
-                    }
-                });
+                checkWebVideoPlayingAndFullscreen(0);
             }, 2000);
             return;
         }
@@ -1907,7 +1892,7 @@ public class MainActivity extends AppCompatActivity {
             
             @Override
             public void onShowCustomView(View view, CustomViewCallback callback) {
-                // 视频元素请求全屏时，仅对非DRM流尝试ExoPlayer接管；DRM流直接用WebView全屏渲染
+                // 视频元素请求全屏时，尝试用ExoPlayer接管播放直链视频
                 if (useWebMode && !isWebVideoFullscreenRequested) {
                     tryExtractAndPlayVideo();
                 }
@@ -2302,10 +2287,11 @@ public class MainActivity extends AppCompatActivity {
                         boolean isDirectLink = videoUrl.contains(".m3u8") || videoUrl.contains(".mp4") || videoUrl.contains(".flv") || videoUrl.contains(".ts");
                         if (!videoUrl.isEmpty() && isDirectLink) {
                             // CCTV的DRM流ExoPlayer无法解密，交给WebView播放器播放
+                            // 注意：cctvnews.cctv.com（央视新闻直播）的流可以被ExoPlayer正常播放
                             String lowerVid = videoUrl.toLowerCase();
                             boolean isCctv = lowerVid.contains("cdrm") || lowerVid.contains("kcdnvip")
-                                || lowerVid.contains("cctvnews.cctv.com") || lowerVid.contains("cctv.cn")
-                                || (lowerVid.contains("cctv") && lowerVid.contains(".m3u8"));
+                                || lowerVid.contains("cctv.cn")
+                                || (lowerVid.contains("cctv") && lowerVid.contains(".m3u8") && !lowerVid.contains("cctvnews"));
                             if (isCctv) {
                                 android.util.Log.i("NewsLive", "extractAndPlay: keep WebView for CCTV/DRM stream: " + videoUrl);
                                 autoClickPlayButton();
@@ -2588,6 +2574,29 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /** 检查WebView视频是否正在播放（支持iframe内的video），播放后触发全屏
+     *  retryIndex: 重试次数，最多5次，每次间隔2秒 */
+    private void checkWebVideoPlayingAndFullscreen(int retryIndex) {
+        if (webView == null) return;
+        // 检查主document和同源iframe内的video播放状态
+        String checkJs = "(function(){try{" +
+            "function checkDoc(doc){try{var v=doc.querySelector('video');if(v&&!v.paused&&v.currentTime>0)return 'playing';}catch(e){}return '';}" +
+            // 先查主文档
+            "var r=checkDoc(document);if(r)return r;" +
+            // 再查同源iframe
+            "var iframes=document.querySelectorAll('iframe');" +
+            "for(var i=0;i<iframes.length;i++){try{if(iframes[i].contentDocument){r=checkDoc(iframes[i].contentDocument);if(r)return r;}}catch(e){}}" +
+            "return 'not-playing';}catch(e){return 'error';}})();";
+        webView.evaluateJavascript(checkJs, r -> {
+            if (r != null && r.contains("playing")) {
+                onWebVideoPlaying();
+            } else if (retryIndex < 5) {
+                // 2秒后重试，最多6次（共12秒）
+                handler.postDelayed(() -> checkWebVideoPlayingAndFullscreen(retryIndex + 1), 2000);
+            }
+        });
+    }
+
     /** WebView视频开始播放后的统一处理：隐藏控制面板（保留顶部信息条）、触发全屏、启动卡顿检测 */
     private void onWebVideoPlaying() {
         isPlaying = true;
@@ -2668,7 +2677,11 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void run() {
                 if (webView == null) return;
-                String checkJs = "(function(){try{var v=document.querySelector('video');if(!v)return 'no-video';" +
+                String checkJs = "(function(){try{" +
+                    "function findVideo(doc){try{var v=doc.querySelector('video');if(v)return v;}catch(e){}return null;}" +
+                    "var v=findVideo(document);" +
+                    "if(!v){var iframes=document.querySelectorAll('iframe');for(var i=0;i<iframes.length;i++){try{if(iframes[i].contentDocument){v=findVideo(iframes[i].contentDocument);if(v)break;}}catch(e){}}}" +
+                    "if(!v)return 'no-video';" +
                     "return JSON.stringify({t:v.currentTime,paused:v.paused,ready:v.readyState});}catch(e){return 'err';}})();";
                 webView.evaluateJavascript(checkJs, result -> {
                     if (result == null || result.contains("no-video") || result.contains("err")) {
