@@ -2,6 +2,17 @@ plugins {
     id 'com.android.application'
 }
 
+// 从 version.properties 读取版本号（GitHub Action 会自动递增）
+def versionPropsFile = rootProject.file("version.properties")
+def versionCode = 1
+def versionName = "1.0.0"
+if (versionPropsFile.exists()) {
+    def versionProps = new Properties()
+    versionProps.load(new FileInputStream(versionPropsFile))
+    versionCode = versionProps['VERSION_CODE'].toInteger()
+    versionName = versionProps['VERSION_NAME']
+}
+
 android {
     namespace 'com.newslive.app'
     compileSdk 34
@@ -10,14 +21,43 @@ android {
         applicationId "com.newslive.app"
         minSdk 21
         targetSdk 28
-        versionCode 1
-        versionName "1.0"
+        versionCode = versionCode
+        versionName = versionName
+    }
+
+    // 签名配置：本地用 keystore 文件，CI 用环境变量解码的 keystore
+    signingConfigs {
+        release {
+            def keystorePath = System.getenv("KEYSTORE_PATH")
+            if (keystorePath != null && !keystorePath.isEmpty()) {
+                storeFile file(keystorePath)
+                storePassword System.getenv("KEYSTORE_PASSWORD")
+                keyAlias System.getenv("KEY_ALIAS")
+                keyPassword System.getenv("KEY_PASSWORD")
+            } else if (rootProject.file("app/newslive-release.jks").exists()) {
+                // 本地开发用（keystore 已存在时启用，避免本地构建失败）
+                storeFile rootProject.file("app/newslive-release.jks")
+                storePassword "newslive2024"
+                keyAlias "newslive"
+                keyPassword "newslive2024"
+            }
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // 配置 release 签名
+            if (rootProject.file("app/newslive-release.jks").exists() || System.getenv("KEYSTORE_PATH") != null) {
+                signingConfig signingConfigs.release
+            }
+            // 输出 APK 文件名：newslive-v<版本号>.apk
+            android.applicationVariants.all { variant ->
+                variant.outputs.all {
+                    outputFileName = "newslive-v${versionName}.apk"
+                }
+            }
         }
     }
     compileOptions {
