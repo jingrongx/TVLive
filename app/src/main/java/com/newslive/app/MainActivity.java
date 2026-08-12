@@ -249,6 +249,9 @@ public class MainActivity extends AppCompatActivity {
     private static final int STALL_REFRESH_COOLDOWN_MS = 30000; // 刷新冷却30秒，避免连续刷新
     private long lastStallRefreshTime = 0;
     private boolean isWebVideoFullscreenRequested = false;
+    // 刷新后兜底定时器：如果视频长时间未恢复播放，再次刷新
+    private Runnable webRefreshFallbackRunnable;
+    private static final int WEB_REFRESH_FALLBACK_DELAY_MS = 60000; // 60秒后视频仍未恢复则再次刷新
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -1539,6 +1542,7 @@ public class MainActivity extends AppCompatActivity {
     
     private void stopAllPlayback() {
         stopWebVideoStallDetector();
+        cancelWebRefreshFallback();
         isWebVideoFullscreenRequested = false;
         if (player != null) {
             try {
@@ -2572,6 +2576,28 @@ public class MainActivity extends AppCompatActivity {
         } else {
             webView.reload();
         }
+
+        // 兜底定时器：如果60秒后视频仍未恢复播放（onWebVideoPlaying未被调用），再次刷新
+        startWebRefreshFallback();
+    }
+
+    /** 启动刷新后兜底定时器：视频长时间未恢复播放时再次刷新 */
+    private void startWebRefreshFallback() {
+        cancelWebRefreshFallback();
+        webRefreshFallbackRunnable = () -> {
+            android.util.Log.w("NewsLive", "Video not recovered 60s after refresh, retrying");
+            Toast.makeText(MainActivity.this, "视频未恢复，重新加载...", Toast.LENGTH_SHORT).show();
+            refreshVideoFromWeb();
+        };
+        handler.postDelayed(webRefreshFallbackRunnable, WEB_REFRESH_FALLBACK_DELAY_MS);
+    }
+
+    /** 取消刷新后兜底定时器 */
+    private void cancelWebRefreshFallback() {
+        if (webRefreshFallbackRunnable != null) {
+            handler.removeCallbacks(webRefreshFallbackRunnable);
+            webRefreshFallbackRunnable = null;
+        }
     }
 
     /** 检查WebView视频是否正在播放（支持iframe内的video），播放后触发全屏
@@ -2600,6 +2626,8 @@ public class MainActivity extends AppCompatActivity {
     /** WebView视频开始播放后的统一处理：隐藏控制面板（保留顶部信息条）、触发全屏、启动卡顿检测 */
     private void onWebVideoPlaying() {
         isPlaying = true;
+        // 视频已恢复播放，取消刷新兜底定时器
+        cancelWebRefreshFallback();
         startHideControlTimer();
         // 仅隐藏控制面板和进度条，保留顶部信息横幅（时间日期、天气节气）
         if (controlPanel != null) controlPanel.setVisibility(View.GONE);
@@ -2667,8 +2695,9 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    /** 启动WebView视频卡顿检测：定时检查currentTime是否推进
-     *  关键策略：readyState<3（加载/缓冲中）不判卡顿；刷新后30秒冷却期避免连续刷新 */
+    /** 启动WebView视频卡顿检测：定时检查currentTime是否推进、videoWidth是否有值
+     *  关键策略：readyState<3（加载/缓冲中）不判卡顿；刷新后30秒冷却期避免连续刷新
+     *  额外检测：有声音但画面空白（currentTime推进但videoWidth===0）也判定为卡顿 */
     private void startWebVideoStallDetector() {
         stopWebVideoStallDetector();
         lastWebVideoTime = -1;
@@ -2682,7 +2711,7 @@ public class MainActivity extends AppCompatActivity {
                     "var v=findVideo(document);" +
                     "if(!v){var iframes=document.querySelectorAll('iframe');for(var i=0;i<iframes.length;i++){try{if(iframes[i].contentDocument){v=findVideo(iframes[i].contentDocument);if(v)break;}}catch(e){}}}" +
                     "if(!v)return 'no-video';" +
-                    "return JSON.stringify({t:v.currentTime,paused:v.paused,ready:v.readyState});}catch(e){return 'err';}})();";
+                    "return JSON.stringify({t:v.currentTime,paused:v.paused,ready:v.readyState,vw:v.videoWidth,vh:v.videoHeight});}catch(e){return 'err';}})();";
                 webView.evaluateJavascript(checkJs, result -> {
                     if (result == null || result.contains("no-video") || result.contains("err")) {
                         webVideoStallCount++;
@@ -2693,18 +2722,23 @@ public class MainActivity extends AppCompatActivity {
                             double currentTime = json.optDouble("t", 0);
                             boolean paused = json.optBoolean("paused", true);
                             int readyState = json.optInt("ready", 0);
-                            android.util.Log.d("NewsLive", "StallCheck: t=" + currentTime + " paused=" + paused + " ready=" + readyState + " stallCount=" + webVideoStallCount);
+                            int videoWidth = json.optInt("vw", 0);
+                            int videoHeight = json.optInt("vh", 0);
+                            android.util.Log.d("NewsLive", "StallCheck: t=" + currentTime + " paused=" + paused + " ready=" + readyState + " vw=" + videoWidth + "x" + videoHeight + " stallCount=" + webVideoStallCount);
                             // readyState < 3 (HAVE_FUTURE_DATA)：视频正在加载/缓冲，不判定卡顿
                             if (readyState < 3) {
                                 webVideoStallCount = 0;
                             } else if (paused) {
                                 // 视频暂停且能播放，可能卡住
                                 webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
+                            } else if (videoWidth == 0 && currentTime > 0) {
+                                // 有声音但画面空白：currentTime在推进但videoWidth为0，视频帧未渲染
+                                webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
                             } else if (lastWebVideoTime >= 0 && currentTime == lastWebVideoTime) {
                                 // 非暂停但currentTime没推进，真正卡顿
                                 webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
                             } else {
-                                // 正常推进，重置计数
+                                // 正常推进且有画面，重置计数
                                 webVideoStallCount = 0;
                             }
                             lastWebVideoTime = currentTime;
@@ -2713,14 +2747,15 @@ public class MainActivity extends AppCompatActivity {
                         }
                     }
                     if (webVideoStallCount >= WEB_STALL_THRESHOLD) {
-                        // 冷却期内不刷新，避免连续刷新（视频加载需要时间）
+                        // 冷却期内不刷新，但继续累计计数，冷却期一到立即刷新
                         long now = System.currentTimeMillis();
                         if (now - lastStallRefreshTime < STALL_REFRESH_COOLDOWN_MS) {
-                            android.util.Log.d("NewsLive", "Stall detected but in cooldown (" + (now - lastStallRefreshTime) / 1000 + "s since last refresh), skip");
-                            webVideoStallCount = 0;
+                            android.util.Log.d("NewsLive", "Stall detected but in cooldown (" + (now - lastStallRefreshTime) / 1000 + "s since last refresh), keep counting");
+                            // 不重置count，继续等冷却期结束
                             handler.postDelayed(this, WEB_STALL_CHECK_INTERVAL);
                         } else {
-                            android.util.Log.w("NewsLive", "WebView video stalled " + webVideoStallCount + "s, refreshing page");
+                            // 有声音说明流是活的，刷新当前页面即可，不切换频道
+                            android.util.Log.w("NewsLive", "WebView video stalled " + webVideoStallCount + "s, refreshing current page");
                             Toast.makeText(MainActivity.this, "视频卡顿，正在刷新...", Toast.LENGTH_SHORT).show();
                             webVideoStallCount = 0;
                             lastStallRefreshTime = now;
@@ -3314,6 +3349,8 @@ public class MainActivity extends AppCompatActivity {
 
         // 停止WebView视频卡顿检测
         stopWebVideoStallDetector();
+        // 取消刷新兜底定时器
+        cancelWebRefreshFallback();
 
         // 清理全屏视图
         cleanupCustomView();
