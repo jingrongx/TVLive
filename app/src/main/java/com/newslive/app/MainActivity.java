@@ -252,10 +252,18 @@ public class MainActivity extends AppCompatActivity {
     // 刷新后兜底定时器：如果视频长时间未恢复播放，再次刷新
     private Runnable webRefreshFallbackRunnable;
     private static final int WEB_REFRESH_FALLBACK_DELAY_MS = 60000; // 60秒后视频仍未恢复则再次刷新
+    private int webRefreshFallbackCount = 0; // 兜底刷新次数，超过上限停止刷新避免无限循环
+    private static final int MAX_WEB_REFRESH_FALLBACK = 2;
+
+    // ExoPlayer监听器引用：切换视频源前先移除旧监听器，避免监听器泄漏导致
+    // 多个缓冲看门狗并存、用旧URL重新prepare等引起的异常卡顿和刷新
+    private Player.Listener currentPlayerListener;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 初始化日志落盘（自动保存+轮转清理）
+        LogUtil.init(this);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         hideSystemUI();
         setContentView(R.layout.activity_main);
@@ -373,7 +381,7 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
         } catch (Exception e) {
-            android.util.Log.w("NewsLive", "applyBlackBackgroundRecursive: " + e.getMessage());
+            LogUtil.w("NewsLive", "applyBlackBackgroundRecursive: " + e.getMessage());
         }
     }
 
@@ -394,7 +402,7 @@ public class MainActivity extends AppCompatActivity {
             try {
                 customViewCallback.onCustomViewHidden();
             } catch (Exception e) {
-                android.util.Log.w("NewsLive", "cleanupCustomView callback: " + e.getMessage());
+                LogUtil.w("NewsLive", "cleanupCustomView callback: " + e.getMessage());
             }
             customViewCallback = null;
         }
@@ -679,7 +687,7 @@ public class MainActivity extends AppCompatActivity {
             // 优先使用 currentSrc（视频实际使用的地址），为空或blob时回退到嗅探地址
             String finalUrl = (realUrl != null && !realUrl.isEmpty() && !realUrl.startsWith("blob:"))
                 ? realUrl : sniffedUrl;
-            android.util.Log.i("NewsLive", "Video check: isPlaying=" + isPlaying
+            LogUtil.i("NewsLive", "Video check: isPlaying=" + isPlaying
                 + " realUrl=" + realUrl + " sniffedUrl=" + sniffedUrl);
 
             if (isPlaying) {
@@ -728,7 +736,7 @@ public class MainActivity extends AppCompatActivity {
                 pendingSwitchTimeoutRunnable = () -> {
                     if (pendingAutoSwitch && webView != null
                         && webView.getVisibility() == View.VISIBLE) {
-                        android.util.Log.w("NewsLive",
+                        LogUtil.w("NewsLive",
                             "Video not playing after 8s, keep WebView (url may be invalid): "
                                 + candidateVideoUrl);
                     }
@@ -752,7 +760,7 @@ public class MainActivity extends AppCompatActivity {
             || lowerUrl.contains("cctv.cn")
             || (lowerUrl.contains("cctv") && lowerUrl.contains(".m3u8") && !lowerUrl.contains("cctvnews"));
         if (isCctvStream) {
-            android.util.Log.i("NewsLive", "skip ExoPlayer for CCTV/DRM stream, keep WebView: " + videoUrl);
+            LogUtil.i("NewsLive", "skip ExoPlayer for CCTV/DRM stream, keep WebView: " + videoUrl);
             // 确保WebView可见并触发自动播放
             if (webView != null) {
                 webView.setVisibility(View.VISIBLE);
@@ -770,7 +778,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        android.util.Log.i("NewsLive", "switchToPlayerMode: " + videoUrl);
+        LogUtil.i("NewsLive", "switchToPlayerMode: " + videoUrl);
         runOnUiThread(() -> {
             sniffRefreshCount = 0;
             // 暂停WebView的所有活动和播放
@@ -843,7 +851,7 @@ public class MainActivity extends AppCompatActivity {
 
         String savedSites = prefs.getString(KEY_WEB_SITES, "");
         if (needRefresh || savedSites.isEmpty()) {
-            android.util.Log.i("NewsLive", "loadWebSites: refreshing to defaults, savedVersion=" + savedVersion + " currentVersion=" + CURRENT_WEB_SITES_VERSION);
+            LogUtil.i("NewsLive", "loadWebSites: refreshing to defaults, savedVersion=" + savedVersion + " currentVersion=" + CURRENT_WEB_SITES_VERSION);
             prefs.edit().remove(KEY_WEB_SITES).putInt(KEY_WEB_SITES_VERSION, CURRENT_WEB_SITES_VERSION).apply();
             currentSiteIndex = 0;
             prefs.edit().putInt(KEY_CURRENT_SITE_INDEX, 0).apply();
@@ -939,7 +947,7 @@ public class MainActivity extends AppCompatActivity {
     // ==================== 右上角时钟 ====================
     // 应用顶部信息横幅样式：可见性、字号、高度
     private void applyBannerStyle() {
-        android.util.Log.i("NewsLive", "applyBannerStyle: visible=" + bannerVisible + " fontSize=" + bannerFontSize + " height=" + bannerHeight);
+        LogUtil.i("NewsLive", "applyBannerStyle: visible=" + bannerVisible + " fontSize=" + bannerFontSize + " height=" + bannerHeight);
         if (infoOverlay == null) return;
         infoOverlay.setVisibility(bannerVisible ? android.view.View.VISIBLE : android.view.View.GONE);
         if (!bannerVisible) return;
@@ -996,7 +1004,7 @@ public class MainActivity extends AppCompatActivity {
                 @Override
                 public void run() {
                     if (lastLatitude != 0 && lastLongitude != 0) {
-                        android.util.Log.i("NewsLive", "定时刷新天气");
+                        LogUtil.i("NewsLive", "定时刷新天气");
                         fetchWeather(lastLatitude, lastLongitude);
                     }
                     weatherRefreshHandler.postDelayed(this, 30 * 60 * 1000);
@@ -1049,17 +1057,17 @@ public class MainActivity extends AppCompatActivity {
         int month = cal.get(java.util.Calendar.MONTH) + 1;
         int day = cal.get(java.util.Calendar.DAY_OF_MONTH);
 
-        android.util.Log.i("NewsLive", "updateDateInfo: " + year + "-" + month + "-" + day);
+        LogUtil.i("NewsLive", "updateDateInfo: " + year + "-" + month + "-" + day);
 
         if (tvLunar != null) {
             try {
                 int[] lunar = LunarCalendar.solarToLunar(year, month, day);
-                android.util.Log.i("NewsLive", "lunar result: year=" + lunar[0] + " month=" + lunar[1] + " day=" + lunar[2] + " isLeap=" + lunar[3]);
+                LogUtil.i("NewsLive", "lunar result: year=" + lunar[0] + " month=" + lunar[1] + " day=" + lunar[2] + " isLeap=" + lunar[3]);
                 String lunarStr = LunarCalendar.formatLunar(lunar[0], lunar[1], lunar[2], lunar[3] == 1);
-                android.util.Log.i("NewsLive", "lunar string: " + lunarStr);
+                LogUtil.i("NewsLive", "lunar string: " + lunarStr);
                 tvLunar.setText(lunarStr);
             } catch (Exception e) {
-                android.util.Log.e("NewsLive", "lunar calc error", e);
+                LogUtil.e("NewsLive", "lunar calc error", e);
                 tvLunar.setText("农历计算错误");
             }
         }
@@ -1067,11 +1075,11 @@ public class MainActivity extends AppCompatActivity {
         if (tvJieqi != null) {
             try {
                 String jieqi = LunarCalendar.getJieqiInfo(year, month, day);
-                android.util.Log.i("NewsLive", "jieqi: " + jieqi);
+                LogUtil.i("NewsLive", "jieqi: " + jieqi);
                 tvJieqi.setText(jieqi);
                 updateJieqiStyle(jieqi.startsWith("今日"));
             } catch (Exception e) {
-                android.util.Log.e("NewsLive", "jieqi calc error", e);
+                LogUtil.e("NewsLive", "jieqi calc error", e);
                 tvJieqi.setText("节气计算错误");
             }
         }
@@ -1123,7 +1131,7 @@ public class MainActivity extends AppCompatActivity {
                 conn.disconnect();
 
                 String resp = response.toString();
-                android.util.Log.i("NewsLive", "pconline response: " + resp);
+                LogUtil.i("NewsLive", "pconline response: " + resp);
                 JSONObject json = new JSONObject(resp);
 
                 // pconline返回字段: pro, city, region, addr（不含坐标）
@@ -1131,7 +1139,7 @@ public class MainActivity extends AppCompatActivity {
                 String city = json.optString("city", ""); // 市
                 String region = json.optString("region", ""); // 区
 
-                android.util.Log.i("NewsLive", "pconline pro=" + pro + " city=" + city + " region=" + region);
+                LogUtil.i("NewsLive", "pconline pro=" + pro + " city=" + city + " region=" + region);
 
                 // 组合显示：省 + 市 + 区
                 String name = "";
@@ -1144,10 +1152,10 @@ public class MainActivity extends AppCompatActivity {
                 runOnUiThread(() -> tvLocation.setText("📍 " + shortenLocation(finalName)));
 
                 // pconline不返回坐标，直接用ip-api获取坐标（快速），地理编码仅作ip-api失败时的备用
-                android.util.Log.i("NewsLive", "pconline OK, fetching coords from ip-api");
+                LogUtil.i("NewsLive", "pconline OK, fetching coords from ip-api");
                 fetchLocationByIPBackup(name);
             } catch (Exception e) {
-                android.util.Log.e("NewsLive", "pconline failed", e);
+                LogUtil.e("NewsLive", "pconline failed", e);
                 fetchLocationByIPBackup("");
             }
         });
@@ -1159,7 +1167,7 @@ public class MainActivity extends AppCompatActivity {
             try {
                 String urlStr = "https://geocoding-api.open-meteo.com/v1/search?name=" +
                     URLEncoder.encode(cityName, "UTF-8") + "&count=1&language=zh&format=json";
-                android.util.Log.i("NewsLive", "geocoding: " + cityName);
+                LogUtil.i("NewsLive", "geocoding: " + cityName);
                 URL url = new URL(urlStr);
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setConnectTimeout(10000);
@@ -1175,23 +1183,23 @@ public class MainActivity extends AppCompatActivity {
                 conn.disconnect();
 
                 String resp = response.toString();
-                android.util.Log.i("NewsLive", "geocoding response: " + resp);
+                LogUtil.i("NewsLive", "geocoding response: " + resp);
                 JSONObject json = new JSONObject(resp);
                 JSONArray results = json.optJSONArray("results");
                 if (results != null && results.length() > 0) {
                     JSONObject first = results.getJSONObject(0);
                     double lat = first.getDouble("latitude");
                     double lon = first.getDouble("longitude");
-                    android.util.Log.i("NewsLive", "geocoded: " + cityName + " -> lat=" + lat + " lon=" + lon);
+                    LogUtil.i("NewsLive", "geocoded: " + cityName + " -> lat=" + lat + " lon=" + lon);
                     lastLatitude = lat;
                     lastLongitude = lon;
                     fetchWeather(lat, lon);
                 } else {
-                    android.util.Log.w("NewsLive", "geocoding no results for: " + cityName);
+                    LogUtil.w("NewsLive", "geocoding no results for: " + cityName);
                     fetchLocationByIPBackup(fallbackDisplayName);
                 }
             } catch (Exception e) {
-                android.util.Log.e("NewsLive", "geocoding failed", e);
+                LogUtil.e("NewsLive", "geocoding failed", e);
                 fetchLocationByIPBackup(fallbackDisplayName);
             }
         });
@@ -1217,7 +1225,7 @@ public class MainActivity extends AppCompatActivity {
                 conn.disconnect();
 
                 String resp = response.toString();
-                android.util.Log.i("NewsLive", "ip-api response: " + resp);
+                LogUtil.i("NewsLive", "ip-api response: " + resp);
                 JSONObject json = new JSONObject(resp);
 
                 double lat = json.optDouble("lat", 0);
@@ -1225,7 +1233,7 @@ public class MainActivity extends AppCompatActivity {
                 String city = json.optString("city", "");
                 String region = json.optString("regionName", "");
 
-                android.util.Log.i("NewsLive", "ip-api city=" + city + " region=" + region + " lat=" + lat + " lon=" + lon);
+                LogUtil.i("NewsLive", "ip-api city=" + city + " region=" + region + " lat=" + lat + " lon=" + lon);
 
                 if (lat != 0 && lon != 0) {
                     lastLatitude = lat;
@@ -1239,14 +1247,14 @@ public class MainActivity extends AppCompatActivity {
                         runOnUiThread(() -> tvLocation.setText("📍 " + finalName));
                     } else {
                         // 无中文名，用坐标逆地理编码获取中文名
-                        android.util.Log.i("NewsLive", "reverse geocoding for Chinese name...");
+                        LogUtil.i("NewsLive", "reverse geocoding for Chinese name...");
                         fetchCityName(lat, lon, region);
                     }
                 } else {
                     runOnUiThread(() -> tvLocation.setText("📍 定位失败"));
                 }
             } catch (Exception e) {
-                android.util.Log.e("NewsLive", "ip-api failed", e);
+                LogUtil.e("NewsLive", "ip-api failed", e);
                 // ip-api失败时，若有pconline中文名则尝试地理编码获取坐标
                 if (preferredCityName != null && !preferredCityName.isEmpty()) {
                     String geocodeName = preferredCityName;
@@ -1254,7 +1262,7 @@ public class MainActivity extends AppCompatActivity {
                     if (parts.length > 0) geocodeName = parts[parts.length - 1];
                     if (geocodeName.endsWith("市")) geocodeName = geocodeName.substring(0, geocodeName.length() - 1);
                     if (geocodeName.endsWith("区")) geocodeName = geocodeName.substring(0, geocodeName.length() - 1);
-                    android.util.Log.i("NewsLive", "ip-api failed, trying geocoding: " + geocodeName);
+                    LogUtil.i("NewsLive", "ip-api failed, trying geocoding: " + geocodeName);
                     geocodeAndFetchWeather(geocodeName, preferredCityName);
                 } else {
                     runOnUiThread(() -> tvLocation.setText("📍 定位失败"));
@@ -1271,7 +1279,7 @@ public class MainActivity extends AppCompatActivity {
                 String urlStr = String.format(
                     "https://nominatim.openstreetmap.org/reverse?lat=%.6f&lon=%.6f&format=json&accept-language=zh&zoom=10",
                     lat, lon);
-                android.util.Log.i("NewsLive", "nominatim: " + urlStr);
+                LogUtil.i("NewsLive", "nominatim: " + urlStr);
                 URL url = new URL(urlStr);
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setConnectTimeout(10000);
@@ -1287,7 +1295,7 @@ public class MainActivity extends AppCompatActivity {
                 conn.disconnect();
 
                 String resp = response.toString();
-                android.util.Log.i("NewsLive", "nominatim response: " + resp);
+                LogUtil.i("NewsLive", "nominatim response: " + resp);
                 JSONObject json = new JSONObject(resp);
                 JSONObject address = json.getJSONObject("address");
 
@@ -1312,10 +1320,10 @@ public class MainActivity extends AppCompatActivity {
                 String finalName = shortenLocation(name);
                 runOnUiThread(() -> tvLocation.setText("📍 " + finalName));
             } catch (Exception e) {
-                android.util.Log.e("NewsLive", "nominatim failed", e);
+                LogUtil.e("NewsLive", "nominatim failed", e);
                 // 备用：BigDataCloud
                 try {
-                    android.util.Log.i("NewsLive", "trying bigdatacloud reverse geocoding...");
+                    LogUtil.i("NewsLive", "trying bigdatacloud reverse geocoding...");
                     String urlStr = String.format(
                         "https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=%.6f&longitude=%.6f&localityLanguage=zh",
                         lat, lon);
@@ -1334,7 +1342,7 @@ public class MainActivity extends AppCompatActivity {
                     conn.disconnect();
 
                     String resp = response.toString();
-                    android.util.Log.i("NewsLive", "bigdatacloud response: " + resp);
+                    LogUtil.i("NewsLive", "bigdatacloud response: " + resp);
                     JSONObject json = new JSONObject(resp);
                     String city = json.optString("city", "");
                     String locality = json.optString("locality", "");
@@ -1349,7 +1357,7 @@ public class MainActivity extends AppCompatActivity {
                     String finalName = shortenLocation(name);
                     runOnUiThread(() -> tvLocation.setText("📍 " + finalName));
                 } catch (Exception e2) {
-                    android.util.Log.e("NewsLive", "bigdatacloud failed", e2);
+                    LogUtil.e("NewsLive", "bigdatacloud failed", e2);
                     // 全部逆地理编码失败，使用ip-api的中文省份名作为兜底
                     String fb = fallbackName != null && !fallbackName.isEmpty() ? fallbackName : "定位失败";
                     runOnUiThread(() -> tvLocation.setText("📍 " + fb));
@@ -1365,7 +1373,7 @@ public class MainActivity extends AppCompatActivity {
                 String weatherUrl = String.format(
                     "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&daily=weathercode,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=3",
                     lat, lon);
-                android.util.Log.i("NewsLive", "fetchWeather: lat=" + lat + " lon=" + lon);
+                LogUtil.i("NewsLive", "fetchWeather: lat=" + lat + " lon=" + lon);
                 URL url = new URL(weatherUrl);
                 HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                 conn.setConnectTimeout(10000);
@@ -1381,7 +1389,7 @@ public class MainActivity extends AppCompatActivity {
                 conn.disconnect();
 
                 String resp = response.toString();
-                android.util.Log.i("NewsLive", "weather response: " + resp);
+                LogUtil.i("NewsLive", "weather response: " + resp);
                 JSONObject json = new JSONObject(resp);
                 JSONObject daily = json.getJSONObject("daily");
                 JSONArray codes = daily.getJSONArray("weathercode");
@@ -1398,7 +1406,7 @@ public class MainActivity extends AppCompatActivity {
                     double minT = minTemps.getDouble(i);
                     temps[i] = String.format("%.0f°/%.0f°", maxT, minT);
                 }
-                android.util.Log.i("NewsLive", "weather OK: " + temps[0] + " " + temps[1] + " " + temps[2]);
+                LogUtil.i("NewsLive", "weather OK: " + temps[0] + " " + temps[1] + " " + temps[2]);
 
                 runOnUiThread(() -> {
                     tvW0Label.setText(labels[0]);
@@ -1412,7 +1420,7 @@ public class MainActivity extends AppCompatActivity {
                     tvW2Temp.setText(temps[2]);
                 });
             } catch (Exception e) {
-                android.util.Log.e("NewsLive", "fetchWeather failed", e);
+                LogUtil.e("NewsLive", "fetchWeather failed", e);
                 runOnUiThread(() -> {
                     tvW0Icon.setText("🌤");
                     tvW0Temp.setText("获取失败");
@@ -1860,7 +1868,7 @@ public class MainActivity extends AppCompatActivity {
                         // 因为该地址可能是浏览器预加载发起的（视频暂停时也会请求 m3u8）
                         // 必须在 checkVideoPlayingAndSwitch 中确认视频真正播放后才使用
                         if (lastDetectedVideoUrl.isEmpty() || now - lastSniffTime > 10000) {
-                            android.util.Log.d("NewsLive", "Sniffed candidate stream: " + url);
+                            LogUtil.d("NewsLive", "Sniffed candidate stream: " + url);
                             candidateVideoUrl = url;
                             lastSniffTime = now;
                             // 延迟2秒，等视频元素就绪后检查播放状态
@@ -2297,7 +2305,7 @@ public class MainActivity extends AppCompatActivity {
                                 || lowerVid.contains("cctv.cn")
                                 || (lowerVid.contains("cctv") && lowerVid.contains(".m3u8") && !lowerVid.contains("cctvnews"));
                             if (isCctv) {
-                                android.util.Log.i("NewsLive", "extractAndPlay: keep WebView for CCTV/DRM stream: " + videoUrl);
+                                LogUtil.i("NewsLive", "extractAndPlay: keep WebView for CCTV/DRM stream: " + videoUrl);
                                 autoClickPlayButton();
                                 return;
                             }
@@ -2410,10 +2418,16 @@ public class MainActivity extends AppCompatActivity {
     private void playVideoUrlWithRetry(String url, String name, int retryCount, boolean isRefreshed) {
         if (player == null || url == null || url.isEmpty()) return;
 
-        android.util.Log.i("NewsLive", "playVideoUrl: " + url + " retry=" + retryCount + " refreshed=" + isRefreshed);
+        LogUtil.i("NewsLive", "playVideoUrl: " + url + " retry=" + retryCount + " refreshed=" + isRefreshed);
 
         tvSourceInfo.setText(name + (isRefreshed ? " (已刷新)" : ""));
         progressBar.setVisibility(View.VISIBLE);
+
+        // 移除上一次注册的监听器，防止监听器泄漏（每次切源/重试都会新建监听器）
+        if (currentPlayerListener != null) {
+            player.removeListener(currentPlayerListener);
+            currentPlayerListener = null;
+        }
 
         MediaItem mediaItem = MediaItem.fromUri(Uri.parse(url));
         try {
@@ -2421,9 +2435,9 @@ public class MainActivity extends AppCompatActivity {
             player.setMediaItem(mediaItem);
             player.prepare();
             player.setPlayWhenReady(true);
-            android.util.Log.i("NewsLive", "prepare() called successfully");
+            LogUtil.i("NewsLive", "prepare() called successfully");
         } catch (Exception e) {
-            android.util.Log.e("NewsLive", "prepare() failed", e);
+            LogUtil.e("NewsLive", "prepare() failed", e);
         }
         
         final int[] bufferingTime = {0};
@@ -2431,7 +2445,7 @@ public class MainActivity extends AppCompatActivity {
         final int[] seekRetryCount = {0};
         final int[] pauseRetryCount = {0};
         
-        player.addListener(new Player.Listener() {
+        currentPlayerListener = new Player.Listener() {
             @Override
             public void onVideoSizeChanged(VideoSize videoSize) {
                 currentVideoWidth = videoSize.width;
@@ -2441,7 +2455,7 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onPlaybackStateChanged(int playbackState) {
-                android.util.Log.i("NewsLive", "onPlaybackStateChanged: " + playbackState + " url=" + url);
+                LogUtil.i("NewsLive", "onPlaybackStateChanged: " + playbackState + " url=" + url);
                 switch (playbackState) {
                     case Player.STATE_BUFFERING:
                         progressBar.setVisibility(View.VISIBLE);
@@ -2452,7 +2466,7 @@ public class MainActivity extends AppCompatActivity {
                                 if (player != null && player.getPlaybackState() == Player.STATE_BUFFERING) {
                                     bufferingTime[0]++;
                                     if (bufferingTime[0] % 5 == 0) {
-                                        android.util.Log.w("NewsLive", "Buffering " + bufferingTime[0] + "s, pos=" + player.getCurrentPosition() + " buffered=" + player.getBufferedPosition());
+                                        LogUtil.w("NewsLive", "Buffering " + bufferingTime[0] + "s, pos=" + player.getCurrentPosition() + " buffered=" + player.getBufferedPosition());
                                     }
                                     if (bufferingTime[0] > 15) {
                                         if (!isRefreshed && useWebMode && seekRetryCount[0] >= 2) {
@@ -2502,7 +2516,7 @@ public class MainActivity extends AppCompatActivity {
                 progressBar.setVisibility(View.GONE);
                 hasError[0] = true;
 
-                android.util.Log.e("NewsLive", "onPlayerError: " + error.getMessage() + " errorCode=" + error.errorCode + " cause=" + (error.getCause() != null ? error.getCause().getMessage() : "null"), error);
+                LogUtil.e("NewsLive", "onPlayerError: " + error.getMessage() + " errorCode=" + error.errorCode + " cause=" + (error.getCause() != null ? error.getCause().getMessage() : "null"), error);
 
                 int newRetryCount = retryCount + 1;
                 if (newRetryCount <= 3) {
@@ -2541,7 +2555,8 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }
             }
-        });
+        };
+        player.addListener(currentPlayerListener);
         
         player.prepare();
         player.setPlayWhenReady(true);
@@ -2581,11 +2596,17 @@ public class MainActivity extends AppCompatActivity {
         startWebRefreshFallback();
     }
 
-    /** 启动刷新后兜底定时器：视频长时间未恢复播放时再次刷新 */
+    /** 启动刷新后兜底定时器：视频长时间未恢复播放时再次刷新（最多 MAX_WEB_REFRESH_FALLBACK 次，避免无限刷新） */
     private void startWebRefreshFallback() {
         cancelWebRefreshFallback();
+        if (webRefreshFallbackCount >= MAX_WEB_REFRESH_FALLBACK) {
+            LogUtil.w("NewsLive", "refresh fallback reached max(" + MAX_WEB_REFRESH_FALLBACK + "), stop retrying");
+            return;
+        }
+        webRefreshFallbackCount++;
+        final int attempt = webRefreshFallbackCount;
         webRefreshFallbackRunnable = () -> {
-            android.util.Log.w("NewsLive", "Video not recovered 60s after refresh, retrying");
+            LogUtil.w("NewsLive", "Video not recovered 60s after refresh, retrying (" + attempt + "/" + MAX_WEB_REFRESH_FALLBACK + ")");
             Toast.makeText(MainActivity.this, "视频未恢复，重新加载...", Toast.LENGTH_SHORT).show();
             refreshVideoFromWeb();
         };
@@ -2626,7 +2647,8 @@ public class MainActivity extends AppCompatActivity {
     /** WebView视频开始播放后的统一处理：隐藏控制面板（保留顶部信息条）、触发全屏、启动卡顿检测 */
     private void onWebVideoPlaying() {
         isPlaying = true;
-        // 视频已恢复播放，取消刷新兜底定时器
+        // 视频已恢复播放，取消刷新兜底定时器并重置计数
+        webRefreshFallbackCount = 0;
         cancelWebRefreshFallback();
         startHideControlTimer();
         // 仅隐藏控制面板和进度条，保留顶部信息横幅（时间日期、天气节气）
@@ -2634,7 +2656,7 @@ public class MainActivity extends AppCompatActivity {
         if (progressBar != null) progressBar.setVisibility(View.GONE);
         // 设置WebView背景为黑色
         if (webView != null) webView.setBackgroundColor(0xFF000000);
-        android.util.Log.i("NewsLive", "WebView video playing, isPlaying=true, hide control panel, keep info overlay");
+        LogUtil.i("NewsLive", "WebView video playing, isPlaying=true, hide control panel, keep info overlay");
         requestWebVideoFullscreen();
         startWebVideoStallDetector();
     }
@@ -2691,13 +2713,13 @@ public class MainActivity extends AppCompatActivity {
             "else if(v.webkitEnterFullscreen){v.webkitEnterFullscreen();}}catch(e){}" +
             "return 'css-fullscreen';}catch(e){return 'err:'+e.message;}})();";
         webView.evaluateJavascript(js, r -> {
-            android.util.Log.i("NewsLive", "requestWebVideoFullscreen: " + r);
+            LogUtil.i("NewsLive", "requestWebVideoFullscreen: " + r);
         });
     }
 
-    /** 启动WebView视频卡顿检测：定时检查currentTime是否推进、videoWidth是否有值
+    /** 启动WebView视频卡顿检测：定时检查currentTime是否推进
      *  关键策略：readyState<3（加载/缓冲中）不判卡顿；刷新后30秒冷却期避免连续刷新
-     *  额外检测：有声音但画面空白（currentTime推进但videoWidth===0）也判定为卡顿 */
+     *  恢复策略：卡顿时优先用ExoPlayer接管播放（解码更稳定），无可用流地址才刷新页面 */
     private void startWebVideoStallDetector() {
         stopWebVideoStallDetector();
         lastWebVideoTime = -1;
@@ -2711,7 +2733,7 @@ public class MainActivity extends AppCompatActivity {
                     "var v=findVideo(document);" +
                     "if(!v){var iframes=document.querySelectorAll('iframe');for(var i=0;i<iframes.length;i++){try{if(iframes[i].contentDocument){v=findVideo(iframes[i].contentDocument);if(v)break;}}catch(e){}}}" +
                     "if(!v)return 'no-video';" +
-                    "return JSON.stringify({t:v.currentTime,paused:v.paused,ready:v.readyState,vw:v.videoWidth,vh:v.videoHeight});}catch(e){return 'err';}})();";
+                    "return JSON.stringify({t:v.currentTime,paused:v.paused,ready:v.readyState,vw:v.videoWidth,vh:v.videoHeight,muted:v.muted});}catch(e){return 'err';}})();";
                 webView.evaluateJavascript(checkJs, result -> {
                     if (result == null || result.contains("no-video") || result.contains("err")) {
                         webVideoStallCount++;
@@ -2722,23 +2744,18 @@ public class MainActivity extends AppCompatActivity {
                             double currentTime = json.optDouble("t", 0);
                             boolean paused = json.optBoolean("paused", true);
                             int readyState = json.optInt("ready", 0);
-                            int videoWidth = json.optInt("vw", 0);
-                            int videoHeight = json.optInt("vh", 0);
-                            android.util.Log.d("NewsLive", "StallCheck: t=" + currentTime + " paused=" + paused + " ready=" + readyState + " vw=" + videoWidth + "x" + videoHeight + " stallCount=" + webVideoStallCount);
+                            LogUtil.d("NewsLive", "StallCheck: t=" + currentTime + " paused=" + paused + " ready=" + readyState + " stallCount=" + webVideoStallCount);
                             // readyState < 3 (HAVE_FUTURE_DATA)：视频正在加载/缓冲，不判定卡顿
                             if (readyState < 3) {
                                 webVideoStallCount = 0;
                             } else if (paused) {
                                 // 视频暂停且能播放，可能卡住
                                 webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
-                            } else if (videoWidth == 0 && currentTime > 0) {
-                                // 有声音但画面空白：currentTime在推进但videoWidth为0，视频帧未渲染
-                                webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
                             } else if (lastWebVideoTime >= 0 && currentTime == lastWebVideoTime) {
                                 // 非暂停但currentTime没推进，真正卡顿
                                 webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
                             } else {
-                                // 正常推进且有画面，重置计数
+                                // 正常推进，重置计数
                                 webVideoStallCount = 0;
                             }
                             lastWebVideoTime = currentTime;
@@ -2750,16 +2767,23 @@ public class MainActivity extends AppCompatActivity {
                         // 冷却期内不刷新，但继续累计计数，冷却期一到立即刷新
                         long now = System.currentTimeMillis();
                         if (now - lastStallRefreshTime < STALL_REFRESH_COOLDOWN_MS) {
-                            android.util.Log.d("NewsLive", "Stall detected but in cooldown (" + (now - lastStallRefreshTime) / 1000 + "s since last refresh), keep counting");
+                            LogUtil.d("NewsLive", "Stall detected but in cooldown (" + (now - lastStallRefreshTime) / 1000 + "s since last refresh), keep counting");
                             // 不重置count，继续等冷却期结束
                             handler.postDelayed(this, WEB_STALL_CHECK_INTERVAL);
                         } else {
-                            // 有声音说明流是活的，刷新当前页面即可，不切换频道
-                            android.util.Log.w("NewsLive", "WebView video stalled " + webVideoStallCount + "s, refreshing current page");
-                            Toast.makeText(MainActivity.this, "视频卡顿，正在刷新...", Toast.LENGTH_SHORT).show();
                             webVideoStallCount = 0;
                             lastStallRefreshTime = now;
-                            refreshVideoFromWeb();
+                            // 优先尝试用ExoPlayer接管播放（解码管线更稳定，不受WebView解码器故障影响）
+                            if (!lastDetectedVideoUrl.isEmpty() && !isDrmStream(lastDetectedVideoUrl)) {
+                                LogUtil.w("NewsLive", "WebView video stalled, switching to ExoPlayer: " + lastDetectedVideoUrl);
+                                Toast.makeText(MainActivity.this, "视频卡顿，切换播放器恢复...", Toast.LENGTH_SHORT).show();
+                                switchToPlayerMode(lastDetectedVideoUrl);
+                            } else {
+                                // 无可用流地址或DRM流，刷新当前页面
+                                LogUtil.w("NewsLive", "WebView video stalled " + WEB_STALL_THRESHOLD + "s, refreshing current page");
+                                Toast.makeText(MainActivity.this, "视频卡顿，正在刷新...", Toast.LENGTH_SHORT).show();
+                                refreshVideoFromWeb();
+                            }
                         }
                     } else {
                         handler.postDelayed(this, WEB_STALL_CHECK_INTERVAL);
@@ -2768,6 +2792,14 @@ public class MainActivity extends AppCompatActivity {
             }
         };
         handler.postDelayed(webVideoStallRunnable, WEB_STALL_CHECK_INTERVAL);
+    }
+
+    /** 判断是否为DRM/特殊编码流（ExoPlayer无法播放，必须留在WebView） */
+    private boolean isDrmStream(String url) {
+        if (url == null || url.isEmpty()) return false;
+        String lower = url.toLowerCase();
+        return lower.contains("cdrm") || lower.contains("kcdnvip")
+            || (lower.contains("cctv") && lower.contains(".m3u8") && !lower.contains("cctvnews"));
     }
 
     /** 停止WebView视频卡顿检测 */
@@ -2928,10 +2960,16 @@ public class MainActivity extends AppCompatActivity {
         showControlPanel();
         updateSourceInfo();
         
+        // 移除上一次注册的监听器，防止监听器泄漏
+        if (currentPlayerListener != null) {
+            player.removeListener(currentPlayerListener);
+            currentPlayerListener = null;
+        }
+
         MediaItem mediaItem = MediaItem.fromUri(Uri.parse(streamUrls.get(index)));
         player.stop();
         player.setMediaItem(mediaItem);
-        player.addListener(new Player.Listener() {
+        currentPlayerListener = new Player.Listener() {
             @Override
             public void onVideoSizeChanged(VideoSize videoSize) {
                 currentVideoWidth = videoSize.width;
@@ -2977,7 +3015,8 @@ public class MainActivity extends AppCompatActivity {
                         Toast.LENGTH_LONG).show();
                 }
             }
-        });
+        };
+        player.addListener(currentPlayerListener);
         player.prepare();
         player.setPlayWhenReady(true);
     }
@@ -3311,7 +3350,7 @@ public class MainActivity extends AppCompatActivity {
         // 恢复天气定时刷新，并立即刷新一次（保证从后台/休眠唤醒后天气为最新）
         startWeatherRefresh();
         if (isNetworkAvailable && lastLatitude != 0 && lastLongitude != 0) {
-            android.util.Log.i("NewsLive", "onResume 立即刷新天气");
+            LogUtil.i("NewsLive", "onResume 立即刷新天气");
             fetchWeather(lastLatitude, lastLongitude);
         }
     }
@@ -3367,6 +3406,11 @@ public class MainActivity extends AppCompatActivity {
             httpServer.stopServer();
         }
         if (player != null) {
+            // 移除监听器后再释放，避免泄漏的监听器回调已释放的播放器
+            if (currentPlayerListener != null) {
+                player.removeListener(currentPlayerListener);
+                currentPlayerListener = null;
+            }
             player.release();
             player = null;
         }
@@ -3380,6 +3424,8 @@ public class MainActivity extends AppCompatActivity {
         if (executorService != null) {
             executorService.shutdownNow();
         }
+        // 刷盘日志，避免丢失最后几条
+        LogUtil.flush();
         super.onDestroy();
     }
 
