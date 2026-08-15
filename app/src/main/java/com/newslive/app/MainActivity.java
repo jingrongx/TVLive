@@ -48,6 +48,7 @@ import androidx.media3.common.Player;
 import androidx.media3.common.VideoSize;
 import androidx.media3.common.AudioAttributes;
 import androidx.media3.datasource.DefaultHttpDataSource;
+import androidx.media3.datasource.HttpDataSource;
 import androidx.media3.exoplayer.DefaultLoadControl;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
@@ -258,6 +259,21 @@ public class MainActivity extends AppCompatActivity {
     // ExoPlayer监听器引用：切换视频源前先移除旧监听器，避免监听器泄漏导致
     // 多个缓冲看门狗并存、用旧URL重新prepare等引起的异常卡顿和刷新
     private Player.Listener currentPlayerListener;
+
+    // CCTV直播流auth_key有CDN配额（约3.5分钟），需要主动轮换/预取新key避免断流
+    private Runnable streamRotateRunnable;
+    private static final long STREAM_ROTATE_INTERVAL_MS = 60000; // 60秒检查一次
+    private static final long PREFETCH_AFTER_MS = 150000; // 播放超过2.5分钟仍无新key时，提前静默刷新网页预取
+    private long currentPlayStartTime = 0; // 当前URL开始播放的时间
+    // 各清晰度变体最近嗅探到的候选地址：网页播放器约每60秒轮换一次auth_key
+    private final java.util.LinkedHashMap<String, String> candidateByVariant = new java.util.LinkedHashMap<>();
+    private final java.util.LinkedHashMap<String, Long> candidateTimeByVariant = new java.util.LinkedHashMap<>();
+    // 最近失败的auth_key：403后该key会持续失败，5分钟内不再选择
+    private final java.util.LinkedHashMap<String, Long> recentlyFailedKeys = new java.util.LinkedHashMap<>();
+    private static final long FAILED_KEY_TTL_MS = 300000;
+    private static final long CANDIDATE_MAX_AGE_MS = 120000; // mbd变体约60秒刷新一次，120秒窗口保证命中且key仍有效
+    // 静默网页刷新标志：403恢复无候选地址时，后台悄悄reload网页拿新key，全程不显示网页/进度条
+    private boolean silentRefreshPending = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -779,6 +795,7 @@ public class MainActivity extends AppCompatActivity {
         }
 
         LogUtil.i("NewsLive", "switchToPlayerMode: " + videoUrl);
+        final boolean wasSilentRefresh = silentRefreshPending;
         runOnUiThread(() -> {
             sniffRefreshCount = 0;
             // 暂停WebView的所有活动和播放
@@ -805,7 +822,12 @@ public class MainActivity extends AppCompatActivity {
                 else if (host.contains("qq.com")) pageName = "腾讯视频";
             }
             
-            playVideoUrl(videoUrl, pageName);
+            if (wasSilentRefresh) {
+                silentRefreshPending = false;
+                playVideoUrlSilent(videoUrl, pageName);
+            } else {
+                playVideoUrl(videoUrl, pageName);
+            }
             setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
         });
     }
@@ -1551,6 +1573,7 @@ public class MainActivity extends AppCompatActivity {
     private void stopAllPlayback() {
         stopWebVideoStallDetector();
         cancelWebRefreshFallback();
+        cancelStreamRotation();
         isWebVideoFullscreenRequested = false;
         if (player != null) {
             try {
@@ -1812,6 +1835,12 @@ public class MainActivity extends AppCompatActivity {
                 webViewRetryCount = 0;
                 // 持久化保存cookie（保留登录态）
                 CookieManager.getInstance().flush();
+                // 静默刷新模式：网页在后台加载，立即静音网页视频，避免与ExoPlayer声音叠加
+                if (silentRefreshPending) {
+                    view.evaluateJavascript(
+                        "(function(){try{var vs=document.querySelectorAll('video');" +
+                        "for(var i=0;i<vs.length;i++){vs[i].muted=true;}}catch(e){}})();", null);
+                }
                 injectVideoDetectionScript();
                 injectFocusStyle();
                 extractAndPlayVideo();
@@ -1871,6 +1900,14 @@ public class MainActivity extends AppCompatActivity {
                             LogUtil.d("NewsLive", "Sniffed candidate stream: " + url);
                             candidateVideoUrl = url;
                             lastSniffTime = now;
+                            // 按清晰度变体记录最新候选地址（供403快速恢复/主动轮换优先选择标清）
+                            String variant = extractVariantName(url);
+                            if (!variant.isEmpty()) {
+                                synchronized (candidateByVariant) {
+                                    candidateByVariant.put(variant, url);
+                                    candidateTimeByVariant.put(variant, now);
+                                }
+                            }
                             // 延迟2秒，等视频元素就绪后检查播放状态
                             runOnUiThread(() -> {
                                 handler.postDelayed(() -> {
@@ -1966,6 +2003,8 @@ public class MainActivity extends AppCompatActivity {
             public void onVideoPlaying(String videoUrl) {
                 if (videoUrl != null && !videoUrl.isEmpty() && !videoUrl.startsWith("blob:")) {
                     lastDetectedVideoUrl = videoUrl;
+                    // 静默刷新模式：由extractAndPlayVideoWithRetry统一接管切换，避免双路径竞争
+                    if (silentRefreshPending) return;
                     // 横屏自动切全屏；或嗅探后等待播放的标志位为 true 时，视频真正开始播放才切换
                     if (lastDeviceOrientation == Configuration.ORIENTATION_LANDSCAPE
                         || pendingAutoSwitch) {
@@ -2117,6 +2156,7 @@ public class MainActivity extends AppCompatActivity {
             "" +
             "function tryAutoPlay(video) {" +
             "  try {" +
+            "    if (window.__nlKeepPaused) return;" +
             "    if (video.paused || video.ended) {" +
             "      var p = video.play();" +
             "      if (p && p.catch) p.catch(function(){" +
@@ -2322,13 +2362,27 @@ public class MainActivity extends AppCompatActivity {
                                 else if (host.contains("sohu")) pageName = "搜狐视频";
                             }
                             final String finalPageName = pageName;
+                            final boolean wasSilentRefresh = silentRefreshPending;
                             runOnUiThread(() -> {
                                 webView.setVisibility(View.GONE);
+                                // 暂停并静音网页视频：释放解码器与内存，避免与ExoPlayer抢资源。
+                                // 网页播放器暂停后不再产生新key，需要新key时由预取机制静默刷新网页。
+                                webView.evaluateJavascript(
+                                    "(function(){try{window.__nlKeepPaused=true;" +
+                                    "var vs=document.querySelectorAll('video');" +
+                                    "for(var i=0;i<vs.length;i++){vs[i].muted=true;try{vs[i].pause();}catch(e){}}}" +
+                                    "catch(e){}})();", null);
                                 playerContainer.setVisibility(View.VISIBLE);
                                 if (player == null) {
                                     initPlayer();
                                 }
-                                playVideoUrl(videoUrl, finalPageName);
+                                // 静默网页刷新恢复的流：无感切换，不闪进度条/控制面板
+                                if (wasSilentRefresh) {
+                                    silentRefreshPending = false;
+                                    playVideoUrlSilent(videoUrl, finalPageName);
+                                } else {
+                                    playVideoUrl(videoUrl, finalPageName);
+                                }
                             });
                         } else if (retryCount < maxRetries) {
                             extractAndPlayVideoWithRetry(retryCount + 1);
@@ -2412,26 +2466,39 @@ public class MainActivity extends AppCompatActivity {
     private void playVideoUrl(String url, String name) {
         currentVideoUrl = url;
         currentVideoName = name;
-        playVideoUrlWithRetry(url, name, 0, false);
+        playVideoUrlWithRetry(url, name, 0, false, false);
+    }
+
+    /** 静默切换：无进度条、无Toast，用于403快速恢复/主动轮换/解码降级。
+     *  keepContentOnPlayerReset让切换期间画面定格在旧流最后一帧（非黑屏），新流READY后立即接上 */
+    private void playVideoUrlSilent(String url, String name) {
+        currentVideoUrl = url;
+        currentVideoName = name;
+        playVideoUrlWithRetry(url, name, 0, false, true);
     }
 
     private void playVideoUrlWithRetry(String url, String name, int retryCount, boolean isRefreshed) {
+        playVideoUrlWithRetry(url, name, retryCount, isRefreshed, false);
+    }
+
+    private void playVideoUrlWithRetry(String url, String name, int retryCount, boolean isRefreshed, boolean silent) {
         if (player == null || url == null || url.isEmpty()) return;
 
-        LogUtil.i("NewsLive", "playVideoUrl: " + url + " retry=" + retryCount + " refreshed=" + isRefreshed);
+        // 每次换源/重试都先取消上一轮的轮换调度，避免旧调度器在新播放期间误切换
+        cancelStreamRotation();
+
+        LogUtil.i("NewsLive", "playVideoUrl: " + url + " retry=" + retryCount + " refreshed=" + isRefreshed + " silent=" + silent);
 
         tvSourceInfo.setText(name + (isRefreshed ? " (已刷新)" : ""));
-        progressBar.setVisibility(View.VISIBLE);
-
-        // 移除上一次注册的监听器，防止监听器泄漏（每次切源/重试都会新建监听器）
-        if (currentPlayerListener != null) {
-            player.removeListener(currentPlayerListener);
-            currentPlayerListener = null;
+        if (!silent) {
+            progressBar.setVisibility(View.VISIBLE);
         }
 
         MediaItem mediaItem = MediaItem.fromUri(Uri.parse(url));
         try {
-            player.stop();
+            if (!silent) {
+                player.stop();
+            }
             player.setMediaItem(mediaItem);
             player.prepare();
             player.setPlayWhenReady(true);
@@ -2440,10 +2507,21 @@ public class MainActivity extends AppCompatActivity {
             LogUtil.e("NewsLive", "prepare() failed", e);
         }
         
+        attachMainListener(url, name, retryCount, isRefreshed, silent);
+    }
+
+    /** 挂载主播放器监听器（缓冲看门狗、403快速恢复、解码降级、暂停恢复） */
+    private void attachMainListener(String url, String name, int retryCount, boolean isRefreshed, boolean silent) {
+        if (player == null) return;
+        if (currentPlayerListener != null) {
+            player.removeListener(currentPlayerListener);
+            currentPlayerListener = null;
+        }
         final int[] bufferingTime = {0};
         final boolean[] hasError = {false};
         final int[] seekRetryCount = {0};
         final int[] pauseRetryCount = {0};
+        final boolean finalSilent = silent;
         
         currentPlayerListener = new Player.Listener() {
             @Override
@@ -2458,7 +2536,9 @@ public class MainActivity extends AppCompatActivity {
                 LogUtil.i("NewsLive", "onPlaybackStateChanged: " + playbackState + " url=" + url);
                 switch (playbackState) {
                     case Player.STATE_BUFFERING:
-                        progressBar.setVisibility(View.VISIBLE);
+                        if (!finalSilent) {
+                            progressBar.setVisibility(View.VISIBLE);
+                        }
                         bufferingTime[0] = 0;
                         handler.postDelayed(new Runnable() {
                             @Override
@@ -2472,15 +2552,21 @@ public class MainActivity extends AppCompatActivity {
                                         if (!isRefreshed && useWebMode && seekRetryCount[0] >= 2) {
                                             if (sniffRefreshCount < MAX_SNIFF_REFRESH) {
                                                 sniffRefreshCount++;
-                                                Toast.makeText(MainActivity.this, "缓冲超时，正在重新获取视频地址(" + sniffRefreshCount + "/" + MAX_SNIFF_REFRESH + ")...", Toast.LENGTH_SHORT).show();
-                                                refreshVideoFromWeb();
+                                                if (!finalSilent) {
+                                                    Toast.makeText(MainActivity.this, "缓冲超时，正在重新获取视频地址(" + sniffRefreshCount + "/" + MAX_SNIFF_REFRESH + ")...", Toast.LENGTH_SHORT).show();
+                                                }
+                                                refreshVideoFromWeb(true);
                                             } else {
-                                                Toast.makeText(MainActivity.this, "多次重试失败，请尝试切换频道或检查网络", Toast.LENGTH_LONG).show();
+                                                if (!finalSilent) {
+                                                    Toast.makeText(MainActivity.this, "多次重试失败，请尝试切换频道或检查网络", Toast.LENGTH_LONG).show();
+                                                }
                                                 progressBar.setVisibility(View.GONE);
                                             }
                                         } else if (seekRetryCount[0] < 3) {
                                             seekRetryCount[0]++;
-                                            Toast.makeText(MainActivity.this, "缓冲超时，重连中(" + seekRetryCount[0] + "/3)...", Toast.LENGTH_SHORT).show();
+                                            if (!finalSilent) {
+                                                Toast.makeText(MainActivity.this, "缓冲超时，重连中(" + seekRetryCount[0] + "/3)...", Toast.LENGTH_SHORT).show();
+                                            }
                                             // 直播流 seek 无意义，改为重新 prepare
                                             player.setMediaItem(MediaItem.fromUri(Uri.parse(url)));
                                             player.prepare();
@@ -2500,7 +2586,14 @@ public class MainActivity extends AppCompatActivity {
                         seekRetryCount[0] = 0;
                         pauseRetryCount[0] = 0;
                         sniffRefreshCount = 0;
-                        startHideControlTimer();
+                        currentPlayStartTime = System.currentTimeMillis(); // 记录key使用起点
+                        // ExoPlayer已恢复播放：取消网页刷新兜底定时器，避免60秒后多余刷新
+                        cancelWebRefreshFallback();
+                        webRefreshFallbackCount = 0;
+                        scheduleStreamRotation();
+                        if (!finalSilent) {
+                            startHideControlTimer();
+                        }
                         break;
                     case Player.STATE_ENDED:
                         progressBar.setVisibility(View.GONE);
@@ -2518,21 +2611,73 @@ public class MainActivity extends AppCompatActivity {
 
                 LogUtil.e("NewsLive", "onPlayerError: " + error.getMessage() + " errorCode=" + error.errorCode + " cause=" + (error.getCause() != null ? error.getCause().getMessage() : "null"), error);
 
+                // CCTV直播流403：auth_key配额/有效期耗尽，同一URL重试必然失败。
+                // 优先使用网页嗅探到的新地址（新auth_key）直接切换，秒级恢复；
+                // 没有可用候选地址时才回退到静默刷新网页重新获取。
+                if (isHttp403(error)) {
+                    LogUtil.w("NewsLive", "403 detected, try fresh sniffed url first");
+                    markKeyFailed(url);
+                    String fresh = pickFreshCandidateUrl(url, false);
+                    if (fresh != null) {
+                        handler.postDelayed(() -> {
+                            if (player != null) {
+                                playVideoUrlSilent(fresh, name);
+                            }
+                        }, 500);
+                        return;
+                    }
+                    // 没有新地址：跳过无意义的同URL重试，静默刷新网页重新获取（不打扰观看）
+                    if (!isRefreshed && useWebMode && sniffRefreshCount < MAX_SNIFF_REFRESH) {
+                        sniffRefreshCount++;
+                        LogUtil.w("NewsLive", "No fresh candidate for 403, silent refresh from web");
+                        refreshVideoFromWeb(true);
+                        return;
+                    }
+                    if (!finalSilent) {
+                        Toast.makeText(MainActivity.this, "直播地址已过期，请尝试切换频道或检查网络", Toast.LENGTH_LONG).show();
+                    }
+                    return;
+                }
+
+                // 解码器初始化失败（如高清流内存不足ENOMEM）：直接换标清mbd地址，避免同URL重试浪费
+                if (error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED) {
+                    LogUtil.w("NewsLive", "Decoder init failed, try mbd(low-res) url");
+                    markKeyFailed(url);
+                    String fresh = pickFreshCandidateUrl(url, true);
+                    if (fresh != null) {
+                        handler.postDelayed(() -> {
+                            if (player != null) {
+                                playVideoUrlSilent(fresh, name);
+                            }
+                        }, 500);
+                        return;
+                    }
+                }
+
                 int newRetryCount = retryCount + 1;
                 if (newRetryCount <= 3) {
                     final int finalRetryCount = newRetryCount;
                     handler.postDelayed(() -> {
                         if (player != null) {
-                            Toast.makeText(MainActivity.this, "自动恢复中(" + finalRetryCount + "/3)...", Toast.LENGTH_SHORT).show();
-                            playVideoUrlWithRetry(url, name, finalRetryCount, isRefreshed);
+                            if (finalSilent) {
+                                // 静默模式：无Toast无进度条，保持重试计数防止无限循环
+                                playVideoUrlWithRetry(url, name, finalRetryCount, isRefreshed, true);
+                            } else {
+                                Toast.makeText(MainActivity.this, "自动恢复中(" + finalRetryCount + "/3)...", Toast.LENGTH_SHORT).show();
+                                playVideoUrlWithRetry(url, name, finalRetryCount, isRefreshed, false);
+                            }
                         }
                     }, 2000);
                 } else if (!isRefreshed && useWebMode && sniffRefreshCount < MAX_SNIFF_REFRESH) {
                     sniffRefreshCount++;
-                    Toast.makeText(MainActivity.this, "地址可能已过期，正在重新获取(" + sniffRefreshCount + "/" + MAX_SNIFF_REFRESH + ")...", Toast.LENGTH_SHORT).show();
-                    refreshVideoFromWeb();
+                    if (!finalSilent) {
+                        Toast.makeText(MainActivity.this, "地址可能已过期，正在重新获取(" + sniffRefreshCount + "/" + MAX_SNIFF_REFRESH + ")...", Toast.LENGTH_SHORT).show();
+                    }
+                    refreshVideoFromWeb(true);
                 } else {
-                    Toast.makeText(MainActivity.this, "播放错误，请尝试切换网站或检查网络: " + error.getMessage(), Toast.LENGTH_LONG).show();
+                    if (!finalSilent) {
+                        Toast.makeText(MainActivity.this, "播放错误，请尝试切换网站或检查网络: " + error.getMessage(), Toast.LENGTH_LONG).show();
+                    }
                 }
             }
 
@@ -2550,16 +2695,15 @@ public class MainActivity extends AppCompatActivity {
                         }, 2000);
                     } else if (!isRefreshed && useWebMode && sniffRefreshCount < MAX_SNIFF_REFRESH) {
                         sniffRefreshCount++;
-                        Toast.makeText(MainActivity.this, "视频源不稳定，正在重新获取(" + sniffRefreshCount + "/" + MAX_SNIFF_REFRESH + ")...", Toast.LENGTH_SHORT).show();
-                        refreshVideoFromWeb();
+                        if (!finalSilent) {
+                            Toast.makeText(MainActivity.this, "视频源不稳定，正在重新获取(" + sniffRefreshCount + "/" + MAX_SNIFF_REFRESH + ")...", Toast.LENGTH_SHORT).show();
+                        }
+                        refreshVideoFromWeb(true);
                     }
                 }
             }
         };
         player.addListener(currentPlayerListener);
-        
-        player.prepare();
-        player.setPlayWhenReady(true);
     }
     
     private void updateVideoLayout(int videoWidth, int videoHeight) {
@@ -2574,11 +2718,201 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /** 判断播放异常是否为HTTP 403（CCTV直播流auth_key配额耗尽） */
+    private boolean isHttp403(PlaybackException error) {
+        Throwable cause = error;
+        while (cause != null) {
+            if (cause instanceof HttpDataSource.InvalidResponseCodeException) {
+                return ((HttpDataSource.InvalidResponseCodeException) cause).responseCode == 403;
+            }
+            cause = cause.getCause();
+        }
+        return false;
+    }
+
+    /** 提取URL中的auth_key参数值（CCTV直播流用于防盗链，有使用配额/有效期） */
+    private String extractAuthKey(String url) {
+        if (url == null) return "";
+        int i = url.indexOf("auth_key=");
+        if (i < 0) return "";
+        String rest = url.substring(i + "auth_key=".length());
+        int amp = rest.indexOf('&');
+        return amp > 0 ? rest.substring(0, amp) : rest;
+    }
+
+    /** 提取URL中的频道标识（如channel_cctv13），用于判断候选地址是否属于当前频道 */
+    private String extractChannelName(String url) {
+        if (url == null) return "";
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("channel_[a-z0-9]+").matcher(url);
+        return m.find() ? m.group() : "";
+    }
+
+    /** 提取URL中的清晰度变体名（如channel_cctv13_mbd → mbd） */
+    private String extractVariantName(String url) {
+        if (url == null) return "";
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("channel_[a-z0-9]+_(\\w+)").matcher(url);
+        return m.find() ? m.group(1) : "";
+    }
+
+    /**
+     * 从嗅探缓存中挑一个"新鲜"的候选直播地址：
+     * - 非DRM直链流（.m3u8/.mp4/.flv/.ts）
+     * - 与当前地址同频道（防止误切到广告/其他视频）
+     * - auth_key与当前不同（当前key已403失效时才值得切换）
+     * - 最近120秒内嗅探到（过旧说明网页播放器已停止刷新，切过去大概率也已失效）
+     * - auth_key不在最近失败名单中（403后的key会持续失败）
+     * - 优先标清mbd（解码内存占用小）
+     * @param requireMbd true=只接受mbd变体（解码降级用）
+     */
+    private String pickFreshCandidateUrl(String currentUrl, boolean requireMbd) {
+        long now = System.currentTimeMillis();
+        // 清理过期失败记录
+        synchronized (recentlyFailedKeys) {
+            java.util.Iterator<java.util.Map.Entry<String, Long>> it = recentlyFailedKeys.entrySet().iterator();
+            while (it.hasNext()) {
+                if (now - it.next().getValue() > FAILED_KEY_TTL_MS) it.remove();
+            }
+        }
+        String curCh = extractChannelName(currentUrl);
+        String curKey = extractAuthKey(currentUrl);
+        String fallback = null;
+        synchronized (candidateByVariant) {
+            // 第一轮：优先标清变体
+            for (String variant : new String[]{"mbd", "mhd", "mud", "md", "hd"}) {
+                if (requireMbd && !variant.equals("mbd")) continue;
+                String cand = candidateByVariant.get(variant);
+                Long t = candidateTimeByVariant.get(variant);
+                if (cand == null || t == null) continue;
+                if (now - t > CANDIDATE_MAX_AGE_MS) continue;
+                if (cand.equals(currentUrl)) continue;
+                if (isDrmStream(cand)) continue;
+                String candCh = extractChannelName(cand);
+                if (!curCh.isEmpty() && !candCh.isEmpty() && !curCh.equals(candCh)) continue;
+                String candKey = extractAuthKey(cand);
+                if (candKey.isEmpty() || candKey.equals(curKey)) continue;
+                boolean failed;
+                synchronized (recentlyFailedKeys) {
+                    failed = recentlyFailedKeys.containsKey(candKey);
+                }
+                if (failed) continue;
+                if (variant.equals("mbd")) return cand; // 标清可用则直接返回
+                if (fallback == null) fallback = cand;
+            }
+            // 第二轮：任意其他变体
+            if (fallback == null && !requireMbd) {
+                for (java.util.Map.Entry<String, String> e : candidateByVariant.entrySet()) {
+                    String cand = e.getValue();
+                    Long t = candidateTimeByVariant.get(e.getKey());
+                    if (t == null || now - t > CANDIDATE_MAX_AGE_MS) continue;
+                    if (cand.equals(currentUrl)) continue;
+                    if (isDrmStream(cand)) continue;
+                    String candCh = extractChannelName(cand);
+                    if (!curCh.isEmpty() && !candCh.isEmpty() && !curCh.equals(candCh)) continue;
+                    String candKey = extractAuthKey(cand);
+                    if (candKey.isEmpty() || candKey.equals(curKey)) continue;
+                    boolean failed;
+                    synchronized (recentlyFailedKeys) {
+                        failed = recentlyFailedKeys.containsKey(candKey);
+                    }
+                    if (failed) continue;
+                    fallback = cand;
+                    break;
+                }
+            }
+        }
+        return fallback;
+    }
+
+    /** 记录一个auth_key为失败（403等），5分钟内不再选用 */
+    private void markKeyFailed(String url) {
+        String key = extractAuthKey(url);
+        if (key.isEmpty()) return;
+        synchronized (recentlyFailedKeys) {
+            recentlyFailedKeys.put(key, System.currentTimeMillis());
+        }
+    }
+
+    /** 主动轮换：CCTV的auth_key约3.5分钟失效。60秒检查一次：
+     *  有新鲜候选→静默切换；无候选且已播2.5分钟→提前静默刷新网页预取新key，
+     *  确保在403发生前完成切换，全程画面不断 */
+    private void scheduleStreamRotation() {
+        cancelStreamRotation();
+        final Runnable[] holder = new Runnable[1];
+        holder[0] = () -> {
+            if (holder[0] != streamRotateRunnable) return; // 已被新的调度取代
+            if (player == null || playerContainer.getVisibility() != View.VISIBLE || !useWebMode) {
+                return; // 播放器已退出，停止轮换
+            }
+            if (player.isPlaying() && player.getPlaybackState() == Player.STATE_READY) {
+                // 主动轮换只选mbd：避免高清解码失败
+                String fresh = pickFreshCandidateUrl(currentVideoUrl, true);
+                if (fresh != null) {
+                    LogUtil.i("NewsLive", "Proactive rotate to fresh stream url: " + fresh);
+                    playVideoUrlSilent(fresh, currentVideoName);
+                    return; // playVideoUrl→STATE_READY会重新调度
+                }
+                // 无新鲜候选且key临近寿命终点：提前静默刷新网页预取新key，
+                // 刷新链路拿到新地址后会自动静默切换（extractAndPlayVideoWithRetry）
+                if (currentPlayStartTime > 0
+                        && System.currentTimeMillis() - currentPlayStartTime > PREFETCH_AFTER_MS) {
+                    LogUtil.i("NewsLive", "No fresh candidate, prefetch new key via silent web refresh");
+                    refreshVideoFromWeb(true);
+                    return; // 静默刷新链路完成后会重新调度
+                }
+            }
+            // 未满足轮换条件（暂停/缓冲中/无新鲜候选），保持调度，播放恢复后继续检查
+            handler.postDelayed(holder[0], STREAM_ROTATE_INTERVAL_MS);
+        };
+        streamRotateRunnable = holder[0];
+        handler.postDelayed(streamRotateRunnable, STREAM_ROTATE_INTERVAL_MS);
+    }
+
+    private void cancelStreamRotation() {
+        if (streamRotateRunnable != null) {
+            handler.removeCallbacks(streamRotateRunnable);
+            streamRotateRunnable = null;
+        }
+    }
+
     private void refreshVideoFromWeb() {
+        refreshVideoFromWeb(false);
+    }
+
+    /**
+     * 重新从网页获取视频地址。
+     * @param silent true=静默刷新：WebView保持在底层隐藏加载，播放器画面不切换，
+     *               不显示网页/进度条/提示，拿到新地址后无感切回ExoPlayer（用于403自动恢复）
+     */
+    private void refreshVideoFromWeb(boolean silent) {
         stopWebVideoStallDetector();
+        cancelStreamRotation();
         isWebVideoFullscreenRequested = false;
         // 设置冷却时间：刷新后视频需要加载，30秒内不触发卡顿刷新
         lastStallRefreshTime = System.currentTimeMillis();
+
+        if (silent) {
+            // 静默刷新：WebView留在底层（playerContainer盖在上面），不打扰观看。
+            // 注意：不能调loadWebSource()（它会切WebView可见/隐藏播放器导致闪屏），直接loadUrl
+            silentRefreshPending = true;
+            webViewRetryCount = 0;
+            if (webView.getUrl() == null || !webView.getUrl().equals(webSourceUrl)) {
+                webView.loadUrl(webSourceUrl);
+            } else {
+                webView.reload();
+            }
+            // 静默兜底定时器：60秒后仍未拿到新地址则再试（不弹Toast）
+            cancelWebRefreshFallback();
+            if (webRefreshFallbackCount < MAX_WEB_REFRESH_FALLBACK) {
+                webRefreshFallbackCount++;
+                webRefreshFallbackRunnable = () -> {
+                    LogUtil.w("NewsLive", "Silent refresh not recovered 60s, retrying");
+                    refreshVideoFromWeb(true);
+                };
+                handler.postDelayed(webRefreshFallbackRunnable, WEB_REFRESH_FALLBACK_DELAY_MS);
+            }
+            return;
+        }
+
         webView.setVisibility(View.VISIBLE);
         playerContainer.setVisibility(View.GONE);
         tvSourceInfo.setText("正在重新获取视频地址...");
@@ -2816,6 +3150,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         
+        cancelStreamRotation();
         webView.setVisibility(View.VISIBLE);
         playerContainer.setVisibility(View.GONE);
         tvSourceInfo.setText(webSiteNames.isEmpty() ? "加载中..." : webSiteNames.get(currentSiteIndex) + "(加载中...)");
@@ -2869,12 +3204,26 @@ public class MainActivity extends AppCompatActivity {
             .setLoadControl(loadControl)
             .build();
         
+        // 限制最高分辨率540p、码率2Mbps：KHAN-230盒子硬解器对1080p会初始化失败(ENOMEM)，
+        // 限制后ExoPlayer自动选择低分辨率变体，避免解码失败导致黑屏/断流
+        androidx.media3.common.TrackSelectionParameters trackParams = player.getTrackSelectionParameters()
+            .buildUpon()
+            .setMaxVideoSize(960, 540)
+            .setMaxVideoBitrate(2000000)
+            .build();
+        player.setTrackSelectionParameters(trackParams);
+        
         AudioAttributes audioAttributes = new AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
             .build();
         player.setAudioAttributes(audioAttributes, false);
         
+        // 禁用PlayerView内置控制器（播放/暂停按钮、进度条）：TV遥控器用方向键/菜单键操作，
+        // 内置控制器会在缓冲/切源时自动弹出，影响直播观看的无感体验
+        playerView.setUseController(false);
+        // 播放器重置/出错后保持最后一帧画面（不黑屏），新流READY后无缝接上
+        playerView.setKeepContentOnPlayerReset(true);
         playerView.setPlayer(player);
     }
 
@@ -2883,6 +3232,7 @@ public class MainActivity extends AppCompatActivity {
         prefs.edit().putBoolean(KEY_USE_WEB_MODE, useWebMode).apply();
 
         if (useWebMode) {
+            cancelStreamRotation();
             if (player != null) {
                 player.stop();
                 player.setPlayWhenReady(false);
@@ -3326,6 +3676,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onStop() {
         super.onStop();
+        cancelStreamRotation();
         if (player != null) {
             player.setPlayWhenReady(false);
         }
@@ -3346,6 +3697,11 @@ public class MainActivity extends AppCompatActivity {
             } else if (isNetworkAvailable && pausedAt > 0 && System.currentTimeMillis() - pausedAt > 30000) {
                 loadWebSource();
             }
+        }
+        // ExoPlayer播放中恢复前台：重新启动主动轮换调度（onStop已取消）
+        if (player != null && playerContainer != null
+                && playerContainer.getVisibility() == View.VISIBLE && useWebMode) {
+            scheduleStreamRotation();
         }
         // 恢复天气定时刷新，并立即刷新一次（保证从后台/休眠唤醒后天气为最新）
         startWeatherRefresh();
@@ -3390,6 +3746,7 @@ public class MainActivity extends AppCompatActivity {
         stopWebVideoStallDetector();
         // 取消刷新兜底定时器
         cancelWebRefreshFallback();
+        cancelStreamRotation();
 
         // 清理全屏视图
         cleanupCustomView();
