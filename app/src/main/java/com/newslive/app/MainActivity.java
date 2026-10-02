@@ -1101,6 +1101,11 @@ public class MainActivity extends AppCompatActivity {
 
     private void switchToPlayerMode(String videoUrl) {
         if (videoUrl == null || videoUrl.isEmpty()) return;
+        // 播放器模式下拒绝网页嗅探/JS桥触发的切换（页面已暂停理论上不会触发，防御历史回调）
+        if (!useWebMode) {
+            LogUtil.w("NewsLive", "switchToPlayerMode skipped: player mode active");
+            return;
+        }
 
         // 已在用同一地址播放（含缓冲中）：嗅探与静默刷新双路径同时拿到同一地址时避免重复prepare导致画面重启
         if (player != null && playerContainer != null
@@ -4247,6 +4252,12 @@ public class MainActivity extends AppCompatActivity {
      *               不显示网页/进度条/提示，拿到新地址后无感切回ExoPlayer（用于403自动恢复）
      */
     private void refreshVideoFromWeb(boolean silent) {
+        // 播放器模式下拒绝一切网页刷新：网页模式的定时器（换台兜底/超时重试等）可能
+        // 在切到播放器模式后到期误触发，把画面切到"正在加载"的网页且盖掉播放器画面
+        if (!useWebMode) {
+            LogUtil.w("NewsLive", "refreshVideoFromWeb skipped: player mode active");
+            return;
+        }
         stopWebVideoStallDetector();
         cancelStreamRotation();
         isWebVideoFullscreenRequested = false;
@@ -4574,6 +4585,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadWebSource() {
+        if (!useWebMode) {
+            // 播放器模式下拒绝网页加载（历史定时器误触发防护）
+            LogUtil.w("NewsLive", "loadWebSource skipped: player mode active");
+            return;
+        }
         if (!isNetworkAvailable) {
             Toast.makeText(this, "网络不可用，请检查网络连接", Toast.LENGTH_LONG).show();
             return;
@@ -4719,6 +4735,12 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "切换到网页模式", Toast.LENGTH_SHORT).show();
         } else {
             cancelWebViewTimeoutTimer();
+            // 关键：清掉网页模式遗留的全部定时器/标记——否则网页模式的刷新兜底定时器
+            // 在播放器模式下到期误触发，把画面切到"正在加载"的网页（声音仍是播放器源）
+            cancelWebRefreshFallback();
+            stopWebVideoStallDetector();
+            silentRefreshPending = false;
+            fullscreenRetryCount = 0;
             webView.pauseTimers();
             webView.onPause();
             webView.setVisibility(View.GONE);
