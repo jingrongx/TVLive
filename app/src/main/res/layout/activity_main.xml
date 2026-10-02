@@ -78,6 +78,7 @@
             android:padding="4dp" />
 
         <LinearLayout
+            android:id="@+id/control_buttons_row"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
@@ -85,95 +86,144 @@
             android:paddingStart="16dp"
             android:paddingEnd="16dp">
 
-            <ImageButton
-                android:id="@+id/btn_prev_source"
+            <LinearLayout
                 android:layout_width="72dp"
-                android:layout_height="72dp"
+                android:layout_height="wrap_content"
                 android:layout_marginEnd="12dp"
-                android:background="@drawable/tv_button_selector"
-                android:src="@android:drawable/arrow_up_float"
-                android:contentDescription="上一个源"
-                android:scaleType="centerInside"
-                android:focusable="true"
-                android:focusableInTouchMode="true"
-                android:padding="16dp" />
+                android:orientation="vertical"
+                android:gravity="center_horizontal">
 
-            <ImageButton
-                android:id="@+id/btn_next_source"
+                <ImageButton
+                    android:id="@+id/btn_prev_source"
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:background="@drawable/tv_button_selector"
+                    android:src="@android:drawable/arrow_up_float"
+                    android:contentDescription="上一个频道"
+                    android:scaleType="centerInside"
+                    android:focusable="true"
+                    android:focusableInTouchMode="true"
+                    android:padding="16dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="上一个"
+                    android:textColor="#AAAAAA"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
                 android:layout_width="72dp"
-                android:layout_height="72dp"
+                android:layout_height="wrap_content"
                 android:layout_marginEnd="12dp"
-                android:background="@drawable/tv_button_selector"
-                android:src="@android:drawable/arrow_down_float"
-                android:contentDescription="下一个源"
-                android:scaleType="centerInside"
-                android:focusable="true"
-                android:focusableInTouchMode="true"
-                android:padding="16dp" />
+                android:orientation="vertical"
+                android:gravity="center_horizontal">
 
-            <ImageButton
-                android:id="@+id/btn_prev_mode"
+                <ImageButton
+                    android:id="@+id/btn_next_source"
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:background="@drawable/tv_button_selector"
+                    android:src="@android:drawable/arrow_down_float"
+                    android:contentDescription="下一个频道"
+                    android:scaleType="centerInside"
+                    android:focusable="true"
+                    android:focusableInTouchMode="true"
+                    android:padding="16dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="下一个"
+                    android:textColor="#AAAAAA"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
                 android:layout_width="72dp"
-                android:layout_height="72dp"
+                android:layout_height="wrap_content"
                 android:layout_marginEnd="12dp"
-                android:background="@drawable/tv_button_selector"
-                android:src="@android:drawable/ic_media_previous"
-                android:contentDescription="切换模式(左)"
-                android:scaleType="centerInside"
-                android:focusable="true"
-                android:focusableInTouchMode="true"
-                android:padding="16dp" />
+                android:orientation="vertical"
+                android:gravity="center_horizontal">
 
-            <ImageButton
-                android:id="@+id/btn_next_mode"
+                <ImageButton
+                    android:id="@+id/btn_switch_mode"
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:background="@drawable/tv_button_selector"
+                    android:src="@drawable/ic_swap_mode"
+                    android:contentDescription="切换模式"
+                    android:scaleType="centerInside"
+                    android:focusable="true"
+                    android:focusableInTouchMode="true"
+                    android:padding="16dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="切模式"
+                    android:textColor="#AAAAAA"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
                 android:layout_width="72dp"
-                android:layout_height="72dp"
+                android:layout_height="wrap_content"
                 android:layout_marginEnd="12dp"
-                android:background="@drawable/tv_button_selector"
-                android:src="@android:drawable/ic_media_next"
-                android:contentDescription="切换模式(右)"
-                android:scaleType="centerInside"
-                android:focusable="true"
-                android:focusableInTouchMode="true"
-                android:padding="16dp" />
+                android:orientation="vertical"
+                android:gravity="center_horizontal">
 
-            <ImageButton
-                android:id="@+id/btn_switch_mode"
-                android:layout_width="72dp"
-                android:layout_height="72dp"
-                android:layout_marginEnd="12dp"
-                android:background="@drawable/tv_button_selector"
-                android:src="@android:drawable/ic_menu_view"
-                android:contentDescription="切换模式"
-                android:scaleType="centerInside"
-                android:focusable="true"
-                android:focusableInTouchMode="true"
-                android:padding="16dp" />
+                <ImageButton
+                    android:id="@+id/btn_orientation"
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:background="@drawable/tv_button_selector"
+                    android:src="@android:drawable/ic_menu_rotate"
+                    android:contentDescription="切换横竖屏"
+                    android:scaleType="centerInside"
+                    android:focusable="true"
+                    android:focusableInTouchMode="true"
+                    android:padding="16dp" />
 
-            <ImageButton
-                android:id="@+id/btn_orientation"
-                android:layout_width="72dp"
-                android:layout_height="72dp"
-                android:layout_marginEnd="12dp"
-                android:background="@drawable/tv_button_selector"
-                android:src="@android:drawable/ic_menu_rotate"
-                android:contentDescription="切换横竖屏"
-                android:scaleType="centerInside"
-                android:focusable="true"
-                android:focusableInTouchMode="true"
-                android:padding="16dp" />
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="旋转"
+                    android:textColor="#AAAAAA"
+                    android:textSize="11sp" />
+            </LinearLayout>
 
-            <ImageButton
-                android:id="@+id/btn_lock_orientation"
+            <LinearLayout
                 android:layout_width="72dp"
-                android:layout_height="72dp"
-                android:background="@drawable/tv_button_selector"
-                android:src="@android:drawable/ic_lock_lock"
-                android:contentDescription="锁定方向"
-                android:scaleType="centerInside"
-                android:focusable="true"
-                android:focusableInTouchMode="true"
-                android:padding="16dp" />
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:gravity="center_horizontal">
+
+                <ImageButton
+                    android:id="@+id/btn_lock_orientation"
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:background="@drawable/tv_button_selector"
+                    android:src="@android:drawable/ic_lock_lock"
+                    android:contentDescription="锁定方向"
+                    android:scaleType="centerInside"
+                    android:focusable="true"
+                    android:focusableInTouchMode="true"
+                    android:padding="16dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="锁定"
+                    android:textColor="#AAAAAA"
+                    android:textSize="11sp" />
+            </LinearLayout>
 
         </LinearLayout>
 
@@ -196,19 +246,106 @@
         android:layout_gravity="center"
         android:visibility="gone" />
 
-    <!-- 顶部信息横幅条：28dp 超窄，三栏铺开（农历/时辰/节气 | 日期时间 | 地点+天气） -->
+    <!-- 竖屏播放时视频下方黑边区的全屏按钮浮层（横屏自动隐藏） -->
+    <LinearLayout
+        android:id="@+id/portrait_play_overlay"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="150dp"
+        android:orientation="vertical"
+        android:gravity="center_horizontal"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/btn_fullscreen_play"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="⛶ 全屏播放"
+            android:textColor="#FFFFFF"
+            android:textSize="18sp"
+            android:paddingStart="28dp"
+            android:paddingEnd="28dp"
+            android:paddingTop="12dp"
+            android:paddingBottom="12dp"
+            android:background="#B3000000"
+            android:clickable="true"
+            android:focusable="true" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="点击切换到横屏全屏播放"
+            android:textColor="#99FFFFFF"
+            android:textSize="13sp" />
+
+    </LinearLayout>
+
+    <!-- 换台遮罩：切换频道期间盖住网页加载过程（原生电视换台体验），视频就绪后收起 -->
+    <FrameLayout
+        android:id="@+id/switch_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:orientation="vertical"
+            android:gravity="center">
+
+            <TextView
+                android:id="@+id/tv_switch_channel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="正在加载..."
+                android:textColor="#FFFFFF"
+                android:textSize="30sp"
+                android:textStyle="bold" />
+
+            <ProgressBar
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:layout_marginTop="20dp" />
+
+            <TextView
+                android:id="@+id/tv_switch_hint"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="正在加载，请稍候..."
+                android:textColor="#999999"
+                android:textSize="14sp" />
+
+        </LinearLayout>
+
+    </FrameLayout>
+
+    <!-- 顶部信息横幅：竖屏两行（第1行农历+日期，第2行定位+天气），横屏单行（定位天气在行尾，第2行隐藏） -->
     <LinearLayout
         android:id="@+id/info_overlay"
         android:layout_width="match_parent"
         android:layout_height="28dp"
         android:layout_gravity="top"
-        android:orientation="horizontal"
+        android:orientation="vertical"
         android:gravity="center_vertical"
         android:background="#A6000000"
-        android:paddingStart="12dp"
-        android:paddingEnd="12dp"
         android:clickable="false"
         android:focusable="false">
+
+        <!-- 第1行：农历/时辰/节气 + 日期时间 + 定位天气（横屏时在本行末尾） -->
+        <LinearLayout
+            android:id="@+id/banner_row1"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp">
 
         <!-- 左栏：农历 + 时辰 + 节气胶囊 -->
         <LinearLayout
@@ -283,8 +420,9 @@
             android:shadowDy="1"
             android:shadowRadius="3" />
 
-        <!-- 右栏：地点 + 分隔线 + 天气三列 -->
+        <!-- 右栏：地点 + 分隔线 + 天气三列（竖屏时整体挪到第2行） -->
         <LinearLayout
+            android:id="@+id/banner_location_weather"
             android:layout_width="wrap_content"
             android:layout_height="match_parent"
             android:orientation="horizontal"
@@ -454,6 +592,32 @@
             </LinearLayout>
 
         </LinearLayout>
+
+        </LinearLayout>
+
+        <!-- 第2行（仅竖屏）：日期时间独占一行 -->
+        <LinearLayout
+            android:id="@+id/banner_row_time"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:visibility="gone" />
+
+        <!-- 第3行（仅竖屏显示）：定位 + 天气三列 -->
+        <LinearLayout
+            android:id="@+id/banner_row2"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:visibility="gone" />
 
     </LinearLayout>
 

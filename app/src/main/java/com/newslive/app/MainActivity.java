@@ -18,14 +18,17 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.OrientationEventListener;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
+import android.webkit.RenderProcessGoneDetail;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
@@ -50,6 +53,7 @@ import androidx.media3.common.AudioAttributes;
 import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.datasource.HttpDataSource;
 import androidx.media3.exoplayer.DefaultLoadControl;
+import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
@@ -59,6 +63,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.Inet4Address;
@@ -88,10 +93,10 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_CURRENT_SITE_INDEX = "current_site_index";
     private static final String KEY_LOCK_ORIENTATION = "lock_orientation";
     private static final String KEY_PLAYER_MODE_ENABLED = "player_mode_enabled";
-    private static final String KEY_PLAYER_VIDEO_URLS = "player_video_urls";
     private static final String KEY_BANNER_VISIBLE = "banner_visible";
     private static final String KEY_BANNER_FONT_SIZE = "banner_font_size";
     private static final String KEY_BANNER_HEIGHT = "banner_height";
+    private static final String KEY_MANUAL_LOCATION = "manual_location"; // 手动配置地区（空=自动IP定位）
     private static final int HTTP_PORT = 8765;
     
     private static final String DEFAULT_REMOTE_URL = "https://gitee.com/xujingrong/tv-live-config/raw/master/tv-live-source.json";
@@ -130,7 +135,7 @@ public class MainActivity extends AppCompatActivity {
     private static final int CONNECT_TIMEOUT_MS = 8000;
     private static final int READ_TIMEOUT_MS = 8000;
 
-    private static final int WEBVIEW_LOAD_TIMEOUT = 25000;
+    private static final int WEBVIEW_LOAD_TIMEOUT = 45000; // 低端电视加载页面慢，25秒易误判超时反复重载
     private static final int WEBVIEW_MAX_RETRY = 5;
     private static final int WEBVIEW_RETRY_DELAY = 2000;
     
@@ -147,8 +152,6 @@ public class MainActivity extends AppCompatActivity {
     private ProgressBar progressBar;
     private ImageButton btnNextSource;
     private ImageButton btnPrevSource;
-    private ImageButton btnNextMode;
-    private ImageButton btnPrevMode;
     private ImageButton btnSwitchMode;
     private ImageButton btnLockOrientation;
     private ImageButton btnOrientation;
@@ -183,6 +186,7 @@ public class MainActivity extends AppCompatActivity {
     private double lastLongitude = 0;
     private int lastComputedDay = -1;
     private int lastShichenMinute = -1;
+    private String manualLocation = ""; // 手动配置地区（如"广东省深圳市南山区"），非空则不自动定位
     private int errorRetryCount = 0;
     private static final int MAX_RETRY_COUNT = 3;
 
@@ -197,9 +201,6 @@ public class MainActivity extends AppCompatActivity {
     private String currentVideoUrl = "";
     private String currentVideoName = "";
 
-    private List<String> playerVideoUrls = new ArrayList<>();
-    private List<String> playerVideoNames = new ArrayList<>();
-    
     private List<String> webSiteUrls = new ArrayList<>();
     private List<String> webSiteNames = new ArrayList<>();
     private List<Boolean> webSiteEnabled = new ArrayList<>();
@@ -250,15 +251,74 @@ public class MainActivity extends AppCompatActivity {
     private static final int STALL_REFRESH_COOLDOWN_MS = 30000; // 刷新冷却30秒，避免连续刷新
     private long lastStallRefreshTime = 0;
     private boolean isWebVideoFullscreenRequested = false;
+    private int fullscreenRetryCount = 0; // 网页视频未就绪时的全屏CSS重试次数
     // 刷新后兜底定时器：如果视频长时间未恢复播放，再次刷新
     private Runnable webRefreshFallbackRunnable;
     private static final int WEB_REFRESH_FALLBACK_DELAY_MS = 60000; // 60秒后视频仍未恢复则再次刷新
     private int webRefreshFallbackCount = 0; // 兜底刷新次数，超过上限停止刷新避免无限循环
     private static final int MAX_WEB_REFRESH_FALLBACK = 2;
 
+    // WebView渲染进程恢复与看门狗自续
+    private boolean stallCheckPending = false;      // 上一次卡顿查询是否仍未回调
+    private int stallHungCount = 0;                 // 渲染进程连续无响应次数
+    private int webRecreateCount = 0;               // WebView重建次数（防循环重建）
+    private long lastWebRecreateTime = 0;
+
+    // 所有重试耗尽后的深度恢复（静默重取地址），保证不会"一卡到底"
+    private Runnable giveUpRecoveryRunnable;
+    private int giveUpRecoveryCount = 0;
+    private static final int MAX_GIVE_UP_RECOVERY = 8;
+    private static final long GIVE_UP_RECOVERY_DELAY_MS = 25000;
+
+    // 换台遮罩：切换频道期间盖住网页加载过程，视频就绪后才显示画面（原生电视换台体验）
+    private android.view.View switchOverlay;
+    private TextView tvSwitchChannel;
+    private TextView tvSwitchHint;
+    private Runnable overlayFallbackRunnable;
+
+    // 竖屏播放时视频下方黑边区的"全屏播放"浮层（横屏自动隐藏）
+    private android.view.View portraitPlayOverlay;
+    private TextView btnFullscreenPlay;
+
+    // 控制面板按钮行（触屏/电视双模式适配）
+    private LinearLayout controlButtonsRow;
+    private Boolean isTvDevice;
+
+    // 触屏单击检测（手机上点屏幕唤出控制面板）
+    private float touchDownX = 0;
+    private float touchDownY = 0;
+    private long touchDownTime = 0;
+    private long lastTouchToggleTime = 0;
+    private long lastBackPressTime = 0; // 返回键双击退出计时
+    private boolean swipeConsumed = false; // 本次手势已触发滑动换台/切模式
+
+    // 顶部横幅多行结构（竖屏三行：农历行/日期行/定位天气行；横屏单行，额外行隐藏）
+    private LinearLayout bannerRow1;
+    private LinearLayout bannerRow2;
+    private LinearLayout bannerRowTime;
+    private LinearLayout bannerLocationWeather;
+
+    // 数据源层key透明重写：等效网页播放器的原生生菜机制——
+    // 播放列表403时用静默刷新harvest的最新签名地址透明替换，直播窗口连续，播放器完全无感
+    private boolean keyRewriteCapable = false;
+    private long lastKeyHarvestTime = 0;
+    private static final long KEY_HARVEST_INTERVAL_MS = 150000;
+    private static final long CANDIDATE_REWRITE_MAX_AGE_MS = 210000; // key签发后约3.5分钟失效
+
     // ExoPlayer监听器引用：切换视频源前先移除旧监听器，避免监听器泄漏导致
     // 多个缓冲看门狗并存、用旧URL重新prepare等引起的异常卡顿和刷新
     private Player.Listener currentPlayerListener;
+
+    // 双播放器无缝续播：预载播放器在新实例上缓冲新流，就绪后瞬时接管，
+    // 全程旧画面持续播放不冻结（用于auth_key轮换/403恢复的静默切换）
+    private ExoPlayer pendingPlayer;
+    private Player.Listener pendingPlayerListener;
+    private Runnable pendingTimeoutRunnable;
+    private static final long PENDING_SWITCH_TIMEOUT_MS = 15000;
+    // 预载播放器的哑渲染表面：让解码器提前初始化、视频分辨率提前上报，
+    // 换入瞬间PlayerView已知新流宽高比 → 旧画面不会被短暂拉伸
+    private android.graphics.SurfaceTexture pendingDummyTexture;
+    private android.view.Surface pendingDummySurface;
 
     // CCTV直播流auth_key有CDN配额（约3.5分钟），需要主动轮换/预取新key避免断流
     private Runnable streamRotateRunnable;
@@ -294,8 +354,6 @@ public class MainActivity extends AppCompatActivity {
         progressBar = findViewById(R.id.progress_bar);
         btnNextSource = findViewById(R.id.btn_next_source);
         btnPrevSource = findViewById(R.id.btn_prev_source);
-        btnNextMode = findViewById(R.id.btn_next_mode);
-        btnPrevMode = findViewById(R.id.btn_prev_mode);
         btnSwitchMode = findViewById(R.id.btn_switch_mode);
         btnLockOrientation = findViewById(R.id.btn_lock_orientation);
         btnOrientation = findViewById(R.id.btn_orientation);
@@ -304,6 +362,16 @@ public class MainActivity extends AppCompatActivity {
         tvNetworkInfo = findViewById(R.id.tv_network_info);
         tvHintInfo = findViewById(R.id.tv_hint_info);
         controlPanel = findViewById(R.id.control_panel);
+        switchOverlay = findViewById(R.id.switch_overlay);
+        tvSwitchChannel = findViewById(R.id.tv_switch_channel);
+        tvSwitchHint = findViewById(R.id.tv_switch_hint);
+        portraitPlayOverlay = findViewById(R.id.portrait_play_overlay);
+        btnFullscreenPlay = findViewById(R.id.btn_fullscreen_play);
+        controlButtonsRow = findViewById(R.id.control_buttons_row);
+        bannerRow1 = findViewById(R.id.banner_row1);
+        bannerRow2 = findViewById(R.id.banner_row2);
+        bannerRowTime = findViewById(R.id.banner_row_time);
+        bannerLocationWeather = findViewById(R.id.banner_location_weather);
 
         // 初始化右上角信息面板
         infoOverlay = findViewById(R.id.info_overlay);
@@ -339,21 +407,52 @@ public class MainActivity extends AppCompatActivity {
                 switchToPrevSource();
             }
         });
-        btnNextMode.setOnClickListener(v -> switchMode());
-        btnPrevMode.setOnClickListener(v -> switchMode());
         btnSwitchMode.setOnClickListener(v -> switchMode());
         btnLockOrientation.setOnClickListener(v -> toggleOrientationLock());
         btnOrientation.setOnClickListener(v -> toggleScreenOrientation());
-        
+
+        // 电视/触屏双模式适配：
+        // 1) 按钮的focusableInTouchMode是为电视遥控器焦点导航设计的，
+        //    在触屏手机上会导致"第一次点击=抢焦点、第二次才触发"，必须关闭
+        boolean tv = isTelevisionDevice();
+        ImageButton[] allButtons = {btnPrevSource, btnNextSource,
+            btnSwitchMode, btnOrientation, btnLockOrientation};
+        for (ImageButton b : allButtons) {
+            if (b != null) b.setFocusableInTouchMode(tv);
+        }
+        // 2) 操作提示按设备区分
+        if (!tv && tvHintInfo != null) {
+            tvHintInfo.setText("点屏幕显示/隐藏面板 | 上/下滑切换频道 | ⇄按钮切换模式 | 双击返回键退出");
+        }
+        // 3) 控制面板窄屏自适应（手机竖屏按钮不超屏）
+        applyControlPanelLayout();
+        // 4) 竖屏全屏播放按钮
+        if (btnFullscreenPlay != null) {
+            // 圆角半透明背景
+            GradientDrawable fsBg = new GradientDrawable();
+            fsBg.setCornerRadius(24 * getResources().getDisplayMetrics().density);
+            fsBg.setColor(0xB3000000);
+            btnFullscreenPlay.setBackground(fsBg);
+            btnFullscreenPlay.setOnClickListener(v -> {
+                Toast.makeText(this, "切换到横屏全屏", Toast.LENGTH_SHORT).show();
+                toggleScreenOrientation();
+            });
+        }
+
         updateLockButtonIcon();
         
-        playerView.setOnClickListener(v -> toggleControlPanel());
-        webView.setOnClickListener(v -> toggleControlPanel());
+        // 手机触屏唤出控制面板统一由dispatchTouchEvent处理：
+        // 网页/视频元素会吞掉触摸事件，View.OnClickListener在WebView上不可靠
         
         initNetworkMonitor();
         initOrientationListener();
         loadSavedConfig();
         applyBannerStyle();
+        // 横幅尺寸变化（旋转/首帧布局/文字变化）时重新自适应字号
+        if (infoOverlay != null) {
+            infoOverlay.addOnLayoutChangeListener(
+                (v, l, t, r, b, ol, ot, or2, ob) -> scheduleBannerAutoFit());
+        }
         startHttpServer();
         updatePlayerModeButtons();
 
@@ -383,6 +482,222 @@ public class MainActivity extends AppCompatActivity {
             View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
             View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
         );
+    }
+
+    /**
+     * 触屏单击唤出/隐藏控制面板（手机端）。
+     * 在Activity层分发触摸事件：网页里的video元素会吞掉触摸，View.OnClickListener收不到；
+     * 这里只"旁观"不消费事件，触摸仍正常传给WebView/播放器，不影响网页交互。
+     */
+    @Override
+    public boolean dispatchTouchEvent(android.view.MotionEvent ev) {
+        switch (ev.getActionMasked()) {
+            case android.view.MotionEvent.ACTION_DOWN:
+                touchDownX = ev.getX();
+                touchDownY = ev.getY();
+                touchDownTime = SystemClock.uptimeMillis();
+                // 手势起点在控制面板/竖屏全屏按钮上时不触发滑动换台（避免误触按钮区）
+                swipeConsumed = (controlPanel != null && controlPanel.getVisibility() == View.VISIBLE
+                        && isPointInsideView(ev.getRawX(), ev.getRawY(), controlPanel))
+                    || (portraitPlayOverlay != null && portraitPlayOverlay.getVisibility() == View.VISIBLE
+                        && isPointInsideView(ev.getRawX(), ev.getRawY(), portraitPlayOverlay));
+                break;
+            case android.view.MotionEvent.ACTION_MOVE: {
+                // 滑动手势（触屏设备）：上滑=下一个频道，下滑=上一个频道。
+                // 左右滑动不做任何操作（模式切换统一由眼睛按钮），避免误触发
+                if (swipeConsumed) break;
+                float gdx = ev.getX() - touchDownX;
+                float gdy = ev.getY() - touchDownY;
+                float threshold = 60 * getResources().getDisplayMetrics().density;
+                if (Math.abs(gdy) >= threshold && Math.abs(gdy) > 2 * Math.abs(gdx)) {
+                    swipeConsumed = true;
+                    swipeChannel(gdy > 0); // 上滑(负)→下一个，下滑(正)→上一个
+                }
+                break;
+            }
+            case android.view.MotionEvent.ACTION_UP: {
+                long dt = SystemClock.uptimeMillis() - touchDownTime;
+                float dx = ev.getX() - touchDownX;
+                float dy = ev.getY() - touchDownY;
+                // 判定放宽到500ms/30dp：快速点击和轻微滑动偏移都算单击，减少"点了没反应"
+                float slop = 30 * getResources().getDisplayMetrics().density;
+                boolean isTap = !swipeConsumed && dt < 500 && (dx * dx + dy * dy) <= slop * slop;
+                boolean onControlPanel = controlPanel != null
+                    && controlPanel.getVisibility() == View.VISIBLE
+                    && isPointInsideView(ev.getRawX(), ev.getRawY(), controlPanel);
+                boolean onPortraitOverlay = portraitPlayOverlay != null
+                    && portraitPlayOverlay.getVisibility() == View.VISIBLE
+                    && isPointInsideView(ev.getRawX(), ev.getRawY(), portraitPlayOverlay);
+                // 350ms防抖：避免异常双事件导致面板刚显示又被隐藏（"触控失灵"的主因）
+                long nowUp = SystemClock.uptimeMillis();
+                if (isTap && !onControlPanel && !onPortraitOverlay && nowUp - lastTouchToggleTime > 350) {
+                    lastTouchToggleTime = nowUp;
+                    toggleControlPanel();
+                }
+                break;
+            }
+        }
+        return super.dispatchTouchEvent(ev);
+    }
+
+    /** 滑动换台（对应遥控器上/下键）：网页模式切网站，播放器模式切直播源 */
+    private void swipeChannel(boolean up) {
+        if (useWebMode) {
+            if (up) switchToPrevWebSite(); else switchToNextWebSite();
+        } else {
+            if (up) switchToPrevSource(); else switchToNextSource();
+        }
+    }
+
+    /** 判断屏幕坐标是否落在View区域内（用于排除控制面板自身的点击） */
+    private boolean isPointInsideView(float rawX, float rawY, View v) {
+        int[] loc = new int[2];
+        v.getLocationOnScreen(loc);
+        return rawX >= loc[0] && rawX <= loc[0] + v.getWidth()
+            && rawY >= loc[1] && rawY <= loc[1] + v.getHeight();
+    }
+
+    /** 是否电视设备（无加速度计、遥控器焦点导航） */
+    private boolean isTelevisionDevice() {
+        if (isTvDevice == null) {
+            android.content.pm.PackageManager pm = getPackageManager();
+            isTvDevice = pm != null && (pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_LEANBACK)
+                || pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_TELEVISION));
+        }
+        return isTvDevice;
+    }
+
+    /** 控制面板窄屏自适应：手机竖屏时缩小按钮与间距，保证一排放得下（配置地址行始终显示） */
+    private void applyControlPanelLayout() {
+        if (controlButtonsRow == null) return;
+        float density = getResources().getDisplayMetrics().density;
+        int screenWidthDp = getResources().getConfiguration().screenWidthDp;
+        boolean narrow = screenWidthDp < 480;
+        int count = controlButtonsRow.getChildCount();
+        if (count == 0) return;
+        // 可用宽度 = 屏宽 - 行左右padding(16dp×2)；按钮间 marginEnd 窄屏4dp / 宽屏12dp
+        int marginDp = narrow ? 4 : 12;
+        int availDp = screenWidthDp - 32;
+        int btnDp = narrow
+            ? Math.max(40, (availDp - marginDp * (count - 1)) / count)
+            : 72;
+        int btnPx = (int) (btnDp * density + 0.5f);
+        int padPx = (int) ((narrow ? 6 : 16) * density + 0.5f);
+        for (int i = 0; i < count; i++) {
+            View cell = controlButtonsRow.getChildAt(i);
+            // 单元格 = 垂直LinearLayout（按钮 + 汉字说明标签）
+            ViewGroup.LayoutParams clp = cell.getLayoutParams();
+            if (clp != null && clp.width != btnPx) {
+                clp.width = btnPx;
+                clp.height = ViewGroup.LayoutParams.WRAP_CONTENT;
+                cell.setLayoutParams(clp);
+            }
+            if (cell instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) cell;
+                for (int j = 0; j < vg.getChildCount(); j++) {
+                    View child = vg.getChildAt(j);
+                    if (child instanceof ImageButton) {
+                        ViewGroup.LayoutParams ilp = child.getLayoutParams();
+                        ilp.width = btnPx;
+                        ilp.height = btnPx;
+                        child.setLayoutParams(ilp);
+                        ((ImageButton) child).setScaleType(android.widget.ImageView.ScaleType.CENTER_INSIDE);
+                        child.setPadding(padPx, padPx, padPx, padPx);
+                    } else if (child instanceof TextView) {
+                        // 说明文字窄屏略微缩小
+                        ((TextView) child).setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, narrow ? 9f : 11f);
+                    }
+                }
+            }
+            ViewGroup.MarginLayoutParams mlp = null;
+            if (cell.getLayoutParams() instanceof ViewGroup.MarginLayoutParams) {
+                mlp = (ViewGroup.MarginLayoutParams) cell.getLayoutParams();
+                int mPx = (int) (marginDp * density + 0.5f);
+                if (mlp.rightMargin != mPx) {
+                    mlp.rightMargin = mPx;
+                    cell.setLayoutParams(mlp);
+                }
+            }
+        }
+    }
+
+    /** 竖屏播放时在视频下方黑边区显示"全屏播放"浮层；横屏/控制面板打开/换台中自动隐藏 */
+    private void updatePortraitPlayOverlay() {
+        if (portraitPlayOverlay == null) return;
+        boolean portrait = getResources().getConfiguration().orientation == Configuration.ORIENTATION_PORTRAIT;
+        // 注意：不依赖isPlaying标志（个别路径下可能未被置回true导致按钮"消失"），
+        // 播放器容器可见即显示——竖屏+播放器+面板收起+非换台 = 显示全屏按钮
+        boolean show = portrait
+            && playerContainer != null && playerContainer.getVisibility() == View.VISIBLE
+            && (controlPanel == null || controlPanel.getVisibility() != View.VISIBLE)
+            && (switchOverlay == null || switchOverlay.getVisibility() != View.VISIBLE);
+        portraitPlayOverlay.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show) {
+            // 动态放到视频下方黑边区：视频底边 = 屏高/2 + 屏宽×9/32，黑边高度 = 屏高 - 屏宽×9/16
+            View root = portraitPlayOverlay.getRootView();
+            float density = getResources().getDisplayMetrics().density;
+            int blackBand = Math.max(0, root.getHeight() - Math.round(root.getWidth() * 9f / 16f));
+            int mb = Math.max((int) (70 * density), (int) (blackBand * 0.30f));
+            FrameLayout.LayoutParams lp = null;
+            if (portraitPlayOverlay.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+                lp = (FrameLayout.LayoutParams) portraitPlayOverlay.getLayoutParams();
+            }
+            if (lp != null && Math.abs(lp.bottomMargin - mb) > density * 8) {
+                lp.bottomMargin = mb;
+                portraitPlayOverlay.setLayoutParams(lp);
+            }
+        }
+    }
+
+    // ==================== 换台遮罩（原生电视换台体验） ====================
+
+    /** 显示换台遮罩：黑色背景+频道名+加载中，盖住网页加载过程 */
+    private void showSwitchOverlay(String channelName) {
+        if (switchOverlay == null) return;
+        if (tvSwitchChannel != null && channelName != null && !channelName.isEmpty()) {
+            tvSwitchChannel.setText(channelName);
+        }
+        if (tvSwitchHint != null) tvSwitchHint.setText("正在加载，请稍候...");
+        switchOverlay.setVisibility(View.VISIBLE);
+        scheduleOverlayFallbackHide();
+    }
+
+    /** 只更新遮罩提示文字（保留频道名） */
+    private void showSwitchOverlayHint(String hint) {
+        if (tvSwitchHint != null && hint != null) tvSwitchHint.setText(hint);
+    }
+
+    /** 遮罩上显示错误提示 */
+    private void showSwitchOverlayError(String hint) {
+        if (switchOverlay == null) return;
+        switchOverlay.setVisibility(View.VISIBLE);
+        showSwitchOverlayHint(hint);
+        scheduleOverlayFallbackHide();
+    }
+
+    /** 收起换台遮罩 */
+    private void hideSwitchOverlay() {
+        if (overlayFallbackRunnable != null) {
+            handler.removeCallbacks(overlayFallbackRunnable);
+            overlayFallbackRunnable = null;
+        }
+        if (switchOverlay != null) switchOverlay.setVisibility(View.GONE);
+    }
+
+    /** 兜底：部分页面视频不会自动播放/桥回调不触发，30秒后强制露出页面并显示控制面板，避免遮罩永远盖住内容 */
+    private void scheduleOverlayFallbackHide() {
+        if (overlayFallbackRunnable != null) {
+            handler.removeCallbacks(overlayFallbackRunnable);
+        }
+        overlayFallbackRunnable = () -> {
+            overlayFallbackRunnable = null;
+            if (switchOverlay != null && switchOverlay.getVisibility() == View.VISIBLE) {
+                LogUtil.w("NewsLive", "Switch overlay fallback reveal after 30s");
+                hideSwitchOverlay();
+                showControlPanel();
+            }
+        };
+        handler.postDelayed(overlayFallbackRunnable, 30000);
     }
 
     /** 递归设置View及其所有子View背景为纯黑，消除视频全屏时的白色边框 */
@@ -434,22 +749,31 @@ public class MainActivity extends AppCompatActivity {
         networkCallback = new ConnectivityManager.NetworkCallback() {
             @Override
             public void onAvailable(Network network) {
-                isNetworkAvailable = true;
                 runOnUiThread(() -> {
+                    boolean wasAvailable = isNetworkAvailable;
+                    // 重新检测当前活动网络：onAvailable可能来自次要网络
+                    isNetworkAvailable = isNetworkConnected();
                     updateNetworkInfo();
-                    onNetworkRestored();
+                    if (!wasAvailable && isNetworkAvailable) {
+                        onNetworkRestored();
+                    }
                 });
             }
-            
+
             @Override
             public void onLost(Network network) {
-                isNetworkAvailable = false;
                 runOnUiThread(() -> {
+                    // 关键修复：onLost会对任意一条被监测网络触发（如闲置蜂窝断开），
+                    // 不能直接全局置为无网络——必须重新检测当前活动网络，
+                    // 否则WiFi正常看播时也会误报"无网络"甚至误暂停播放
+                    isNetworkAvailable = isNetworkConnected();
                     updateNetworkInfo();
-                    onNetworkLost();
+                    if (!isNetworkAvailable) {
+                        onNetworkLost();
+                    }
                 });
             }
-            
+
             @Override
             public void onCapabilitiesChanged(Network network, NetworkCapabilities capabilities) {
                 runOnUiThread(() -> updateNetworkInfo());
@@ -476,7 +800,7 @@ public class MainActivity extends AppCompatActivity {
     private void updateNetworkInfo() {
         String networkType = "无网络";
         int color = 0xFFE53935;
-        
+
         if (isNetworkAvailable && connectivityManager != null) {
             Network network = connectivityManager.getActiveNetwork();
             NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
@@ -490,10 +814,17 @@ public class MainActivity extends AppCompatActivity {
                 } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
                     networkType = "有线网络";
                     color = 0xFF43A047;
+                } else {
+                    // 有活动网络但类型未识别（如正在验证）：不误报"无网络"
+                    networkType = "已连接";
+                    color = 0xFF43A047;
                 }
+            } else {
+                networkType = "已连接";
+                color = 0xFF43A047;
             }
         }
-        
+
         if (tvNetworkInfo != null) {
             tvNetworkInfo.setText("网络: " + networkType);
             tvNetworkInfo.setTextColor(color);
@@ -578,10 +909,9 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
         } else {
+            // 竖屏：只跟随旋转画面，不再切换模式
+            // （旧代码的switchToWebMode条件在播放器模式下恒不成立，竖屏看视频本就该保持画面）
             setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
-            if (!useWebMode) {
-                switchToWebMode();
-            }
         }
     }
     
@@ -663,7 +993,12 @@ public class MainActivity extends AppCompatActivity {
     }
     private void checkVideoPlayingAndSwitch(String sniffedUrl) {
         if (sniffedUrl == null || sniffedUrl.isEmpty()) return;
-        if (webView == null || webView.getVisibility() != View.VISIBLE) {
+        // 只在真正隐藏（GONE，即播放器模式）时跳过；INVISIBLE是静默刷新的合法状态
+        if (webView == null || webView.getVisibility() == View.GONE) {
+            return;
+        }
+        // 播放器已在播放时不处理，避免干扰
+        if (playerContainer != null && playerContainer.getVisibility() == View.VISIBLE) {
             return;
         }
         // 从 video.currentSrc 获取真实地址（视频元素实际使用的地址，比嗅探的更准确）
@@ -767,6 +1102,21 @@ public class MainActivity extends AppCompatActivity {
     private void switchToPlayerMode(String videoUrl) {
         if (videoUrl == null || videoUrl.isEmpty()) return;
 
+        // 已在用同一地址播放（含缓冲中）：嗅探与静默刷新双路径同时拿到同一地址时避免重复prepare导致画面重启
+        if (player != null && playerContainer != null
+                && playerContainer.getVisibility() == View.VISIBLE
+                && videoUrl.equals(currentVideoUrl)
+                && (player.isPlaying() || player.getPlaybackState() == Player.STATE_BUFFERING)) {
+            LogUtil.i("NewsLive", "switchToPlayerMode: already playing same url, skip");
+            // 标记/兜底定时器清理：防止silentRefreshPending残留导致后续页面被误静音
+            silentRefreshPending = false;
+            candidateVideoUrl = "";
+            pendingAutoSwitch = false;
+            cancelWebRefreshFallback();
+            webRefreshFallbackCount = 0;
+            return;
+        }
+
         // CCTV的流含cdrm(DRM加密)，ExoPlayer无法解密；kcdnvip域名的流也常解码失败。
         // 这些流交给WebView自带播放器播放（网页有解密逻辑），不切换到ExoPlayer，避免黑屏。
         // 注意：cctvnews.cctv.com（央视新闻直播）的流可以被ExoPlayer正常播放，不在此列。
@@ -828,7 +1178,7 @@ public class MainActivity extends AppCompatActivity {
             } else {
                 playVideoUrl(videoUrl, pageName);
             }
-            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+            // 不再强制横屏：方向跟随设备旋转，竖屏持机时视频以黑边居中显示，横过来即全屏
         });
     }
 
@@ -847,8 +1197,7 @@ public class MainActivity extends AppCompatActivity {
         currentSiteIndex = prefs.getInt(KEY_CURRENT_SITE_INDEX, 0);
 
         loadWebSites();
-        loadPlayerVideoUrls();
-        
+
         String savedConfig = prefs.getString("saved_sources", "");
         if (!savedConfig.isEmpty()) {
             try {
@@ -917,53 +1266,90 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void loadPlayerVideoUrls() {
-        playerVideoUrls.clear();
-        playerVideoNames.clear();
-
-        String savedUrls = prefs.getString(KEY_PLAYER_VIDEO_URLS, "");
-        if (!savedUrls.isEmpty()) {
-            try {
-                JSONArray urls = new JSONArray(savedUrls);
-                for (int i = 0; i < urls.length(); i++) {
-                    JSONObject item = urls.getJSONObject(i);
-                    playerVideoNames.add(item.optString("name", "视频" + (i + 1)));
-                    playerVideoUrls.add(item.optString("url", ""));
-                }
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
-
-        // 如果没有配置，使用默认直播源
-        if (playerVideoUrls.isEmpty() && !streamUrls.isEmpty()) {
-            for (int i = 0; i < streamUrls.size(); i++) {
-                playerVideoNames.add(streamNames.get(i));
-                playerVideoUrls.add(streamUrls.get(i));
-            }
-        }
-    }
-
-    private void savePlayerVideoUrls() {
-        try {
-            JSONArray urls = new JSONArray();
-            for (int i = 0; i < playerVideoUrls.size(); i++) {
-                JSONObject item = new JSONObject();
-                item.put("name", playerVideoNames.get(i));
-                item.put("url", playerVideoUrls.get(i));
-                urls.put(item);
-            }
-            prefs.edit().putString(KEY_PLAYER_VIDEO_URLS, urls.toString()).apply();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
     private void updatePlayerModeButtons() {
-        // 模式切换按钮始终显示
+        // 模式切换只保留一个按钮（网页↔播放器）
         if (btnSwitchMode != null) btnSwitchMode.setVisibility(View.VISIBLE);
-        if (btnNextMode != null) btnNextMode.setVisibility(View.VISIBLE);
-        if (btnPrevMode != null) btnPrevMode.setVisibility(View.VISIBLE);
+    }
+
+    // ==================== 顶部横幅多行排版（竖屏独立布局） ====================
+
+    /** 竖屏三行：农历行 / 日期行 / 定位天气行（各占一行，字号保持正常大小）；
+     *  横屏单行：日期居中、定位天气在行尾，额外行隐藏 */
+    private void relayoutBannerForOrientation() {
+        if (bannerRow1 == null || bannerRow2 == null || bannerRowTime == null
+                || bannerLocationWeather == null || tvDateTime == null) return;
+        boolean portrait = getResources().getConfiguration().orientation == Configuration.ORIENTATION_PORTRAIT;
+        // 日期行独立成行时去掉左右边距（原12dp是给横屏单行准备的），保证与上下两行左对齐
+        applyDateTimeMargins(portrait ? 0 : 12);
+        // 日期文字对齐：竖屏独立行靠左（原gravity=center会显得居中悬浮），横屏恢复居中
+        tvDateTime.setGravity(portrait
+            ? Gravity.START | Gravity.CENTER_VERTICAL
+            : Gravity.CENTER_HORIZONTAL | Gravity.CENTER_VERTICAL);
+        if (portrait) {
+            if (tvDateTime.getParent() != bannerRowTime) {
+                bannerRow1.removeView(tvDateTime);
+                bannerRowTime.addView(tvDateTime);
+            }
+            if (bannerLocationWeather.getParent() != bannerRow2) {
+                bannerRow1.removeView(bannerLocationWeather);
+                bannerRow2.addView(bannerLocationWeather);
+            }
+            bannerRowTime.setVisibility(View.VISIBLE);
+            bannerRow2.setVisibility(View.VISIBLE);
+        } else {
+            if (tvDateTime.getParent() != bannerRow1) {
+                ViewGroup p = (ViewGroup) tvDateTime.getParent();
+                if (p != null) p.removeView(tvDateTime);
+                bannerRow1.addView(tvDateTime, 1); // 左栏之后
+            }
+            if (bannerLocationWeather.getParent() != bannerRow1) {
+                ViewGroup p = (ViewGroup) bannerLocationWeather.getParent();
+                if (p != null) p.removeView(bannerLocationWeather);
+                bannerRow1.addView(bannerLocationWeather);
+            }
+            bannerRowTime.setVisibility(View.GONE);
+            bannerRow2.setVisibility(View.GONE);
+        }
+    }
+
+    /** 设置日期TextView的左右边距（横屏单行时12dp与两侧留白，竖屏独立行时0对齐最左） */
+    private void applyDateTimeMargins(int marginDp) {
+        if (tvDateTime == null) return;
+        ViewGroup.LayoutParams lp = tvDateTime.getLayoutParams();
+        if (lp instanceof ViewGroup.MarginLayoutParams) {
+            ViewGroup.MarginLayoutParams mlp = (ViewGroup.MarginLayoutParams) lp;
+            float density = getResources().getDisplayMetrics().density;
+            int mPx = (int) (marginDp * density + 0.5f);
+            if (mlp.leftMargin != mPx || mlp.rightMargin != mPx) {
+                mlp.leftMargin = mPx;
+                mlp.rightMargin = mPx;
+                tvDateTime.setLayoutParams(mlp);
+            }
+        }
+    }
+
+    /**
+     * 仅音频流处理：清掉上一视频频道残留的冻结画面。
+     * KeepContentOnPlayerReset为无缝换流保帧设计，但音频流永远不会渲染新帧，
+     * 冻结帧会一直挂着，看起来像"画面还在播"。检测到无视频轨时清空表面转黑屏。
+     */
+    private void clearSurfaceIfAudioOnly() {
+        if (playerView == null || player == null) return;
+        try {
+            androidx.media3.common.Format videoFormat = player.getVideoFormat();
+            androidx.media3.common.VideoSize vs = player.getVideoSize();
+            boolean audioOnly = (videoFormat == null)
+                || (vs != null && vs.width == 0 && vs.height == 0);
+            if (!audioOnly) return;
+            // 临时关闭保帧 → 重绑播放器清空表面 → 恢复保帧（供下次视频流无缝切换）
+            playerView.setKeepContentOnPlayerReset(false);
+            playerView.setPlayer(null);
+            playerView.setPlayer(player);
+            playerView.setKeepContentOnPlayerReset(true);
+            LogUtil.i("NewsLive", "audio-only stream: cleared stale video frame");
+        } catch (Exception e) {
+            LogUtil.w("NewsLive", "clearSurfaceIfAudioOnly: " + e.getMessage());
+        }
     }
 
     // ==================== 右上角时钟 ====================
@@ -973,19 +1359,34 @@ public class MainActivity extends AppCompatActivity {
         if (infoOverlay == null) return;
         infoOverlay.setVisibility(bannerVisible ? android.view.View.VISIBLE : android.view.View.GONE);
         if (!bannerVisible) return;
-        // 高度（dp→px）
+        relayoutBannerForOrientation();
+        // 高度（dp→px）：竖屏三行
+        boolean portrait = getResources().getConfiguration().orientation == Configuration.ORIENTATION_PORTRAIT;
         float density = getResources().getDisplayMetrics().density;
-        int heightPx = (int) (bannerHeight * density + 0.5f);
+        int heightPx = (int) (bannerHeight * (portrait ? 3 : 1) * density + 0.5f);
         android.view.ViewGroup.LayoutParams lp = infoOverlay.getLayoutParams();
         if (lp != null && lp.height != heightPx) {
             lp.height = heightPx;
             infoOverlay.setLayoutParams(lp);
         }
-        // 字号：基准 = bannerFontSize
+        // 所有横幅文本强制单行，杜绝换行
+        List<TextView> bannerTexts = new ArrayList<>();
+        collectBannerTextViews((ViewGroup) infoOverlay, bannerTexts);
+        for (TextView tv : bannerTexts) {
+            tv.setSingleLine(true);
+        }
+        applyBannerFontSizes();
+        // 自适应：文字总宽超出横幅宽度时自动缩小字号（手机窄屏不再换行/截断）
+        scheduleBannerAutoFit();
+    }
+
+    /** 按当前自适应缩放比例设置横幅各文字字号 */
+    private void applyBannerFontSizes() {
+        // 字号：基准 = bannerFontSize × 自适应比例
         // 主文字=基准；节气/温度=基准-1；标签=基准-2；图标=基准+2
-        float base = bannerFontSize;
-        float sub = Math.max(base - 1, 8);
-        float label = Math.max(base - 2, 8);
+        float base = bannerFontSize * bannerFitScale;
+        float sub = Math.max(base - 1, 7);
+        float label = Math.max(base - 2, 7);
         float icon = base + 2;
         if (tvLunar != null) tvLunar.setTextSize(base);
         if (tvShichen != null) tvShichen.setTextSize(base);
@@ -1001,6 +1402,106 @@ public class MainActivity extends AppCompatActivity {
         for (TextView tv : new TextView[]{tvW0Temp, tvW1Temp, tvW2Temp}) {
             if (tv != null) tv.setTextSize(sub);
         }
+    }
+
+    // ==================== 横幅字号自适应（单行不换行） ====================
+    private float bannerFitScale = 1f;       // 当前自适应缩放比例（0.5~1）
+    private boolean bannerFitScheduled = false;
+
+    private void scheduleBannerAutoFit() {
+        if (handler == null || infoOverlay == null || !bannerVisible) return;
+        if (bannerFitScheduled) return;
+        bannerFitScheduled = true;
+        handler.postDelayed(() -> {
+            bannerFitScheduled = false;
+            autoFitBannerTexts();
+        }, 120);
+    }
+
+    /**
+     * 横幅自适应：迭代测量全部文本理想总宽，超出横幅宽度时按比例缩小字号并重新测量，
+     * 收敛到刚好放下（手机竖屏内容总宽可达屏幕2倍以上，单次线性缩放不够）；
+     * 大量富余时逐步恢复字号，恢复后若溢出立即回退。
+     */
+    private void autoFitBannerTexts() {
+        if (infoOverlay == null || !bannerVisible) return;
+        if (!(infoOverlay instanceof ViewGroup)) return;
+        // 逐行自适应：竖屏三行各自收敛，横屏整条收敛
+        List<ViewGroup> rows = new ArrayList<>();
+        if (bannerRow1 != null && bannerRowTime != null && bannerRow2 != null
+                && bannerRowTime.getVisibility() == View.VISIBLE) {
+            rows.add(bannerRow1);
+            rows.add(bannerRowTime);
+            rows.add(bannerRow2);
+        } else {
+            rows.add((ViewGroup) infoOverlay);
+        }
+        for (ViewGroup row : rows) {
+            fitBannerRow(row);
+        }
+    }
+
+    /** 对单行做字号收敛：超出则按比例缩小并重新测量（只缩不涨，避免反复试探导致的"抽动"） */
+    private void fitBannerRow(ViewGroup row) {
+        int avail = row.getWidth() - row.getPaddingStart() - row.getPaddingEnd();
+        if (avail <= 0) {
+            scheduleBannerAutoFit(); // 尚未完成布局，稍后重试
+            return;
+        }
+        List<TextView> texts = new ArrayList<>();
+        collectBannerTextViews(row, texts);
+        int extras = sumBannerExtras(row);
+        // 收敛循环：缩到放下为止（最多8轮）
+        for (int i = 0; i < 8; i++) {
+            int total = measureBannerTotal(texts) + extras;
+            if (total <= avail) break;
+            float newScale = bannerFitScale * ((float) avail / total);
+            newScale = Math.max(0.35f, Math.min(bannerFitScale, newScale)); // 循环内只缩不涨
+            if (bannerFitScale - newScale < 0.01f) break; // 已到下限或步长过小
+            bannerFitScale = newScale;
+            applyBannerFontSizes();
+        }
+    }
+
+    /** 测量横幅全部文本的理想总宽 */
+    private int measureBannerTotal(List<TextView> texts) {
+        int desired = 0;
+        for (TextView tv : texts) {
+            tv.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
+            desired += tv.getMeasuredWidth();
+        }
+        return desired;
+    }
+
+    /** 递归收集View树中的所有TextView */
+    private void collectBannerTextViews(ViewGroup group, List<TextView> out) {
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            if (child instanceof TextView) {
+                out.add((TextView) child);
+            } else if (child instanceof ViewGroup) {
+                collectBannerTextViews((ViewGroup) child, out);
+            }
+        }
+    }
+
+    /** 统计横幅内非文本开销：所有子View水平边距 + 非文本子View宽度（分隔线等） */
+    private int sumBannerExtras(ViewGroup group) {
+        int sum = 0;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            ViewGroup.LayoutParams clp = child.getLayoutParams();
+            if (clp instanceof ViewGroup.MarginLayoutParams) {
+                ViewGroup.MarginLayoutParams mlp = (ViewGroup.MarginLayoutParams) clp;
+                sum += mlp.leftMargin + mlp.rightMargin;
+            }
+            if (child instanceof ViewGroup) {
+                sum += sumBannerExtras((ViewGroup) child);
+            } else if (!(child instanceof TextView)) {
+                sum += Math.max(child.getMeasuredWidth(), 1);
+            }
+        }
+        return sum;
     }
 
     private void startClock() {
@@ -1054,12 +1555,13 @@ public class MainActivity extends AppCompatActivity {
             tvDateTime.setText(String.format("%d年%02d月%02d日 周%s %02d:%02d:%02d",
                     year, month, day, weekNames[weekday - 1], hour, minute, second));
 
-            // 时辰：每分钟更新一次
+            // 时辰：每分钟更新一次（文字宽度变化，需重新自适应字号）
             int currentMinute = hour * 60 + minute;
             if (currentMinute != lastShichenMinute) {
                 lastShichenMinute = currentMinute;
                 if (tvShichen != null) {
                     tvShichen.setText(ShichenUtil.getShichen(cal));
+                    scheduleBannerAutoFit();
                 }
             }
 
@@ -1072,6 +1574,8 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             e.printStackTrace();
         }
+        // 每秒例行校准：竖屏全屏按钮浮层的显示条件若在事件间隙被错过，1秒内自动补上
+        updatePortraitPlayOverlay();
     }
 
     private void updateDateInfo(java.util.Calendar cal) {
@@ -1100,6 +1604,7 @@ public class MainActivity extends AppCompatActivity {
                 LogUtil.i("NewsLive", "jieqi: " + jieqi);
                 tvJieqi.setText(jieqi);
                 updateJieqiStyle(jieqi.startsWith("今日"));
+                scheduleBannerAutoFit();
             } catch (Exception e) {
                 LogUtil.e("NewsLive", "jieqi calc error", e);
                 tvJieqi.setText("节气计算错误");
@@ -1126,59 +1631,385 @@ public class MainActivity extends AppCompatActivity {
 
     // ==================== 定位与天气 ====================
     private void requestLocationAndWeather() {
+        // 手动配置地区优先：配置了就不再自动定位
+        manualLocation = prefs.getString(KEY_MANUAL_LOCATION, "");
+        if (manualLocation != null && !manualLocation.trim().isEmpty()) {
+            manualLocation = manualLocation.trim();
+            tvLocation.setText("📍 " + shortenLocation(manualLocation));
+            scheduleBannerAutoFit();
+            executorService.execute(() -> {
+                double[] coord = geocodeManualLocation(manualLocation);
+                if (coord != null) {
+                    lastLatitude = coord[0];
+                    lastLongitude = coord[1];
+                    runOnUiThread(() -> fetchWeather(lastLatitude, lastLongitude));
+                } else {
+                    LogUtil.w("NewsLive", "manual location unresolved, fallback to IP: " + manualLocation);
+                    runOnUiThread(() -> {
+                        Toast.makeText(this, "手动地区无法解析，已回退自动定位", Toast.LENGTH_LONG).show();
+                        fetchLocationByIP();
+                    });
+                }
+            });
+            return;
+        }
         // 电视无GPS，直接使用IP定位
         tvLocation.setText("📍 定位中...");
         fetchLocationByIP();
     }
 
+    /**
+     * Photon(komoot)地名搜索：基于OSM数据，对中国区县/乡镇/街道收录远好于Open-Meteo，
+     * 且国内网络可直连（Nominatim直连不可达，实测HTTP:000超时）。
+     * 过滤规则：优先行政区划条目（osm_key=place），跳过同名车站/POI等噪声。
+     */
+    private double[] tryGeocodePhoton(String query) {
+        try {
+            String urlStr = "https://photon.komoot.io/api?q=" +
+                URLEncoder.encode(query, "UTF-8") + "&limit=10";
+            URL url = new URL(urlStr);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
+            conn.setRequestProperty("User-Agent", "NewsLiveApp/1.0 (weather location config)");
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), "UTF-8"));
+            StringBuilder response = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                response.append(line);
+            }
+            reader.close();
+            conn.disconnect();
+            JSONObject json = new JSONObject(response.toString());
+            JSONArray features = json.optJSONArray("features");
+            if (features == null || features.length() == 0) {
+                LogUtil.w("NewsLive", "photon no result: " + query);
+                return null;
+            }
+            // 两轮筛选：先找行政区划条目（避免"临川"命中火车站等噪声），找不到再放宽到名称匹配
+            JSONObject best = null;
+            for (int pass = 0; pass < 2 && best == null; pass++) {
+                for (int i = 0; i < features.length(); i++) {
+                    JSONObject f = features.getJSONObject(i);
+                    JSONObject pr = f.optJSONObject("properties");
+                    if (pr == null) continue;
+                    if (!"中国".equals(pr.optString("country", ""))) continue;
+                    String pname = pr.optString("name", "");
+                    if (pname.isEmpty()) continue;
+                    boolean administrative = "place".equals(pr.optString("osm_key", ""))
+                        || java.util.Arrays.asList("county", "city", "town", "district", "state", "village", "suburb", "quarter")
+                            .contains(pr.optString("type", ""));
+                    boolean nameMatch = pname.contains(query) || query.contains(pname);
+                    if (pass == 0 && !administrative) continue;
+                    if (pass == 1 && !nameMatch) continue;
+                    best = f;
+                    break;
+                }
+            }
+            if (best == null) {
+                LogUtil.w("NewsLive", "photon no administrative/name match: " + query);
+                return null;
+            }
+            JSONArray coords = best.getJSONObject("geometry").optJSONArray("coordinates");
+            if (coords == null || coords.length() < 2) return null;
+            double lon = coords.getDouble(0); // GeoJSON坐标顺序 [lon, lat]
+            double lat = coords.getDouble(1);
+            LogUtil.i("NewsLive", "photon hit: " + query + " -> " + best.optJSONObject("properties").optString("name")
+                + " lat=" + lat + " lon=" + lon);
+            return new double[]{lat, lon};
+        } catch (Exception e) {
+            LogUtil.e("NewsLive", "tryGeocodePhoton(" + query + ") failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /** 解析手动输入的地区名为[省,市,区]（如"广东省深圳市南山区"→[广东省,深圳市,南山区]） */
+    private String[] parseManualLocation(String name) {
+        String pro = "", city = "", district = "";
+        java.util.regex.Matcher m;
+        m = java.util.regex.Pattern.compile("(北京市|天津市|上海市|重庆市|[^省]{1,8}省|[^自治]{1,10}自治区)").matcher(name);
+        if (m.find()) pro = m.group(1);
+        m = java.util.regex.Pattern.compile("([^省市自治]{1,10}市)").matcher(name);
+        if (m.find()) {
+            String c = m.group(1);
+            if (!c.equals(pro)) city = c;
+        }
+        m = java.util.regex.Pattern.compile("([^市省]{1,10}(?:区|县|旗))").matcher(name);
+        if (m.find()) district = m.group(1);
+        return new String[]{pro, city, district};
+    }
+
+    /**
+     * 手动地区转坐标（逐级尝试）：区验证→区名→OSM(区+市消歧)→市→OSM全文。
+     * Open-Meteo地名库对区县收录稀疏，OSM Nominatim覆盖到乡镇/街道，两者互补。
+     * @return [lat, lon]，全部失败返回null（视为无效地区）
+     */
+    private double[] geocodeManualLocation(String name) {
+        String[] parts = parseManualLocation(name);
+        String pro = parts[0], city = parts[1], district = parts[2];
+        LogUtil.i("NewsLive", "manual location parsed: pro=" + pro + " city=" + city + " district=" + district);
+        double[] coord = null;
+        if (!district.isEmpty()) {
+            coord = tryGeocodeDistrict(district, city, pro);
+            if (coord == null) coord = tryGeocodeName(district, 1);
+            if (coord == null) coord = tryGeocodePhoton(city.isEmpty() ? district : district + " " + city);
+        }
+        if (coord == null && !city.isEmpty()) {
+            String c = city.endsWith("市") ? city.substring(0, city.length() - 1) : city;
+            coord = tryGeocodeName(c, 1);
+            if (coord == null) coord = tryGeocodePhoton(c);
+        }
+        if (coord == null) {
+            coord = tryGeocodePhoton(name);
+        }
+        return coord;
+    }
+
+    /** 配置页提交手动地区：先验证（能查到天气坐标才生效），通过后保存并立即刷新定位与天气 */
+    private void handleManualLocationUpdate(String newLoc) {
+        String cur = prefs.getString(KEY_MANUAL_LOCATION, "");
+        if (newLoc == null) newLoc = "";
+        newLoc = newLoc.trim();
+        if (newLoc.equals(cur)) return;
+        if (newLoc.isEmpty()) {
+            // 清空=恢复自动IP定位
+            prefs.edit().remove(KEY_MANUAL_LOCATION).apply();
+            manualLocation = "";
+            runOnUiThread(() -> {
+                Toast.makeText(this, "已恢复自动IP定位", Toast.LENGTH_SHORT).show();
+                requestLocationAndWeather();
+            });
+            return;
+        }
+        final String loc = newLoc;
+        executorService.execute(() -> {
+            double[] coord = geocodeManualLocation(loc);
+            if (coord != null) {
+                prefs.edit().putString(KEY_MANUAL_LOCATION, loc).apply();
+                manualLocation = loc;
+                lastLatitude = coord[0];
+                lastLongitude = coord[1];
+                runOnUiThread(() -> {
+                    Toast.makeText(this, "地区已设置: " + loc, Toast.LENGTH_LONG).show();
+                    tvLocation.setText("📍 " + shortenLocation(loc));
+                    scheduleBannerAutoFit();
+                    fetchWeather(lastLatitude, lastLongitude);
+                });
+            } else {
+                LogUtil.w("NewsLive", "manual location invalid (no weather data): " + loc);
+                runOnUiThread(() -> Toast.makeText(this,
+                    "地区无法识别（查不到对应天气），未保存: " + loc, Toast.LENGTH_LONG).show());
+            }
+        });
+    }
+
     // IP定位：通过公网IP获取位置（电视无GPS）
-    // 主用太平洋电脑网API（HTTP，国内速度快，返回中文），备用 ip-api.com + 逆地理编码
+    // 主用百度qifu区级定位（免Key，精确到区），备用太平洋电脑网API；
+    // 坐标通过Open-Meteo按区名地理编码（验证省市归属防止同名区错配），市级兜底
     private void fetchLocationByIP() {
         executorService.execute(() -> {
-            try {
-                // 太平洋电脑网IP定位，HTTPS
-                URL url = new URL("https://whois.pconline.com.cn/ipJson.jsp?json=true");
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setConnectTimeout(8000);
-                conn.setReadTimeout(8000);
-                conn.setRequestProperty("User-Agent", "Mozilla/5.0");
-                // pconline返回GBK编码
-                BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "GBK"));
-                StringBuilder response = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    response.append(line);
+            String pro = "", city = "", district = "";
+            // 1) 百度qifu区级IP定位（免Key，国内直连）
+            String[] q = fetchQifuDistrict();
+            if (q != null) {
+                pro = q[0]; city = q[1]; district = q[2];
+            }
+            // 2) pconline兜底（region字段有时含区名）
+            if (city.isEmpty()) {
+                String[] p = fetchPconlineLocation();
+                if (p != null) {
+                    pro = p[0]; city = p[1]; district = p[2];
                 }
-                reader.close();
-                conn.disconnect();
-
-                String resp = response.toString();
-                LogUtil.i("NewsLive", "pconline response: " + resp);
-                JSONObject json = new JSONObject(resp);
-
-                // pconline返回字段: pro, city, region, addr（不含坐标）
-                String pro = json.optString("pro", "");   // 省
-                String city = json.optString("city", ""); // 市
-                String region = json.optString("region", ""); // 区
-
-                LogUtil.i("NewsLive", "pconline pro=" + pro + " city=" + city + " region=" + region);
-
-                // 组合显示：省 + 市 + 区
-                String name = "";
-                if (!pro.isEmpty()) name = pro;
-                if (!city.isEmpty() && !city.equals(pro)) name = name + " " + city;
-                if (!region.isEmpty() && !region.equals(city)) name = name + " " + region;
-                if (name.isEmpty()) name = json.optString("addr", "未知");
-
-                final String finalName = name;
-                runOnUiThread(() -> tvLocation.setText("📍 " + shortenLocation(finalName)));
-
-                // pconline不返回坐标，直接用ip-api获取坐标（快速），地理编码仅作ip-api失败时的备用
-                LogUtil.i("NewsLive", "pconline OK, fetching coords from ip-api");
-                fetchLocationByIPBackup(name);
-            } catch (Exception e) {
-                LogUtil.e("NewsLive", "pconline failed", e);
+            }
+            if (city.isEmpty() && district.isEmpty()) {
+                LogUtil.e("NewsLive", "qifu & pconline both failed");
                 fetchLocationByIPBackup("");
+                return;
+            }
+            LogUtil.i("NewsLive", "location: pro=" + pro + " city=" + city + " district=" + district);
+
+            // 显示优先级：区 > 市（用户要求至少定位到区）
+            String display = !district.isEmpty() ? district : city;
+            final String shortName = shortenLocation(display);
+            runOnUiThread(() -> {
+                tvLocation.setText("📍 " + shortName);
+                scheduleBannerAutoFit();
+            });
+
+            // 坐标：区级优先（验证归属）→ 市级兜底 → 老链路(ip-api)兜底 → 天气
+            geocodeAndFetchWeatherRefined(pro, city, district);
+        });
+    }
+
+    /** 百度qifu区级IP定位（免Key，国内直连）：返回[省, 市, 区]，失败返回null */
+    private String[] fetchQifuDistrict() {
+        try {
+            URL url = new URL("https://qifu-api.baidubce.com/ip/local/geo/v1/district");
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(6000);
+            conn.setReadTimeout(6000);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), "UTF-8"));
+            StringBuilder response = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                response.append(line);
+            }
+            reader.close();
+            conn.disconnect();
+            JSONObject json = new JSONObject(response.toString());
+            if (json.optInt("code", -1) != 0) return null;
+            JSONObject data = json.optJSONObject("data");
+            if (data == null) return null;
+            String prov = data.optString("prov", "");
+            String city = data.optString("city", "");
+            String district = data.optString("district", "");
+            if (prov.isEmpty() && city.isEmpty()) return null;
+            LogUtil.i("NewsLive", "qifu: prov=" + prov + " city=" + city + " district=" + district);
+            return new String[]{prov, city, district};
+        } catch (Exception e) {
+            LogUtil.e("NewsLive", "qifu failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /** 太平洋电脑网IP定位：返回[省, 市, 区]，失败返回null（原主逻辑提取为备用） */
+    private String[] fetchPconlineLocation() {
+        try {
+            URL url = new URL("https://whois.pconline.com.cn/ipJson.jsp?json=true");
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            // pconline返回GBK编码
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), "GBK"));
+            StringBuilder response = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                response.append(line);
+            }
+            reader.close();
+            conn.disconnect();
+            JSONObject json = new JSONObject(response.toString());
+            LogUtil.i("NewsLive", "pconline response: " + response);
+            return new String[]{
+                json.optString("pro", ""),
+                json.optString("city", ""),
+                json.optString("region", "")
+            };
+        } catch (Exception e) {
+            LogUtil.e("NewsLive", "pconline failed", e);
+            return null;
+        }
+    }
+
+    /** Open-Meteo地名搜索坐标：返回[lat,lon]，失败返回null */
+    private double[] tryGeocodeName(String name, int count) {
+        try {
+            String urlStr = "https://geocoding-api.open-meteo.com/v1/search?name=" +
+                URLEncoder.encode(name, "UTF-8") + "&count=" + count + "&language=zh&format=json";
+            URL url = new URL(urlStr);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), "UTF-8"));
+            StringBuilder response = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                response.append(line);
+            }
+            reader.close();
+            conn.disconnect();
+            JSONObject json = new JSONObject(response.toString());
+            JSONArray results = json.optJSONArray("results");
+            if (results == null || results.length() == 0) return null;
+            JSONObject first = results.getJSONObject(0);
+            return new double[]{first.getDouble("latitude"), first.getDouble("longitude")};
+        } catch (Exception e) {
+            LogUtil.e("NewsLive", "tryGeocodeName(" + name + ") failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 区名搜索坐标并验证省市归属（全国同名区多，防止错配到其他城市），失败返回null。
+     * Open-Meteo结果带admin1(省)/admin2(市)/admin3(区)，逐条比对命中即用。
+     */
+    private double[] tryGeocodeDistrict(String district, String city, String pro) {
+        try {
+            String urlStr = "https://geocoding-api.open-meteo.com/v1/search?name=" +
+                URLEncoder.encode(district, "UTF-8") + "&count=10&language=zh&format=json";
+            URL url = new URL(urlStr);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), "UTF-8"));
+            StringBuilder response = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                response.append(line);
+            }
+            reader.close();
+            conn.disconnect();
+            JSONArray results = new JSONObject(response.toString()).optJSONArray("results");
+            if (results == null) return null;
+            String cityCore = city.replace("市", "");
+            String proCore = pro.replace("省", "").replace("市", "").replace("自治区", "");
+            for (int i = 0; i < results.length(); i++) {
+                JSONObject r = results.getJSONObject(i);
+                String admin1 = r.optString("admin1", "");
+                String admin2 = r.optString("admin2", "");
+                String admin3 = r.optString("admin3", "");
+                boolean match = (!admin3.isEmpty() && district.contains(admin3))
+                    || (!cityCore.isEmpty() && (admin2.contains(cityCore) || admin3.contains(cityCore)))
+                    || (!proCore.isEmpty() && admin1.contains(proCore));
+                if (match) {
+                    double lat = r.getDouble("latitude");
+                    double lon = r.getDouble("longitude");
+                    LogUtil.i("NewsLive", "district geocoded: " + district + " -> "
+                        + admin1 + "/" + admin2 + "/" + admin3 + " lat=" + lat + " lon=" + lon);
+                    return new double[]{lat, lon};
+                }
+            }
+            LogUtil.w("NewsLive", "district geocoding no verified match: " + district);
+        } catch (Exception e) {
+            LogUtil.e("NewsLive", "tryGeocodeDistrict failed: " + e.getMessage());
+        }
+        return null;
+    }
+
+    /** 区级坐标→天气（区名验证定位），市级兜底，全部失败走老链路(ip-api) */
+    private void geocodeAndFetchWeatherRefined(String pro, String city, String district) {
+        executorService.execute(() -> {
+            double lat = 0, lon = 0;
+            if (!district.isEmpty()) {
+                double[] d = tryGeocodeDistrict(district, city, pro);
+                if (d != null) { lat = d[0]; lon = d[1]; }
+                if (lat == 0) {
+                    // OSM Nominatim兜底：区县/乡镇收录更全
+                    d = tryGeocodePhoton(city.isEmpty() ? district : district + " " + city);
+                    if (d != null) { lat = d[0]; lon = d[1]; }
+                }
+            }
+            if (lat == 0 && !city.isEmpty()) {
+                String cityName = city.endsWith("市") ? city.substring(0, city.length() - 1) : city;
+                double[] c = tryGeocodeName(cityName, 1);
+                if (c != null) { lat = c[0]; lon = c[1]; }
+            }
+            if (lat != 0) {
+                lastLatitude = lat;
+                lastLongitude = lon;
+                fetchWeather(lat, lon);
+            } else {
+                LogUtil.w("NewsLive", "district & city geocoding failed, fallback to ip-api");
+                fetchLocationByIPBackup((pro + " " + city + " " + district).trim());
             }
         });
     }
@@ -1440,6 +2271,7 @@ public class MainActivity extends AppCompatActivity {
                     tvW2Label.setText(labels[2]);
                     tvW2Icon.setText(icons[2]);
                     tvW2Temp.setText(temps[2]);
+                    scheduleBannerAutoFit();
                 });
             } catch (Exception e) {
                 LogUtil.e("NewsLive", "fetchWeather failed", e);
@@ -1455,11 +2287,17 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    // 缩短定位名称用于叠加层显示：去掉省份，只保留城市名
+    // 缩短定位名称用于叠加层显示：优先显示区名（定位到区），无区名时显示城市
     private String shortenLocation(String name) {
         if (name == null || name.isEmpty()) return "未知";
-        // 去掉空格分隔的多段，只保留最后两段（省 市）或最后一段（市）
+        // 去掉空格分隔的多段
         String[] parts = name.trim().split("\\s+");
+        if (parts.length >= 3) {
+            // 省 市 区：优先显示区（用户要求至少定位到区）
+            String d = parts[2];
+            if (d.endsWith("市")) d = d.substring(0, d.length() - 1); // 区位数据可能是县级市
+            return d;
+        }
         if (parts.length >= 2) {
             // 取第二段（通常是市）
             String city = parts[1];
@@ -1467,7 +2305,7 @@ public class MainActivity extends AppCompatActivity {
             if (city.endsWith("市")) city = city.substring(0, city.length() - 1);
             return city;
         }
-        // 单段：尝试去掉省/市后缀
+        // 单段：保留"区"后缀（本身就是区名），去掉省/市后缀
         String result = name.trim();
         if (result.endsWith("市")) result = result.substring(0, result.length() - 1);
         else if (result.endsWith("省")) result = result.substring(0, result.length() - 1);
@@ -1574,6 +2412,11 @@ public class MainActivity extends AppCompatActivity {
         stopWebVideoStallDetector();
         cancelWebRefreshFallback();
         cancelStreamRotation();
+        cancelGiveUpRecovery();
+        releasePendingPlayer();
+        isPlaying = false;
+        updatePortraitPlayOverlay();
+        keyRewriteCapable = false;
         isWebVideoFullscreenRequested = false;
         if (player != null) {
             try {
@@ -1622,12 +2465,21 @@ public class MainActivity extends AppCompatActivity {
     private void toggleOrientationLock() {
         isOrientationLocked = !isOrientationLocked;
         prefs.edit().putBoolean(KEY_LOCK_ORIENTATION, isOrientationLocked).apply();
-        
+
         updateLockButtonIcon();
-        
+
         if (isOrientationLocked) {
+            // 关键：锁定不能只挡传感器监听——Manifest是fullSensor，系统自身也会随传感器旋转。
+            // 首次启动后若一次方向事件都没发生过，Activity仍处于fullSensor模式，
+            // 点锁定后照样会转（"提示已锁定但方向还在变"）。必须立刻显式钉死当前方向。
+            int current = getResources().getConfiguration().orientation;
+            setRequestedOrientation(current == Configuration.ORIENTATION_LANDSCAPE
+                ? ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
             Toast.makeText(this, "已锁定屏幕方向", Toast.LENGTH_SHORT).show();
         } else {
+            // 解锁：交还系统传感器，方向跟随恢复
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR);
             Toast.makeText(this, "已解锁屏幕方向", Toast.LENGTH_SHORT).show();
         }
     }
@@ -1805,8 +2657,10 @@ public class MainActivity extends AppCompatActivity {
         webView.setClickable(true);
         webView.setLongClickable(true);
 
-        // 硬件加速渲染（软件渲染在电视上会导致视频画面抖动/闪烁）
-        webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        // 硬件加速渲染（软件渲染在电视上会导致视频画面抖动/闪烁）。
+        // 注意用LAYER_TYPE_NONE：WebView自带硬件合成器，外层再套LAYER_TYPE_HARDWARE
+        // 会额外占用一整屏离屏缓冲，低端电视内存翻倍，易触发渲染进程被杀导致永久黑屏
+        webView.setLayerType(View.LAYER_TYPE_NONE, null);
 
         // 启用Cookie持久化，保留登录态
         CookieManager cookieManager = CookieManager.getInstance();
@@ -1833,6 +2687,8 @@ public class MainActivity extends AppCompatActivity {
                 cancelWebViewTimeoutTimer();
                 progressBar.setVisibility(View.GONE);
                 webViewRetryCount = 0;
+                // 页面加载完成：频道名去掉"加载中"后缀，同步为当前网页频道
+                updateWebChannelLabel();
                 // 持久化保存cookie（保留登录态）
                 CookieManager.getInstance().flush();
                 // 静默刷新模式：网页在后台加载，立即静音网页视频，避免与ExoPlayer声音叠加
@@ -1862,6 +2718,17 @@ public class MainActivity extends AppCompatActivity {
                 if (request.isForMainFrame()) {
                     handleWebViewError("HTTP错误: " + errorResponse.getStatusCode());
                 }
+            }
+
+            // 渲染进程被系统杀掉/崩溃（低端电视内存不足时高发）：
+            // 不处理的话WebView永久黑屏且所有JS查询失效，表现为"卡了之后就一直播不了"。
+            // 返回true表示已处理，然后重建WebView恢复。
+            @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                LogUtil.e("NewsLive", "WebView renderer process gone! crashed="
+                    + (detail != null && detail.didCrash()));
+                recreateWebView();
+                return true;
             }
             
             @Override
@@ -1974,7 +2841,12 @@ public class MainActivity extends AppCompatActivity {
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.MATCH_PARENT
                 );
-                rootLayout.addView(customViewContainer, containerParams);
+                // 插到控制面板下方：全屏视频盖住WebView，但不得盖住控制面板/换台遮罩/顶部横幅。
+                // 旧代码addView默认加到最顶层，全屏时顶部横幅被盖住（表现为"横幅消失，
+                // 退出全屏又出现"）。层级从底到顶：WebView→播放器→全屏视频→面板→进度→遮罩→横幅
+                int insertIndex = rootLayout.indexOfChild(controlPanel);
+                if (insertIndex <= 0) insertIndex = rootLayout.getChildCount();
+                rootLayout.addView(customViewContainer, insertIndex, containerParams);
 
                 // 隐藏控制面板等其他UI元素，保留顶部信息横幅（时间日期、天气节气）
                 if (controlPanel != null) controlPanel.setVisibility(View.GONE);
@@ -2003,8 +2875,24 @@ public class MainActivity extends AppCompatActivity {
             public void onVideoPlaying(String videoUrl) {
                 if (videoUrl != null && !videoUrl.isEmpty() && !videoUrl.startsWith("blob:")) {
                     lastDetectedVideoUrl = videoUrl;
-                    // 静默刷新模式：由extractAndPlayVideoWithRetry统一接管切换，避免双路径竞争
-                    if (silentRefreshPending) return;
+                    if (silentRefreshPending) {
+                        // 静默刷新拿到新地址：由这里完成无感切换。
+                        // 旧逻辑直接return（等extractAndPlayVideoWithRetry接管），但其重试窗口
+                        // 只有约12秒，网页播放器初始化慢时错过窗口就永远拿不到新地址 → 播放
+                        // 数分钟后key过期必卡死。这里主动完成切换。
+                        // 关键：保持silentRefreshPending标记不清除，switchToPlayerMode内部
+                        // 捕获wasSilentRefresh后走playVideoUrlSilent无感路径并自行清标记。
+                        final String silentUrl = videoUrl;
+                        runOnUiThread(() -> {
+                            if (keyRewriteCapable && player != null && player.isPlaying()) {
+                                // 数据源层支持key透明重写：本次刷新只为harvest，画面不动
+                                completeSilentRefreshAsHarvest(silentUrl);
+                                return;
+                            }
+                            switchToPlayerMode(silentUrl);
+                        });
+                        return;
+                    }
                     // 横屏自动切全屏；或嗅探后等待播放的标志位为 true 时，视频真正开始播放才切换
                     if (lastDeviceOrientation == Configuration.ORIENTATION_LANDSCAPE
                         || pendingAutoSwitch) {
@@ -2090,6 +2978,7 @@ public class MainActivity extends AppCompatActivity {
         isWebViewLoading = true;
         webViewLoadStartTime = System.currentTimeMillis();
         progressBar.setVisibility(View.VISIBLE);
+        showSwitchOverlayHint("正在重试(" + webViewRetryCount + "/" + WEBVIEW_MAX_RETRY + ")...");
 
         // 不清除缓存，避免cookie丢失导致需要登录的网站加载失败
         startWebViewTimeoutTimer();
@@ -2104,6 +2993,65 @@ public class MainActivity extends AppCompatActivity {
             tvHintInfo.setText("网页加载失败，按\"上一个/下一个\"切换网站，或按菜单键打开配置");
             tvHintInfo.setVisibility(View.VISIBLE);
         }
+        showSwitchOverlayError("网页加载失败，请按上下键切换频道");
+    }
+
+    /**
+     * 重建WebView：渲染进程崩溃/挂起后的唯一可靠恢复手段。
+     * 播放器模式下静默重建（不显示网页，不打扰画面）；网页模式下走loadWebSource带遮罩重载。
+     */
+    private void recreateWebView() {
+        if (isFinishing() || isDestroyed()) return;
+        if (handler == null) return;
+        handler.post(() -> {
+            long now = System.currentTimeMillis();
+            if (now - lastWebRecreateTime < 10000) {
+                webRecreateCount++;
+            } else {
+                webRecreateCount = 1;
+            }
+            lastWebRecreateTime = now;
+            if (webRecreateCount > 4) {
+                LogUtil.e("NewsLive", "recreateWebView too frequently, stop and show error");
+                showSwitchOverlayError("播放器恢复失败，请切换频道");
+                return;
+            }
+            LogUtil.e("NewsLive", "recreateWebView #" + webRecreateCount);
+            cancelWebViewTimeoutTimer();
+            stopWebVideoStallDetector();
+            cancelWebRefreshFallback();
+            if (webView == null) return;
+            ViewGroup parent = (ViewGroup) webView.getParent();
+            if (parent != null) {
+                int index = parent.indexOfChild(webView);
+                parent.removeView(webView);
+                try {
+                    webView.destroy();
+                } catch (Exception e) {
+                    LogUtil.w("NewsLive", "destroy old webview: " + e.getMessage());
+                }
+                WebView newView = new WebView(this);
+                newView.setId(R.id.web_view);
+                newView.setBackgroundColor(0xFF000000);
+                parent.addView(newView, Math.max(index, 0),
+                    new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT));
+                webView = newView;
+            }
+            // 重新应用全部设置/客户端/JS桥
+            initWebView();
+            boolean playerMode = playerContainer != null
+                && playerContainer.getVisibility() == View.VISIBLE;
+            if (playerMode) {
+                // 播放器模式：静默重建空白页，后续静默刷新需要新key时再加载真实页面
+                webView.setVisibility(View.INVISIBLE);
+                webView.loadUrl("about:blank");
+                LogUtil.i("NewsLive", "WebView recreated silently in player mode");
+            } else {
+                webViewRetryCount = 0;
+                loadWebSource();
+            }
+        });
     }
 
     private void injectFocusStyle() {
@@ -2364,6 +3312,20 @@ public class MainActivity extends AppCompatActivity {
                             final String finalPageName = pageName;
                             final boolean wasSilentRefresh = silentRefreshPending;
                             runOnUiThread(() -> {
+                                // 幂等保护：嗅探/JS桥/本轮询三条链路都会在页面视频就绪时触发切换，
+                                // 后到的必须跳过——否则刚播放几秒就会被重复stop+prepare卡一下（每次进入必现）
+                                if (player != null && videoUrl.equals(currentVideoUrl)
+                                        && (player.isPlaying()
+                                            || player.getPlaybackState() == Player.STATE_BUFFERING)) {
+                                    LogUtil.i("NewsLive", "extract: same url already playing, skip duplicate switch");
+                                    return;
+                                }
+                                if (wasSilentRefresh && keyRewriteCapable
+                                        && player != null && player.isPlaying()) {
+                                    // 数据源层支持key透明重写：本次刷新只为harvest，画面不动
+                                    completeSilentRefreshAsHarvest(videoUrl);
+                                    return;
+                                }
                                 webView.setVisibility(View.GONE);
                                 // 暂停并静音网页视频：释放解码器与内存，避免与ExoPlayer抢资源。
                                 // 网页播放器暂停后不再产生新key，需要新key时由预取机制静默刷新网页。
@@ -2469,12 +3431,191 @@ public class MainActivity extends AppCompatActivity {
         playVideoUrlWithRetry(url, name, 0, false, false);
     }
 
-    /** 静默切换：无进度条、无Toast，用于403快速恢复/主动轮换/解码降级。
-     *  keepContentOnPlayerReset让切换期间画面定格在旧流最后一帧（非黑屏），新流READY后立即接上 */
+    /** 静默切换：无进度条、无Toast，用于403快速恢复/主动轮换/静默刷新接续。
+     *  播放器正在播放时走双播放器无缝接管（新流预载就绪后瞬时换入，画面不冻结不跳变）；
+     *  否则回退到同播放器重prepare（keepContentOnPlayerReset保最后一帧，非黑屏） */
     private void playVideoUrlSilent(String url, String name) {
+        // 幂等保护：嗅探与JS桥双路径可能同时拿到同一新地址，已在播/已在切则忽略
+        if (url != null && url.equals(currentVideoUrl)
+                && (pendingPlayer != null
+                    || (player != null && player.isPlaying()))) {
+            LogUtil.i("NewsLive", "playVideoUrlSilent: same url already playing/switching, skip");
+            return;
+        }
         currentVideoUrl = url;
         currentVideoName = name;
+        if (player != null && playerContainer != null
+                && playerContainer.getVisibility() == View.VISIBLE
+                && (player.isPlaying()
+                    || (player.getPlaybackState() == Player.STATE_READY && player.getPlayWhenReady()))) {
+            seamlessSwitchTo(url, name);
+            return;
+        }
         playVideoUrlWithRetry(url, name, 0, false, true);
+    }
+
+    /**
+     * 双播放器无缝续播：
+     * 1. 旧播放器保持播放（画面/声音完全不间断）
+     * 2. 新流在第二个ExoPlayer实例上预载：挂哑渲染表面让解码器提前初始化、分辨率提前上报
+     * 3. 预载就绪后seek到旧播放器的当前播放位置（直播窗口内分片还在即可精确续上，
+     *    分片已过期时ExoPlayer自动钳回直播边缘）
+     * 4. 等视频宽高比已知后原子换入（同一消息循环内 setPlayer→挂监听→开播→释放旧播放器），
+     *    消除旧版"新画面先拉伸再恢复比例"的视觉跳变
+     * 预载失败/超时(15s)自动回退到旧路径，不会比原来更差
+     */
+    private void seamlessSwitchTo(final String url, final String name) {
+        releasePendingPlayer();
+        cancelStreamRotation(); // 换流期间旧轮换调度作废，接管完成后重新调度
+        final ExoPlayer oldPlayer = player;
+        final ExoPlayer p2 = createPlayer();
+        pendingPlayer = p2;
+        // 哑表面：SurfaceTexture无消费者也能让解码器提前初始化并读出视频格式（分辨率上报前置），
+        // 换入瞬间PlayerView已知新流宽高比 → 旧画面不会被短暂拉伸
+        try {
+            pendingDummyTexture = new android.graphics.SurfaceTexture(0);
+            pendingDummySurface = new android.view.Surface(pendingDummyTexture);
+            p2.setVideoSurface(pendingDummySurface);
+        } catch (Exception e) {
+            LogUtil.w("NewsLive", "seamlessSwitch: dummy surface failed, " + e.getMessage());
+            releaseDummySurface();
+        }
+        LogUtil.i("NewsLive", "seamlessSwitch: preload " + url);
+        pendingPlayerListener = new Player.Listener() {
+            private boolean seeked = false;
+            private boolean sizeKnown = false;
+            private boolean swapPosted = false;
+
+            /** 换入条件：已seek + 宽高比已知；仅READY不换（避免旧画面被拉伸的视觉跳变） */
+            private void maybeSwap() {
+                if (swapPosted || !seeked || !sizeKnown) return;
+                swapPosted = true;
+                handler.post(() -> {
+                    if (pendingPlayer != p2) return;
+                    pendingPlayer = null;
+                    if (pendingPlayerListener != null) {
+                        p2.removeListener(pendingPlayerListener);
+                        pendingPlayerListener = null;
+                    }
+                    cancelPendingSwitchTimeout();
+                    player = p2;
+                    // PlayerView绑定p2：此刻宽高比已知 → 旧画面以正确比例保持，不会拉伸
+                    playerView.setPlayer(p2);
+                    attachMainListener(url, name, 0, false, true);
+                    updateKeyRewriteCapable();
+                    isPlaying = true;
+                    giveUpRecoveryCount = 0;
+                    cancelGiveUpRecovery();
+                    hideSwitchOverlay();
+                    sniffRefreshCount = 0;
+                    currentPlayStartTime = System.currentTimeMillis();
+                    scheduleStreamRotation();
+                    updatePortraitPlayOverlay();
+                    p2.setPlayWhenReady(true);
+                    if (oldPlayer != null) {
+                        try { oldPlayer.stop(); } catch (Exception e) { }
+                        try { oldPlayer.release(); } catch (Exception e) { }
+                    }
+                    releaseDummySurface(); // 哑表面完成使命
+                    LogUtil.i("NewsLive", "seamlessSwitch: took over seamlessly");
+                });
+            }
+
+            @Override
+            public void onVideoSizeChanged(androidx.media3.common.VideoSize videoSize) {
+                if (pendingPlayer != p2) return;
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    sizeKnown = true;
+                    maybeSwap();
+                }
+            }
+
+            @Override
+            public void onPlaybackStateChanged(int state) {
+                if (pendingPlayer != p2) return; // 已被新一轮预载/释放取代
+                if (state == Player.STATE_READY) {
+                    if (!seeked) {
+                        seeked = true;
+                        // 以"此刻"旧播放器的位置为目标，重播偏差只剩seek缓冲的1~2秒
+                        long target = 0;
+                        try {
+                            target = oldPlayer != null ? Math.max(oldPlayer.getCurrentPosition(), 0) : 0;
+                        } catch (Exception e) { /* 旧播放器可能已被释放 */ }
+                        p2.seekTo(target);
+                        // 兜底：部分设备哑表面下分辨率上报偏晚，2.5秒后不再等待（宁轻微拉伸不长冻结）
+                        handler.postDelayed(() -> {
+                            if (pendingPlayer != p2 || sizeKnown) return;
+                            try {
+                                androidx.media3.common.VideoSize vs = p2.getVideoSize();
+                                sizeKnown = vs.width > 0;
+                            } catch (Exception e) { }
+                            sizeKnown = true;
+                            maybeSwap();
+                        }, 2500);
+                        return; // 等seek后的READY
+                    }
+                    try {
+                        androidx.media3.common.VideoSize vs = p2.getVideoSize();
+                        sizeKnown = vs.width > 0;
+                    } catch (Exception e) { }
+                    maybeSwap();
+                }
+            }
+
+            @Override
+            public void onPlayerError(PlaybackException error) {
+                if (pendingPlayer != p2) return;
+                LogUtil.w("NewsLive", "seamlessSwitch preload failed, fallback: " + error.getMessage());
+                releasePendingPlayer();
+                playVideoUrlWithRetry(url, name, 0, false, true);
+            }
+        };
+        p2.addListener(pendingPlayerListener);
+        p2.setMediaItem(MediaItem.fromUri(Uri.parse(url)));
+        p2.prepare();
+        // 预载超时兜底：迟迟不就绪则回退原路径（同播放器静默重prepare）
+        cancelPendingSwitchTimeout();
+        pendingTimeoutRunnable = () -> {
+            if (pendingPlayer == p2) {
+                LogUtil.w("NewsLive", "seamlessSwitch preload timeout(" + PENDING_SWITCH_TIMEOUT_MS / 1000 + "s), fallback");
+                releasePendingPlayer();
+                playVideoUrlWithRetry(url, name, 0, false, true);
+            }
+        };
+        handler.postDelayed(pendingTimeoutRunnable, PENDING_SWITCH_TIMEOUT_MS);
+    }
+
+    /** 释放哑渲染表面 */
+    private void releaseDummySurface() {
+        if (pendingDummySurface != null) {
+            try { pendingDummySurface.release(); } catch (Exception e) { }
+            pendingDummySurface = null;
+        }
+        if (pendingDummyTexture != null) {
+            try { pendingDummyTexture.release(); } catch (Exception e) { }
+            pendingDummyTexture = null;
+        }
+    }
+
+    /** 释放预载播放器（换台/显式换流/退出时调用，避免僵尸预载在后台接管播放） */
+    private void releasePendingPlayer() {
+        cancelPendingSwitchTimeout();
+        releaseDummySurface();
+        if (pendingPlayer != null && pendingPlayerListener != null) {
+            try { pendingPlayer.removeListener(pendingPlayerListener); } catch (Exception e) { }
+        }
+        pendingPlayerListener = null;
+        if (pendingPlayer != null) {
+            try { pendingPlayer.release(); } catch (Exception e) { }
+            pendingPlayer = null;
+        }
+    }
+
+    private void cancelPendingSwitchTimeout() {
+        if (pendingTimeoutRunnable != null) {
+            handler.removeCallbacks(pendingTimeoutRunnable);
+            pendingTimeoutRunnable = null;
+        }
     }
 
     private void playVideoUrlWithRetry(String url, String name, int retryCount, boolean isRefreshed) {
@@ -2484,8 +3625,10 @@ public class MainActivity extends AppCompatActivity {
     private void playVideoUrlWithRetry(String url, String name, int retryCount, boolean isRefreshed, boolean silent) {
         if (player == null || url == null || url.isEmpty()) return;
 
-        // 每次换源/重试都先取消上一轮的轮换调度，避免旧调度器在新播放期间误切换
+        // 每次换源/重试都先取消上一轮的轮换调度与无缝预载，避免旧调度器/预载器在新播放期间误切换
+        releasePendingPlayer();
         cancelStreamRotation();
+        updateKeyRewriteCapable();
 
         LogUtil.i("NewsLive", "playVideoUrl: " + url + " retry=" + retryCount + " refreshed=" + isRefreshed + " silent=" + silent);
 
@@ -2536,7 +3679,8 @@ public class MainActivity extends AppCompatActivity {
                 LogUtil.i("NewsLive", "onPlaybackStateChanged: " + playbackState + " url=" + url);
                 switch (playbackState) {
                     case Player.STATE_BUFFERING:
-                        if (!finalSilent) {
+                        // 无缝预载进行中时不弹转圈：旧画面还在播，短暂缓冲不该打扰观看
+                        if (!finalSilent && pendingPlayer == null) {
                             progressBar.setVisibility(View.VISIBLE);
                         }
                         bufferingTime[0] = 0;
@@ -2561,6 +3705,7 @@ public class MainActivity extends AppCompatActivity {
                                                     Toast.makeText(MainActivity.this, "多次重试失败，请尝试切换频道或检查网络", Toast.LENGTH_LONG).show();
                                                 }
                                                 progressBar.setVisibility(View.GONE);
+                                                scheduleGiveUpRecovery();
                                             }
                                         } else if (seekRetryCount[0] < 3) {
                                             seekRetryCount[0]++;
@@ -2586,6 +3731,11 @@ public class MainActivity extends AppCompatActivity {
                         seekRetryCount[0] = 0;
                         pauseRetryCount[0] = 0;
                         sniffRefreshCount = 0;
+                        giveUpRecoveryCount = 0;
+                        cancelGiveUpRecovery();
+                        hideSwitchOverlay();
+                        updatePortraitPlayOverlay();
+                        clearSurfaceIfAudioOnly();
                         currentPlayStartTime = System.currentTimeMillis(); // 记录key使用起点
                         // ExoPlayer已恢复播放：取消网页刷新兜底定时器，避免60秒后多余刷新
                         cancelWebRefreshFallback();
@@ -2636,6 +3786,7 @@ public class MainActivity extends AppCompatActivity {
                     if (!finalSilent) {
                         Toast.makeText(MainActivity.this, "直播地址已过期，请尝试切换频道或检查网络", Toast.LENGTH_LONG).show();
                     }
+                    scheduleGiveUpRecovery();
                     return;
                 }
 
@@ -2678,6 +3829,7 @@ public class MainActivity extends AppCompatActivity {
                     if (!finalSilent) {
                         Toast.makeText(MainActivity.this, "播放错误，请尝试切换网站或检查网络: " + error.getMessage(), Toast.LENGTH_LONG).show();
                     }
+                    scheduleGiveUpRecovery();
                 }
             }
 
@@ -2699,6 +3851,8 @@ public class MainActivity extends AppCompatActivity {
                             Toast.makeText(MainActivity.this, "视频源不稳定，正在重新获取(" + sniffRefreshCount + "/" + MAX_SNIFF_REFRESH + ")...", Toast.LENGTH_SHORT).show();
                         }
                         refreshVideoFromWeb(true);
+                    } else {
+                        scheduleGiveUpRecovery();
                     }
                 }
             }
@@ -2708,14 +3862,11 @@ public class MainActivity extends AppCompatActivity {
     
     private void updateVideoLayout(int videoWidth, int videoHeight) {
         if (videoWidth <= 0 || videoHeight <= 0) return;
-        
+
         isPortraitVideo = videoHeight > videoWidth;
-        
-        if (isPortraitVideo) {
-            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
-        } else {
-            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
-        }
+        // 不再按视频尺寸强制旋转屏幕：旧逻辑每次缓冲/换key轮换后onVideoSizeChanged都会
+        // 把屏幕锁回横屏，导致手机竖屏时"画面不跟着变竖屏"。
+        // 屏幕方向完全跟随设备物理旋转（onDeviceOrientationChanged）或手动方向键切换。
     }
 
     /** 判断播放异常是否为HTTP 403（CCTV直播流auth_key配额耗尽） */
@@ -2754,6 +3905,158 @@ public class MainActivity extends AppCompatActivity {
         return m.find() ? m.group(1) : "";
     }
 
+    /** 去掉URL中的auth_key参数（用于识别"同一播放列表端点、不同签名"的地址） */
+    private String stripAuthKey(String url) {
+        if (url == null) return "";
+        int i = url.indexOf("auth_key=");
+        if (i < 0) return url;
+        int amp = url.indexOf('&', i);
+        return amp > 0 ? url.substring(0, i) + url.substring(amp) : url.substring(0, i);
+    }
+
+    /** 找"同一播放列表端点、key不同、且新鲜"的候选地址（主动重写用） */
+    private String findFreshCandidateSameEndpoint(String url) {
+        String stripped = stripAuthKey(url);
+        long now = System.currentTimeMillis();
+        synchronized (candidateByVariant) {
+            String best = null;
+            long bestTime = -1;
+            for (java.util.Map.Entry<String, String> e : candidateByVariant.entrySet()) {
+                String cand = e.getValue();
+                Long t = candidateTimeByVariant.get(e.getKey());
+                if (t == null || now - t > CANDIDATE_REWRITE_MAX_AGE_MS) continue;
+                if (!stripAuthKey(cand).equals(stripped)) continue;
+                if (cand.equals(url)) continue;
+                String candKey = extractAuthKey(cand);
+                synchronized (recentlyFailedKeys) {
+                    if (recentlyFailedKeys.containsKey(candKey)) continue;
+                }
+                if (t > bestTime) { bestTime = t; best = cand; }
+            }
+            return best;
+        }
+    }
+
+    /** 找"同频道（优先同清晰度）、新鲜"的候选地址（403兜底替换播放列表内容用） */
+    private String findFreshCandidateSameChannel(String url) {
+        String channel = extractChannelName(url);
+        String variant = extractVariantName(url);
+        long now = System.currentTimeMillis();
+        synchronized (candidateByVariant) {
+            String best = null;
+            long bestTime = -1;
+            boolean bestSameVariant = false;
+            for (java.util.Map.Entry<String, String> e : candidateByVariant.entrySet()) {
+                String cand = e.getValue();
+                Long t = candidateTimeByVariant.get(e.getKey());
+                if (t == null || now - t > CANDIDATE_REWRITE_MAX_AGE_MS) continue;
+                String candCh = extractChannelName(cand);
+                if (!channel.isEmpty() && !candCh.equals(channel)) continue;
+                String candKey = extractAuthKey(cand);
+                if (candKey.isEmpty()) continue;
+                synchronized (recentlyFailedKeys) {
+                    if (recentlyFailedKeys.containsKey(candKey)) continue;
+                }
+                boolean sameVariant = !variant.isEmpty() && extractVariantName(cand).equals(variant);
+                if (best == null || (sameVariant && !bestSameVariant)
+                        || (sameVariant == bestSameVariant && t > bestTime)) {
+                    best = cand;
+                    bestTime = t;
+                    bestSameVariant = sameVariant;
+                }
+            }
+            return best;
+        }
+    }
+
+    /**
+     * 包装Http数据源：直播流auth_key过期(403)时，透明改用静默刷新harvest的最新签名地址。
+     * 播放列表内容是同一直播窗口（media sequence连续），播放器解析后无缝续播——
+     * 不重建播放器、不重启流，等效网页播放器在页面内换key的原生机制。
+     * 主动模式：每次播放列表重取时直接改写到最新签名地址（避免每次都吃一次403）；
+     * 被动模式：403后取同频道最新候选，把其内容作为本次请求的响应返回。
+     */
+    private class KeyRewritingDataSource implements androidx.media3.datasource.DataSource {
+        private final DefaultHttpDataSource.Factory factory;
+        private final androidx.media3.datasource.DataSource base;
+        private androidx.media3.datasource.DataSource active;
+        private final java.util.List<androidx.media3.datasource.TransferListener> listeners =
+            new java.util.ArrayList<>();
+
+        KeyRewritingDataSource(DefaultHttpDataSource.Factory factory) {
+            this.factory = factory;
+            this.base = factory.createDataSource();
+        }
+
+        @Override
+        public void addTransferListener(androidx.media3.datasource.TransferListener transferListener) {
+            listeners.add(transferListener);
+            base.addTransferListener(transferListener);
+        }
+
+        @Override
+        public long open(androidx.media3.datasource.DataSpec dataSpec) throws IOException {
+            active = base;
+            String url = dataSpec.uri.toString();
+            boolean isPlaylist = url.toLowerCase().contains(".m3u8");
+            if (isPlaylist && url.contains("auth_key=")) {
+                // 主动重写：直接用最新签名地址取播放列表（省一次403往返）
+                String rewritten = findFreshCandidateSameEndpoint(url);
+                if (rewritten != null) {
+                    try {
+                        return base.open(dataSpec.buildUpon().setUri(Uri.parse(rewritten)).build());
+                    } catch (IOException e) {
+                        LogUtil.w("NewsLive", "KeyRewrite: proactive rewrite failed, fallback to original");
+                        try { base.close(); } catch (Exception ignore) { }
+                    }
+                }
+            }
+            try {
+                return base.open(dataSpec);
+            } catch (HttpDataSource.InvalidResponseCodeException e) {
+                if (e.responseCode != 403 || !isPlaylist || !url.contains("auth_key=")) throw e;
+                // 被动兜底：用同频道最新候选地址的内容作为本次响应（直播窗口连续 → 无感续播）
+                String candidate = findFreshCandidateSameChannel(url);
+                if (candidate == null || candidate.equals(url)) throw e;
+                try { base.close(); } catch (Exception ignore) { }
+                androidx.media3.datasource.DataSource tmp = factory.createDataSource();
+                for (androidx.media3.datasource.TransferListener l : listeners) {
+                    tmp.addTransferListener(l);
+                }
+                long len = tmp.open(dataSpec.buildUpon().setUri(Uri.parse(candidate)).build());
+                active = tmp;
+                LogUtil.i("NewsLive", "KeyRewrite: playlist 403 -> seamless swap to fresh key");
+                return len;
+            }
+        }
+
+        @Override
+        public Uri getUri() {
+            return active != null ? active.getUri() : null;
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            return active != null ? active.read(buffer, offset, length) : -1;
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (active != null) {
+                active.close();
+                if (active != base) {
+                    try { base.close(); } catch (Exception ignore) { }
+                }
+            }
+            active = null;
+        }
+
+        @Override
+        public java.util.Map<String, java.util.List<String>> getResponseHeaders() {
+            return active != null ? active.getResponseHeaders() : null;
+        }
+    }
+
     /**
      * 从嗅探缓存中挑一个"新鲜"的候选直播地址：
      * - 非DRM直链流（.m3u8/.mp4/.flv/.ts）
@@ -2777,8 +4080,12 @@ public class MainActivity extends AppCompatActivity {
         String curKey = extractAuthKey(currentUrl);
         String fallback = null;
         synchronized (candidateByVariant) {
-            // 第一轮：优先标清变体
-            for (String variant : new String[]{"mbd", "mhd", "mud", "md", "hd"}) {
+            // 第一轮：优先与当前相同的清晰度变体（key轮换不掉画质），其次标清mbd
+            java.util.LinkedHashSet<String> variantOrder = new java.util.LinkedHashSet<>();
+            String preferredVariant = extractVariantName(currentUrl);
+            if (!preferredVariant.isEmpty()) variantOrder.add(preferredVariant);
+            java.util.Collections.addAll(variantOrder, "mbd", "mhd", "mud", "md", "hd");
+            for (String variant : variantOrder) {
                 if (requireMbd && !variant.equals("mbd")) continue;
                 String cand = candidateByVariant.get(variant);
                 Long t = candidateTimeByVariant.get(variant);
@@ -2832,9 +4139,33 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /** 主动轮换：CCTV的auth_key约3.5分钟失效。60秒检查一次：
-     *  有新鲜候选→静默切换；无候选且已播2.5分钟→提前静默刷新网页预取新key，
-     *  确保在403发生前完成切换，全程画面不断 */
+    /** 更新key透明重写能力标记：仅网页模式的带auth_key直播流支持 */
+    private void updateKeyRewriteCapable() {
+        keyRewriteCapable = useWebMode && currentVideoUrl != null && currentVideoUrl.contains("auth_key=");
+    }
+
+    /**
+     * 静默刷新完成但当前播放已支持key透明重写：只入库新key，不切换播放地址。
+     * 播放画面完全不动；网页视频静音暂停，WebView留在底层供下次harvest复用。
+     */
+    private void completeSilentRefreshAsHarvest(String videoUrl) {
+        silentRefreshPending = false;
+        cancelWebRefreshFallback();
+        webRefreshFallbackCount = 0;
+        lastDetectedVideoUrl = videoUrl;
+        LogUtil.i("NewsLive", "Silent refresh: keys harvested, playback continues seamlessly");
+        // 静音并暂停网页视频，释放解码资源
+        webView.evaluateJavascript(
+            "(function(){try{window.__nlKeepPaused=true;" +
+            "var vs=document.querySelectorAll('video');" +
+            "for(var i=0;i<vs.length;i++){vs[i].muted=true;try{vs[i].pause();}catch(e){}}}" +
+            "catch(e){}})();", null);
+        webView.onPause();
+        webView.pauseTimers();
+    }
+
+    /** 主动轮换（key养护）：key过期由数据源层透明重写（KeyRewritingDataSource）处理，
+     *  不再切换播放器实例；这里只负责定期通过静默刷新网页harvest新的签名key备胎 */
     private void scheduleStreamRotation() {
         cancelStreamRotation();
         final Runnable[] holder = new Runnable[1];
@@ -2843,24 +4174,15 @@ public class MainActivity extends AppCompatActivity {
             if (player == null || playerContainer.getVisibility() != View.VISIBLE || !useWebMode) {
                 return; // 播放器已退出，停止轮换
             }
-            if (player.isPlaying() && player.getPlaybackState() == Player.STATE_READY) {
-                // 主动轮换只选mbd：避免高清解码失败
-                String fresh = pickFreshCandidateUrl(currentVideoUrl, true);
-                if (fresh != null) {
-                    LogUtil.i("NewsLive", "Proactive rotate to fresh stream url: " + fresh);
-                    playVideoUrlSilent(fresh, currentVideoName);
-                    return; // playVideoUrl→STATE_READY会重新调度
-                }
-                // 无新鲜候选且key临近寿命终点：提前静默刷新网页预取新key，
-                // 刷新链路拿到新地址后会自动静默切换（extractAndPlayVideoWithRetry）
-                if (currentPlayStartTime > 0
-                        && System.currentTimeMillis() - currentPlayStartTime > PREFETCH_AFTER_MS) {
-                    LogUtil.i("NewsLive", "No fresh candidate, prefetch new key via silent web refresh");
-                    refreshVideoFromWeb(true);
-                    return; // 静默刷新链路完成后会重新调度
-                }
+            if (player.isPlaying() && player.getPlaybackState() == Player.STATE_READY
+                    && keyRewriteCapable && currentPlayStartTime > 0
+                    && System.currentTimeMillis() - currentPlayStartTime > PREFETCH_AFTER_MS
+                    && System.currentTimeMillis() - lastKeyHarvestTime > KEY_HARVEST_INTERVAL_MS) {
+                lastKeyHarvestTime = System.currentTimeMillis();
+                LogUtil.i("NewsLive", "Rotation: harvest fresh keys via silent web refresh");
+                refreshVideoFromWeb(true);
             }
-            // 未满足轮换条件（暂停/缓冲中/无新鲜候选），保持调度，播放恢复后继续检查
+            // 始终自续期（harvest完成后由本循环按间隔继续巡检）
             handler.postDelayed(holder[0], STREAM_ROTATE_INTERVAL_MS);
         };
         streamRotateRunnable = holder[0];
@@ -2871,6 +4193,47 @@ public class MainActivity extends AppCompatActivity {
         if (streamRotateRunnable != null) {
             handler.removeCallbacks(streamRotateRunnable);
             streamRotateRunnable = null;
+        }
+    }
+
+    /**
+     * 深度恢复兜底：所有重试/刷新链路都放弃后，定期静默重取直播地址。
+     * 旧逻辑在重试耗尽后只弹Toast就永久放弃，表现为"卡了就一直播不了"。
+     * 每次触发后检查播放状态：仍无播放则静默刷新网页重取地址，并继续守护直到恢复。
+     */
+    private void scheduleGiveUpRecovery() {
+        cancelGiveUpRecovery();
+        if (giveUpRecoveryCount >= MAX_GIVE_UP_RECOVERY) {
+            LogUtil.e("NewsLive", "Deep recovery exhausted (" + MAX_GIVE_UP_RECOVERY + "), give up");
+            showSwitchOverlayError("播放失败，请按上下键切换频道");
+            return;
+        }
+        giveUpRecoveryRunnable = () -> {
+            giveUpRecoveryRunnable = null;
+            giveUpRecoveryCount++;
+            if (player == null || playerContainer == null
+                    || playerContainer.getVisibility() != View.VISIBLE) {
+                return; // 已不在播放器模式，交给其他链路处理
+            }
+            boolean alive = player.isPlaying()
+                || (player.getPlaybackState() == Player.STATE_READY && player.getPlayWhenReady());
+            if (alive) {
+                giveUpRecoveryCount = 0; // 已被其他链路救活，重置计数
+                return;
+            }
+            LogUtil.w("NewsLive", "Deep recovery attempt " + giveUpRecoveryCount
+                + "/" + MAX_GIVE_UP_RECOVERY);
+            sniffRefreshCount = 0;
+            refreshVideoFromWeb(true);
+            scheduleGiveUpRecovery(); // 继续守护，直到恢复播放
+        };
+        handler.postDelayed(giveUpRecoveryRunnable, GIVE_UP_RECOVERY_DELAY_MS);
+    }
+
+    private void cancelGiveUpRecovery() {
+        if (giveUpRecoveryRunnable != null) {
+            handler.removeCallbacks(giveUpRecoveryRunnable);
+            giveUpRecoveryRunnable = null;
         }
     }
 
@@ -2887,6 +4250,7 @@ public class MainActivity extends AppCompatActivity {
         stopWebVideoStallDetector();
         cancelStreamRotation();
         isWebVideoFullscreenRequested = false;
+        fullscreenRetryCount = 0;
         // 设置冷却时间：刷新后视频需要加载，30秒内不触发卡顿刷新
         lastStallRefreshTime = System.currentTimeMillis();
 
@@ -2895,6 +4259,11 @@ public class MainActivity extends AppCompatActivity {
             // 注意：不能调loadWebSource()（它会切WebView可见/隐藏播放器导致闪屏），直接loadUrl
             silentRefreshPending = true;
             webViewRetryCount = 0;
+            // 关键修复：切到播放器模式时WebView被onPause/pauseTimers挂起，页面JS完全停摆，
+            // 不恢复定时器的话视频永远播不起来，静默刷新拿不到新地址 → 播放一段时间后必卡死
+            webView.setVisibility(View.INVISIBLE);
+            webView.onResume();
+            webView.resumeTimers();
             if (webView.getUrl() == null || !webView.getUrl().equals(webSourceUrl)) {
                 webView.loadUrl(webSourceUrl);
             } else {
@@ -2917,6 +4286,8 @@ public class MainActivity extends AppCompatActivity {
         playerContainer.setVisibility(View.GONE);
         tvSourceInfo.setText("正在重新获取视频地址...");
         progressBar.setVisibility(View.VISIBLE);
+        showSwitchOverlay(webSiteNames.isEmpty() ? currentVideoName
+            : webSiteNames.get(currentSiteIndex));
 
         webViewRetryCount = 0;
 
@@ -2959,6 +4330,8 @@ public class MainActivity extends AppCompatActivity {
      *  retryIndex: 重试次数，最多5次，每次间隔2秒 */
     private void checkWebVideoPlayingAndFullscreen(int retryIndex) {
         if (webView == null) return;
+        // 播放器模式下不轮询（WebView已让位给ExoPlayer，轮询会干扰播放）
+        if (playerContainer != null && playerContainer.getVisibility() == View.VISIBLE) return;
         // 检查主document和同源iframe内的video播放状态
         String checkJs = "(function(){try{" +
             "function checkDoc(doc){try{var v=doc.querySelector('video');if(v&&!v.paused&&v.currentTime>0)return 'playing';}catch(e){}return '';}" +
@@ -2992,62 +4365,93 @@ public class MainActivity extends AppCompatActivity {
         if (webView != null) webView.setBackgroundColor(0xFF000000);
         LogUtil.i("NewsLive", "WebView video playing, isPlaying=true, hide control panel, keep info overlay");
         requestWebVideoFullscreen();
-        startWebVideoStallDetector();
+        // 播放器模式下不启动WebView卡顿检测（避免误判干扰ExoPlayer播放）
+        if (playerContainer == null || playerContainer.getVisibility() != View.VISIBLE) {
+            startWebVideoStallDetector();
+        }
     }
 
-    /** 触发网页视频元素全屏：注入CSS让video元素及其所有祖先容器铺满整个WebView视口，消除白色边框 */
+    /**
+     * 触发网页视频元素全屏：注入CSS让video元素及其所有祖先容器铺满整个WebView视口。
+     * 关键：央视等页面把video放在iframe里，必须同时处理主文档与所有同源iframe——
+     * 1. 对每个document分别注入video全屏CSS
+     * 2. 装着video的iframe元素本身在父文档里拉成全屏
+     * 旧版只查主document，iframe里的视频完全没全屏化（网页header下方布局 → 画面偏下），
+     * 且无论成功与否回调都收起换台遮罩（露出网页内容）。
+     * 只有确认全屏CSS真正生效才收遮罩；视频未就绪时2.5秒后重试（最多5次）。
+     */
     private void requestWebVideoFullscreen() {
-        if (isWebVideoFullscreenRequested || webView == null) return;
+        requestWebVideoFullscreen(true);
+    }
+
+    private void requestWebVideoFullscreen(boolean allowRetry) {
+        if (webView == null) return;
+        if (isWebVideoFullscreenRequested) {
+            hideSwitchOverlay(); // CSS已注入过，直接收起换台遮罩
+            return;
+        }
         isWebVideoFullscreenRequested = true;
-        // 注入CSS和JS：让video元素及其所有祖先容器都fixed定位铺满整个视口
-        // 不依赖Fullscreen API（需要用户手势），直接通过CSS实现网页内全屏
-        String js = "(function(){try{var v=document.querySelector('video');if(!v)return 'no-video';" +
-            // 设置html和body背景为黑色，消除margin
-            "document.documentElement.style.background='#000000';" +
-            "document.documentElement.style.margin='0';" +
-            "document.documentElement.style.padding='0';" +
-            "document.body.style.background='#000000';" +
-            "document.body.style.margin='0';" +
-            "document.body.style.padding='0';" +
-            "document.body.style.overflow='hidden';" +
-            // 注入全局CSS样式
-            "var style=document.getElementById('news-live-fullscreen-style');" +
-            "if(!style){style=document.createElement('style');style.id='news-live-fullscreen-style';" +
-            "style.textContent='video,video *{position:fixed!important;top:0!important;left:0!important;" +
+        // 对指定document注入video全屏样式；iframe里的video还要把iframe元素本身拉全屏
+        String js = "(function(){try{" +
+            "function styleVideo(doc){" +
+            "  try{var v=doc.querySelector('video');if(!v)return false;" +
+            "  var st=doc.getElementById('news-live-fullscreen-style');" +
+            "  if(!st){st=doc.createElement('style');st.id='news-live-fullscreen-style';" +
+            "    st.textContent='video{position:fixed!important;top:0!important;left:0!important;" +
             "width:100vw!important;height:100vh!important;min-width:100vw!important;min-height:100vh!important;" +
             "max-width:100vw!important;max-height:100vh!important;z-index:2147483647!important;" +
             "object-fit:contain!important;background:#000000!important;outline:none!important;border:none!important;}" +
             "video::-webkit-media-controls{display:none!important;}" +
-            "body,html{margin:0!important;padding:0!important;overflow:hidden!important;background:#000!important;}';" +
-            "document.head.appendChild(style);}" +
-            // 遍历video元素的所有祖先元素，设置fixed铺满全屏
-            "var el=v.parentNode;var depth=0;" +
-            "while(el&&el!==document.body&&depth<20){" +
-            "el.style.position='fixed';el.style.top='0';el.style.left='0';" +
-            "el.style.width='100vw';el.style.height='100vh';" +
-            "el.style.minWidth='100vw';el.style.minHeight='100vh';" +
-            "el.style.maxWidth='100vw';el.style.maxHeight='100vh';" +
-            "el.style.margin='0';el.style.padding='0';el.style.zIndex='2147483646';" +
-            "el.style.background='#000000';el.style.overflow='hidden';" +
-            "el=el.parentNode;depth++;}" +
-            // 确保video元素本身的样式
-            "v.style.position='fixed';v.style.top='0';v.style.left='0';" +
-            "v.style.width='100vw';v.style.height='100vh';" +
-            "v.style.minWidth='100vw';v.style.minHeight='100vh';" +
-            "v.style.maxWidth='100vw';v.style.maxHeight='100vh';" +
-            "v.style.zIndex='2147483647';v.style.objectFit='contain';v.style.background='#000000';" +
-            // 隐藏body直接子元素中不包含video的元素（广告、分享、导航等干扰内容）
-            "var bodyChildren=document.body.children;" +
-            "for(var i=0;i<bodyChildren.length;i++){" +
-            "var child=bodyChildren[i];if(child===v)continue;" +
-            "if(!child.contains(v)){child.style.display='none';}" +
-            "}" +
-            // 尝试Fullscreen API（如果支持），失败也无妨，CSS已确保全屏
-            "try{if(v.requestFullscreen&&document.fullscreenEnabled){v.requestFullscreen().catch(function(){});}" +
-            "else if(v.webkitEnterFullscreen){v.webkitEnterFullscreen();}}catch(e){}" +
-            "return 'css-fullscreen';}catch(e){return 'err:'+e.message;}})();";
+            "html,body{margin:0!important;padding:0!important;overflow:hidden!important;background:#000!important;}';" +
+            "    (doc.head||doc.documentElement).appendChild(st);}" +
+            "  var el=v.parentNode;var n=0;" +
+            "  while(el&&el!==doc.body&&n<20){" +
+            "    el.style.position='fixed';el.style.top='0';el.style.left='0';" +
+            "    el.style.width='100vw';el.style.height='100vh';" +
+            "    el.style.zIndex='2147483646';el.style.background='#000000';el.style.overflow='hidden';" +
+            "    el=el.parentNode;n++;}" +
+            "  v.style.position='fixed';v.style.top='0';v.style.left='0';" +
+            "  v.style.width='100vw';v.style.height='100vh';" +
+            "  v.style.zIndex='2147483647';v.style.objectFit='contain';v.style.background='#000000';" +
+            "  var ch=doc.body?doc.body.children:null;" +
+            "  if(ch){for(var i=0;i<ch.length;i++){var c=ch[i];if(c===v)continue;if(!c.contains(v)){c.style.display='none';}}}" +
+            "  return true;" +
+            "  }catch(e){return false;}}" +
+            "var ok=styleVideo(document);" +
+            "var frames=document.querySelectorAll('iframe');" +
+            "for(var i=0;i<frames.length;i++){" +
+            "  try{var fd=frames[i].contentDocument;if(!fd)continue;" +
+            "    if(styleVideo(fd)){" +
+            "      var f=frames[i];" +
+            "      f.style.setProperty('position','fixed','important');f.style.setProperty('top','0','important');" +
+            "      f.style.setProperty('left','0','important');f.style.setProperty('width','100vw','important');" +
+            "      f.style.setProperty('height','100vh','important');f.style.setProperty('min-width','100vw','important');" +
+            "      f.style.setProperty('min-height','100vh','important');f.style.setProperty('z-index','2147483645','important');" +
+            "      f.style.setProperty('background','#000','important');f.style.setProperty('border','none','important');" +
+            "      ok=true;" +
+            "    }" +
+            "  }catch(e){}}" +
+            "return ok?'css-fullscreen':'no-video';" +
+            "}catch(e){return 'err';}})();";
         webView.evaluateJavascript(js, r -> {
             LogUtil.i("NewsLive", "requestWebVideoFullscreen: " + r);
+            if (r != null && r.contains("css-fullscreen")) {
+                fullscreenRetryCount = 0;
+                // 全屏CSS确认生效后才收起换台遮罩：用户第一眼看到的就是已全屏的视频画面
+                hideSwitchOverlay();
+                updatePortraitPlayOverlay();
+            } else if (allowRetry && fullscreenRetryCount < 5) {
+                // 视频元素尚未就绪（页面还在初始化）：复位标记稍后重试，遮罩保持
+                isWebVideoFullscreenRequested = false;
+                fullscreenRetryCount++;
+                handler.postDelayed(() -> {
+                    if (useWebMode && webView != null) {
+                        requestWebVideoFullscreen(true);
+                    }
+                }, 2500);
+            } else {
+                isWebVideoFullscreenRequested = false;
+            }
         });
     }
 
@@ -3058,74 +4462,99 @@ public class MainActivity extends AppCompatActivity {
         stopWebVideoStallDetector();
         lastWebVideoTime = -1;
         webVideoStallCount = 0;
+        stallCheckPending = false;
+        stallHungCount = 0;
+        final String checkJs = "(function(){try{" +
+            "function findVideo(doc){try{var v=doc.querySelector('video');if(v)return v;}catch(e){}return null;}" +
+            "var v=findVideo(document);" +
+            "if(!v){var iframes=document.querySelectorAll('iframe');for(var i=0;i<iframes.length;i++){try{if(iframes[i].contentDocument){v=findVideo(iframes[i].contentDocument);if(v)break;}}catch(e){}}}" +
+            "if(!v)return 'no-video';" +
+            "return JSON.stringify({t:v.currentTime,paused:v.paused,ready:v.readyState,vw:v.videoWidth,vh:v.videoHeight,muted:v.muted});}catch(e){return 'err';}})();";
         webVideoStallRunnable = new Runnable() {
             @Override
             public void run() {
                 if (webView == null) return;
-                String checkJs = "(function(){try{" +
-                    "function findVideo(doc){try{var v=doc.querySelector('video');if(v)return v;}catch(e){}return null;}" +
-                    "var v=findVideo(document);" +
-                    "if(!v){var iframes=document.querySelectorAll('iframe');for(var i=0;i<iframes.length;i++){try{if(iframes[i].contentDocument){v=findVideo(iframes[i].contentDocument);if(v)break;}}catch(e){}}}" +
-                    "if(!v)return 'no-video';" +
-                    "return JSON.stringify({t:v.currentTime,paused:v.paused,ready:v.readyState,vw:v.videoWidth,vh:v.videoHeight,muted:v.muted});}catch(e){return 'err';}})();";
-                webView.evaluateJavascript(checkJs, result -> {
-                    if (result == null || result.contains("no-video") || result.contains("err")) {
-                        webVideoStallCount++;
-                    } else {
-                        try {
-                            String jsonStr = result.replace("\\\"", "\"").replaceAll("^\"|\"$", "");
-                            JSONObject json = new JSONObject(jsonStr);
-                            double currentTime = json.optDouble("t", 0);
-                            boolean paused = json.optBoolean("paused", true);
-                            int readyState = json.optInt("ready", 0);
-                            LogUtil.d("NewsLive", "StallCheck: t=" + currentTime + " paused=" + paused + " ready=" + readyState + " stallCount=" + webVideoStallCount);
-                            // readyState < 3 (HAVE_FUTURE_DATA)：视频正在加载/缓冲，不判定卡顿
-                            if (readyState < 3) {
-                                webVideoStallCount = 0;
-                            } else if (paused) {
-                                // 视频暂停且能播放，可能卡住
-                                webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
-                            } else if (lastWebVideoTime >= 0 && currentTime == lastWebVideoTime) {
-                                // 非暂停但currentTime没推进，真正卡顿
-                                webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
-                            } else {
-                                // 正常推进，重置计数
-                                webVideoStallCount = 0;
-                            }
-                            lastWebVideoTime = currentTime;
-                        } catch (Exception e) {
-                            webVideoStallCount++;
-                        }
-                    }
-                    if (webVideoStallCount >= WEB_STALL_THRESHOLD) {
-                        // 冷却期内不刷新，但继续累计计数，冷却期一到立即刷新
-                        long now = System.currentTimeMillis();
-                        if (now - lastStallRefreshTime < STALL_REFRESH_COOLDOWN_MS) {
-                            LogUtil.d("NewsLive", "Stall detected but in cooldown (" + (now - lastStallRefreshTime) / 1000 + "s since last refresh), keep counting");
-                            // 不重置count，继续等冷却期结束
-                            handler.postDelayed(this, WEB_STALL_CHECK_INTERVAL);
-                        } else {
-                            webVideoStallCount = 0;
-                            lastStallRefreshTime = now;
-                            // 优先尝试用ExoPlayer接管播放（解码管线更稳定，不受WebView解码器故障影响）
-                            if (!lastDetectedVideoUrl.isEmpty() && !isDrmStream(lastDetectedVideoUrl)) {
-                                LogUtil.w("NewsLive", "WebView video stalled, switching to ExoPlayer: " + lastDetectedVideoUrl);
-                                Toast.makeText(MainActivity.this, "视频卡顿，切换播放器恢复...", Toast.LENGTH_SHORT).show();
-                                switchToPlayerMode(lastDetectedVideoUrl);
-                            } else {
-                                // 无可用流地址或DRM流，刷新当前页面
-                                LogUtil.w("NewsLive", "WebView video stalled " + WEB_STALL_THRESHOLD + "s, refreshing current page");
-                                Toast.makeText(MainActivity.this, "视频卡顿，正在刷新...", Toast.LENGTH_SHORT).show();
-                                refreshVideoFromWeb();
-                            }
-                        }
-                    } else {
-                        handler.postDelayed(this, WEB_STALL_CHECK_INTERVAL);
-                    }
-                });
+                if (stallCheckPending) {
+                    // 上一轮查询迟迟没有回调：渲染进程可能已挂起/崩溃
+                    stallHungCount++;
+                    webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
+                    LogUtil.w("NewsLive", "StallCheck: renderer no response x" + stallHungCount);
+                } else {
+                    stallCheckPending = true;
+                    webView.evaluateJavascript(checkJs, result -> {
+                        stallCheckPending = false;
+                        stallHungCount = 0;
+                        processStallCheckResult(result);
+                    });
+                }
+                // 连续3轮无响应：判定渲染进程挂起/崩溃，重建WebView恢复
+                if (stallHungCount >= 3) {
+                    stallHungCount = 0;
+                    webVideoStallCount = 0;
+                    stallCheckPending = false;
+                    Toast.makeText(MainActivity.this, "播放器异常，正在自动恢复...", Toast.LENGTH_SHORT).show();
+                    recreateWebView();
+                    return; // 重建后会重新启动检测
+                }
+                // 看门狗自续：无论回调是否返回都保持检测循环
+                // （旧实现依赖回调续期，渲染器挂起后看门狗静默死亡，再也没人救活播放）
+                handler.postDelayed(this, WEB_STALL_CHECK_INTERVAL);
             }
         };
         handler.postDelayed(webVideoStallRunnable, WEB_STALL_CHECK_INTERVAL);
+    }
+
+    /** 处理卡顿查询结果：currentTime推进/暂停/缓冲判定 + 卡顿恢复动作 */
+    private void processStallCheckResult(String result) {
+        if (result == null || result.contains("no-video") || result.contains("err")) {
+            webVideoStallCount++;
+        } else {
+            try {
+                String jsonStr = result.replace("\\\"", "\"").replaceAll("^\"|\"$", "");
+                JSONObject json = new JSONObject(jsonStr);
+                double currentTime = json.optDouble("t", 0);
+                boolean paused = json.optBoolean("paused", true);
+                int readyState = json.optInt("ready", 0);
+                LogUtil.d("NewsLive", "StallCheck: t=" + currentTime + " paused=" + paused + " ready=" + readyState + " stallCount=" + webVideoStallCount);
+                // readyState < 3 (HAVE_FUTURE_DATA)：视频正在加载/缓冲，不判定卡顿
+                if (readyState < 3) {
+                    webVideoStallCount = 0;
+                } else if (paused) {
+                    // 视频暂停且能播放，可能卡住
+                    webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
+                } else if (lastWebVideoTime >= 0 && currentTime == lastWebVideoTime) {
+                    // 非暂停但currentTime没推进，真正卡顿
+                    webVideoStallCount += WEB_STALL_CHECK_INTERVAL / 1000;
+                } else {
+                    // 正常推进，重置计数
+                    webVideoStallCount = 0;
+                }
+                lastWebVideoTime = currentTime;
+            } catch (Exception e) {
+                webVideoStallCount++;
+            }
+        }
+        if (webVideoStallCount >= WEB_STALL_THRESHOLD) {
+            // 冷却期内不刷新，计数保留，冷却期一到立即恢复
+            long now = System.currentTimeMillis();
+            if (now - lastStallRefreshTime < STALL_REFRESH_COOLDOWN_MS) {
+                LogUtil.d("NewsLive", "Stall detected but in cooldown (" + (now - lastStallRefreshTime) / 1000 + "s since last refresh), keep counting");
+            } else {
+                webVideoStallCount = 0;
+                lastStallRefreshTime = now;
+                // 优先尝试用ExoPlayer接管播放（解码管线更稳定，不受WebView解码器故障影响）
+                if (!lastDetectedVideoUrl.isEmpty() && !isDrmStream(lastDetectedVideoUrl)) {
+                    LogUtil.w("NewsLive", "WebView video stalled, switching to ExoPlayer: " + lastDetectedVideoUrl);
+                    Toast.makeText(MainActivity.this, "视频卡顿，切换播放器恢复...", Toast.LENGTH_SHORT).show();
+                    switchToPlayerMode(lastDetectedVideoUrl);
+                } else {
+                    // 无可用流地址或DRM流，刷新当前页面
+                    LogUtil.w("NewsLive", "WebView video stalled " + WEB_STALL_THRESHOLD + "s, refreshing current page");
+                    Toast.makeText(MainActivity.this, "视频卡顿，正在刷新...", Toast.LENGTH_SHORT).show();
+                    refreshVideoFromWeb();
+                }
+            }
+        }
     }
 
     /** 判断是否为DRM/特殊编码流（ExoPlayer无法播放，必须留在WebView） */
@@ -3149,25 +4578,38 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "网络不可用，请检查网络连接", Toast.LENGTH_LONG).show();
             return;
         }
-        
+
         cancelStreamRotation();
+        silentRefreshPending = false; // 显式加载（换台/恢复）不再是静默链路，避免误静音
+        keyRewriteCapable = false;    // 播放回到WebView，数据源重写不适用
         webView.setVisibility(View.VISIBLE);
         playerContainer.setVisibility(View.GONE);
         tvSourceInfo.setText(webSiteNames.isEmpty() ? "加载中..." : webSiteNames.get(currentSiteIndex) + "(加载中...)");
         progressBar.setVisibility(View.VISIBLE);
-        
+        // 原生电视换台体验：黑色遮罩盖住网页加载过程，视频就绪后才露出画面
+        showSwitchOverlay(webSiteNames.isEmpty() ? "正在加载..." : webSiteNames.get(currentSiteIndex));
+
         isWebViewLoading = true;
         webViewLoadStartTime = System.currentTimeMillis();
         webViewRetryCount = 0;
-        
+
         webView.resumeTimers();
         webView.onResume();
         webView.loadUrl(webSourceUrl);
-        
+
+        // 兜底：部分页面视频播放后嗅探/JS桥都不触发，主动轮询播放状态以收起换台遮罩
+        handler.postDelayed(() -> {
+            if (useWebMode && switchOverlay != null
+                    && switchOverlay.getVisibility() == View.VISIBLE) {
+                checkWebVideoPlayingAndFullscreen(0);
+            }
+        }, 10000);
+
         startWebViewTimeoutTimer();
     }
 
-    private void initPlayer() {
+    /** 构造一个配置完整的ExoPlayer实例（主播放器与无缝续播预载播放器共用同一套参数） */
+    private ExoPlayer createPlayer() {
         // 为CCTV等需要Referer的流添加请求头
         java.util.Map<String, String> requestHeaders = new java.util.HashMap<>();
         requestHeaders.put("Referer", "https://tv.cctv.com/");
@@ -3184,7 +4626,9 @@ public class MainActivity extends AppCompatActivity {
         int maxBuffer = Math.max(bufferMaxMs, 60000);
 
         DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
-            .setBufferDurationsMs(minBuffer, maxBuffer, 1000, minBuffer)
+            // 初始起播缓冲5000ms（旧值1000ms会导致冷启动时缓冲太薄，
+            // 播放几秒后遇网络抖动必小卡一次再补满——每次进入App都会复现）
+            .setBufferDurationsMs(minBuffer, maxBuffer, 5000, minBuffer)
             .setPrioritizeTimeOverSizeThresholds(true)
             .setBackBuffer(maxBuffer, true)
             .setTargetBufferBytes(-1)
@@ -3195,36 +4639,61 @@ public class MainActivity extends AppCompatActivity {
             .setEnableDecoderFallback(true)
             .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER);
 
-        // 使用Context构造，自动包含HLS/ Dash/ SmoothStreaming等支持
+        // 使用Context构造，自动包含HLS/ Dash/ SmoothStreaming等支持。
+        // 数据源包一层KeyRewritingDataSource：直播流auth_key过期(403)时透明改用最新签名地址，
+        // 播放列表内容连续（同一直播窗口）→ 播放器无感续播，等效网页播放器的原无缝机制
+        androidx.media3.datasource.DataSource.Factory wrappedFactory =
+            () -> new KeyRewritingDataSource(httpDataSourceFactory);
         DefaultMediaSourceFactory mediaSourceFactory = new DefaultMediaSourceFactory(this)
-            .setDataSourceFactory(httpDataSourceFactory);
+            .setDataSourceFactory(wrappedFactory);
 
-        player = new ExoPlayer.Builder(this, renderersFactory)
+        // 带宽估计器初始值设为2Mbps（与下方码率上限一致）：
+        // 冷启动时估计为空，ABR会保守地从低码率变体开始播，几秒后测得带宽充足再升档，
+        // 解码器重建造成"第一次启动播放5秒左右必卡一下"；给定初始值后首次即选中正确变体
+        DefaultBandwidthMeter bandwidthMeter = new DefaultBandwidthMeter.Builder(this)
+            .setInitialBitrateEstimate(2_000_000)
+            .build();
+
+        ExoPlayer p = new ExoPlayer.Builder(this, renderersFactory)
             .setMediaSourceFactory(mediaSourceFactory)
             .setLoadControl(loadControl)
+            .setBandwidthMeter(bandwidthMeter)
             .build();
-        
+
         // 限制最高分辨率540p、码率2Mbps：KHAN-230盒子硬解器对1080p会初始化失败(ENOMEM)，
         // 限制后ExoPlayer自动选择低分辨率变体，避免解码失败导致黑屏/断流
-        androidx.media3.common.TrackSelectionParameters trackParams = player.getTrackSelectionParameters()
+        androidx.media3.common.TrackSelectionParameters trackParams = p.getTrackSelectionParameters()
             .buildUpon()
             .setMaxVideoSize(960, 540)
             .setMaxVideoBitrate(2000000)
             .build();
-        player.setTrackSelectionParameters(trackParams);
-        
+        p.setTrackSelectionParameters(trackParams);
+
         AudioAttributes audioAttributes = new AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
             .build();
-        player.setAudioAttributes(audioAttributes, false);
-        
+        p.setAudioAttributes(audioAttributes, false);
+        return p;
+    }
+
+    private void initPlayer() {
+        player = createPlayer();
+
         // 禁用PlayerView内置控制器（播放/暂停按钮、进度条）：TV遥控器用方向键/菜单键操作，
         // 内置控制器会在缓冲/切源时自动弹出，影响直播观看的无感体验
         playerView.setUseController(false);
         // 播放器重置/出错后保持最后一帧画面（不黑屏），新流READY后无缝接上
         playerView.setKeepContentOnPlayerReset(true);
         playerView.setPlayer(player);
+    }
+
+    /** 网页模式下同步频道名标签为当前网页频道（播放器源列表的名字只在播放器模式显示） */
+    private void updateWebChannelLabel() {
+        if (tvSourceInfo != null && !webSiteUrls.isEmpty()
+                && currentSiteIndex < webSiteNames.size()) {
+            tvSourceInfo.setText(webSiteNames.get(currentSiteIndex));
+        }
     }
 
     private void switchMode() {
@@ -3245,7 +4714,8 @@ public class MainActivity extends AppCompatActivity {
             if (webView.getUrl() == null || webView.getUrl().isEmpty() || webView.getUrl().equals("about:blank")) {
                 loadWebSource();
             }
-            updateSourceInfo();
+            // 频道名显示网页频道的名字（updateSourceInfo显示的是播放器源列表名，仅播放器模式适用）
+            updateWebChannelLabel();
             Toast.makeText(this, "切换到网页模式", Toast.LENGTH_SHORT).show();
         } else {
             cancelWebViewTimeoutTimer();
@@ -3253,16 +4723,17 @@ public class MainActivity extends AppCompatActivity {
             webView.onPause();
             webView.setVisibility(View.GONE);
             playerContainer.setVisibility(View.VISIBLE);
+            hideSwitchOverlay();
             if (player == null) {
                 initPlayer();
             }
-            // 如果有嗅探到的视频地址，直接播放；否则从直播源列表加载
-            if (!lastDetectedVideoUrl.isEmpty()) {
-                playVideoUrl(lastDetectedVideoUrl, "网页视频");
-            } else if (isStreamListEnabled && !streamUrls.isEmpty()) {
+            // 真正切到播放器模式：播放"直播源列表"配置的源。
+            // 旧逻辑优先播网页嗅探的lastDetectedVideoUrl，导致切模式后播的还是网页频道
+            // 的视频流，模式切换形同虚设。网页流只在网页模式内使用（嗅探自动接管）。
+            if (isStreamListEnabled && !streamUrls.isEmpty()) {
                 loadStreamFromConfig(currentUrlIndex);
             } else {
-                Toast.makeText(this, "无可用视频源，请先在网页中播放视频", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "未启用直播源列表，请到配置页开启并添加源", Toast.LENGTH_LONG).show();
             }
             Toast.makeText(this, "切换到播放器模式", Toast.LENGTH_SHORT).show();
         }
@@ -3310,7 +4781,8 @@ public class MainActivity extends AppCompatActivity {
         showControlPanel();
         updateSourceInfo();
         
-        // 移除上一次注册的监听器，防止监听器泄漏
+        // 移除上一次注册的监听器，防止监听器泄漏；同时作废可能存在的无缝预载
+        releasePendingPlayer();
         if (currentPlayerListener != null) {
             player.removeListener(currentPlayerListener);
             currentPlayerListener = null;
@@ -3337,6 +4809,10 @@ public class MainActivity extends AppCompatActivity {
                         progressBar.setVisibility(View.GONE);
                         isPlaying = true;
                         errorRetryCount = 0;
+                        giveUpRecoveryCount = 0;
+                        cancelGiveUpRecovery();
+                        hideSwitchOverlay();
+                        clearSurfaceIfAudioOnly();
                         startHideControlTimer();
                         break;
                     case Player.STATE_ENDED:
@@ -3360,9 +4836,10 @@ public class MainActivity extends AppCompatActivity {
                         }
                     }, 1000);
                 } else {
-                    Toast.makeText(MainActivity.this, 
-                        "播放失败，请切换其他源或检查网络", 
+                    Toast.makeText(MainActivity.this,
+                        "播放失败，请切换其他源或检查网络",
                         Toast.LENGTH_LONG).show();
+                    scheduleGiveUpRecovery();
                 }
             }
         };
@@ -3376,6 +4853,7 @@ public class MainActivity extends AppCompatActivity {
             controlPanel.setVisibility(View.VISIBLE);
             isControlVisible = true;
         }
+        updatePortraitPlayOverlay();
     }
 
     private void hideControlPanel() {
@@ -3383,6 +4861,7 @@ public class MainActivity extends AppCompatActivity {
             controlPanel.setVisibility(View.GONE);
             isControlVisible = false;
         }
+        updatePortraitPlayOverlay();
     }
 
     private void togglePlayPause() {
@@ -3490,6 +4969,10 @@ public class MainActivity extends AppCompatActivity {
                 bannerHeight = config.optInt("bannerHeight", 28);
                 prefs.edit().putInt(KEY_BANNER_HEIGHT, bannerHeight).apply();
             }
+            if (config.has("manualLocation")) {
+                // 手动地区：先验证（查得到天气坐标才生效），通过后保存并立即刷新定位与天气
+                handleManualLocationUpdate(config.optString("manualLocation", ""));
+            }
 
             if (config.has("websites")) {
                 JSONArray websites = config.getJSONArray("websites");
@@ -3511,18 +4994,6 @@ public class MainActivity extends AppCompatActivity {
                 if (!webSiteUrls.isEmpty() && currentSiteIndex < webSiteUrls.size()) {
                     webSourceUrl = webSiteUrls.get(currentSiteIndex);
                 }
-            }
-
-            if (config.has("playerVideoUrls")) {
-                JSONArray urls = config.getJSONArray("playerVideoUrls");
-                playerVideoUrls.clear();
-                playerVideoNames.clear();
-                for (int i = 0; i < urls.length(); i++) {
-                    JSONObject item = urls.getJSONObject(i);
-                    playerVideoNames.add(item.optString("name", "视频" + (i + 1)));
-                    playerVideoUrls.add(item.optString("url", ""));
-                }
-                savePlayerVideoUrls();
             }
 
             if (config.has("sources")) {
@@ -3584,12 +5055,8 @@ public class MainActivity extends AppCompatActivity {
 
                 case KeyEvent.KEYCODE_DPAD_LEFT:
                 case KeyEvent.KEYCODE_DPAD_RIGHT:
-                    if (useWebMode && webView != null) {
-                        // WebView模式下，方向键用于网页焦点导航
-                        return super.dispatchKeyEvent(event);
-                    }
-                    switchMode();
-                    return true;
+                    // 左右方向键不再切换模式（统一由眼睛按钮切换），交给页面焦点导航
+                    break;
 
                 case KeyEvent.KEYCODE_DPAD_UP:
                     if (useWebMode) {
@@ -3638,19 +5105,38 @@ public class MainActivity extends AppCompatActivity {
                     startHideControlTimer();
                     return true;
 
-                case KeyEvent.KEYCODE_BACK:
-                    // 先退出WebView全屏视图
+                case KeyEvent.KEYCODE_BACK: {
+                    // 1) 先退出WebView全屏视图
                     if (customView != null) {
                         cleanupCustomView();
                         if (webView != null) webView.setVisibility(View.VISIBLE);
                         if (infoOverlay != null) infoOverlay.setVisibility(View.VISIBLE);
+                        lastBackPressTime = 0; // 退出全屏不计入双击退出
                         return true;
                     }
+                    // 2) 2秒内连按两次返回：退出应用（直播应用单次误触不应直接退出）
+                    long nowBack = System.currentTimeMillis();
+                    if (nowBack - lastBackPressTime < 2000) {
+                        finish();
+                        return true;
+                    }
+                    lastBackPressTime = nowBack;
+                    // 3) 控制面板打开时先收起面板
+                    if (controlPanel != null && controlPanel.getVisibility() == View.VISIBLE) {
+                        hideControlPanel();
+                        Toast.makeText(this, "再按一次返回键退出应用", Toast.LENGTH_SHORT).show();
+                        return true;
+                    }
+                    // 4) 网页有历史时先返回上一页
                     if (webView != null && webView.canGoBack() && useWebMode) {
                         webView.goBack();
+                        Toast.makeText(this, "再按一次返回键退出应用", Toast.LENGTH_SHORT).show();
                         return true;
                     }
-                    break;
+                    // 5) 无历史：提示双击退出
+                    Toast.makeText(this, "再按一次返回键退出应用", Toast.LENGTH_SHORT).show();
+                    return true;
+                }
 
                 case KeyEvent.KEYCODE_M:
                     switchMode();
@@ -3747,6 +5233,11 @@ public class MainActivity extends AppCompatActivity {
         // 取消刷新兜底定时器
         cancelWebRefreshFallback();
         cancelStreamRotation();
+        // 取消深度恢复守护与换台遮罩兜底
+        cancelGiveUpRecovery();
+        hideSwitchOverlay();
+        // 释放无缝续播预载播放器
+        releasePendingPlayer();
 
         // 清理全屏视图
         cleanupCustomView();
@@ -3810,11 +5301,18 @@ public class MainActivity extends AppCompatActivity {
             hideSystemUI();
         }
     }
-    
+
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
         hideSystemUI();
+        // 旋转不重建（manifest已声明configChanges）：重排控制面板/横幅布局/竖屏浮层/横幅字号
+        applyControlPanelLayout();
+        // 横幅按新方向重排（竖屏三行/横屏单行），字号从头收敛，避免多行布局滞留到横屏
+        bannerFitScale = 1f;
+        relayoutBannerForOrientation();
+        applyBannerStyle();
+        updatePortraitPlayOverlay();
         if (currentVideoWidth > 0 && currentVideoHeight > 0) {
             updateVideoLayout(currentVideoWidth, currentVideoHeight);
         }
@@ -3927,14 +5425,6 @@ public class MainActivity extends AppCompatActivity {
             }
             webSitesJson.append("]");
 
-            StringBuilder playerVideoUrlsJson = new StringBuilder("[");
-            for (int i = 0; i < playerVideoUrls.size(); i++) {
-                if (i > 0) playerVideoUrlsJson.append(",");
-                playerVideoUrlsJson.append("{\"name\":\"").append(playerVideoNames.get(i))
-                    .append("\",\"url\":\"").append(playerVideoUrls.get(i)).append("\"}");
-            }
-            playerVideoUrlsJson.append("]");
-
             return "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>新闻直播配置</title>" +
                 "<style>" +
                 "body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f5f5f5}" +
@@ -3948,7 +5438,8 @@ public class MainActivity extends AppCompatActivity {
                 ".source-item.disabled-item{background:#f0f0f0;opacity:0.6;border-color:#ccc}" +
                 ".enable-label{display:inline-flex;align-items:center;gap:4px;margin:4px 0;font-size:14px;color:#333}" +
                 ".item-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}" +
-                ".drag-handle{color:#999;font-size:20px;cursor:grab}" +
+                ".drag-handle{color:#999;font-size:20px;cursor:grab;padding:0 4px}" +
+                ".drag-tip{color:#999;font-size:11px;margin-left:8px}" +
                 ".item-index{background:#2196F3;color:#fff;padding:2px 8px;border-radius:4px;font-size:12px}" +
                 "input[type=text],input[type=url],input[type=number]{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}" +
                 "input[type=checkbox]{width:18px;height:18px;vertical-align:middle}" +
@@ -3975,7 +5466,7 @@ public class MainActivity extends AppCompatActivity {
                 ".player-video-item{background:#FFF8E1;border:1px solid #FF9800}" +
                 "</style></head><body>" +
                 "<h1>📺 新闻直播配置</h1>" +
-                "<div class='tip'>💡 网页浏览器模式 | 拖拽排序 | 频道+/-切换网站</div>" +
+                "<div class='tip'>💡 按住卡片左上角 ☰ 手柄上下拖动调整顺序（仅手柄区域可拖动） | 频道+/-切换网站</div>" +
                 "<div class='network-status " + (isNetworkAvailable ? "network-ok" : "network-error") + "'>" +
                 "网络状态: " + (isNetworkAvailable ? "✅ 已连接" : "❌ 未连接") + "</div>" +
                 "<div class='group-header'>🌐 网页浏览区</div>" +
@@ -4001,12 +5492,6 @@ public class MainActivity extends AppCompatActivity {
                 "<div id='sources'></div>" +
                 "<button class='btn-add' onclick='addSource()'>+ 添加直播源</button>" +
                 "</div>" +
-                "<div class='section'>" +
-                "<div class='section-title'>🎬 播放器模式视频网址</div>" +
-                "<div class='tip'>播放器模式下可播放以下视频网址（支持m3u8/mp4/flv直链）</div>" +
-                "<div id='playerVideos'></div>" +
-                "<button class='btn-add' onclick='addPlayerVideo()'>+ 添加视频网址</button>" +
-                "</div>" +
                 "<div class='group-header'>⚙️ 系统设置区</div>" +
                 "<div class='section'>" +
                 "<div class='section-title'>⏱️ 缓冲设置 (毫秒)</div>" +
@@ -4026,6 +5511,13 @@ public class MainActivity extends AppCompatActivity {
                 "<div class='tip'>字号基准：主文字=基准，节气/温度=基准-1，标签=基准-2，图标=基准+2</div>" +
                 "</div>" +
                 "<div class='section'>" +
+                "<div class='section-title'>📍 地区设置（定位/天气）</div>" +
+                "<input type='text' id='manualLocation' placeholder='留空=自动IP定位；如：江西省抚州市临川区' value='" + manualLocation.replace("'", "") + "'>" +
+                "<div class='btn-group'><button class='btn-fetch' onclick='queryLocation()'>🔍 查询验证（实时试查天气）</button></div>" +
+                "<div id='locationResult' class='tip' style='text-align:left'>输入地区后点\"查询验证\"实时试查：✅查得到=地区有效并预览当前气温，❌查不到=可能不存在或数据源未收录。</div>" +
+                "<div class='tip'>手动配置后不再自动定位，天气按此地区获取。支持省+市+区/县/乡镇（如：江西省抚州市临川区、上顿渡镇）。查询通过后点底部\"保存配置\"生效；清空保存则恢复自动定位。</div>" +
+                "</div>" +
+                "<div class='section'>" +
                 "<div class='section-title'>⚙️ 远程配置</div>" +
                 "<input type='url' id='remoteUrl' placeholder='远程配置URL' value='" + remoteConfigUrl + "'>" +
                 "<label><input type='checkbox' id='autoUpdate' " + (autoUpdateConfig ? "checked" : "") + "> 启动时自动更新</label>" +
@@ -4035,13 +5527,12 @@ public class MainActivity extends AppCompatActivity {
                 "<script>" +
                 "var sources=" + sourcesJson.toString() + ";" +
                 "var websites=" + webSitesJson.toString() + ";" +
-                "var playerVideos=" + playerVideoUrlsJson.toString() + ";" +
                 "var draggedItem=null;" +
                 "function renderSources(){" +
                 "  var html='';" +
                 "  for(var i=0;i<sources.length;i++){" +
-                "    html+='<div class=\"source-item\" draggable=\"true\" data-index=\"'+i+'\" data-type=\"source\" ondragstart=\"dragStart(event)\" ondragover=\"dragOver(event)\" ondrop=\"drop(event)\" ondragend=\"dragEnd(event)\">';" +
-                "    html+='<div class=\"item-header\"><span class=\"drag-handle\">☰</span><span class=\"item-index\">'+(i+1)+'</span></div>';" +
+                "    html+='<div class=\"source-item\" data-index=\"'+i+'\" data-type=\"source\" ondragstart=\"dragStart(event)\" ondragover=\"dragOver(event)\" ondrop=\"drop(event)\" ondragend=\"dragEnd(event)\">';" +
+                "    html+='<div class=\"item-header\"><span class=\"drag-handle\" draggable=\"true\" title=\"按住我拖动调整顺序\" onmousedown=\"armDrag(event)\" onmouseup=\"disarmDrag(event)\" ontouchstart=\"armDrag(event)\" ontouchend=\"disarmDrag(event)\">☰</span><span class=\"item-index\">'+(i+1)+'</span><span class=\"drag-tip\">按住左侧 ☰ 上下拖动调整顺序</span></div>';" +
                 "    html+='<input type=\"text\" placeholder=\"名称\" value=\"'+sources[i].name+'\" onchange=\"sources['+i+'].name=this.value\">';" +
                 "    html+='<input type=\"url\" placeholder=\"直播地址\" value=\"'+sources[i].url+'\" onchange=\"sources['+i+'].url=this.value\">';" +
                 "    html+='<div class=\"btn-group\">';" +
@@ -4056,8 +5547,8 @@ public class MainActivity extends AppCompatActivity {
                 "  var html='';" +
                 "  for(var i=0;i<websites.length;i++){" +
                 "    var en=websites[i].enabled!==false;" +
-                "    html+='<div class=\"source-item website-item'+(en?'':' disabled-item')+'\" draggable=\"true\" data-index=\"'+i+'\" data-type=\"website\" ondragstart=\"dragStart(event)\" ondragover=\"dragOver(event)\" ondrop=\"drop(event)\" ondragend=\"dragEnd(event)\">';" +
-                "    html+='<div class=\"item-header\"><span class=\"drag-handle\">☰</span><span class=\"item-index\" style=\"background:#2196F3\">'+(i+1)+'</span></div>';" +
+                "    html+='<div class=\"source-item website-item'+(en?'':' disabled-item')+'\" data-index=\"'+i+'\" data-type=\"website\" ondragstart=\"dragStart(event)\" ondragover=\"dragOver(event)\" ondrop=\"drop(event)\" ondragend=\"dragEnd(event)\">';" +
+                "    html+='<div class=\"item-header\"><span class=\"drag-handle\" draggable=\"true\" title=\"按住我拖动调整顺序\" onmousedown=\"armDrag(event)\" onmouseup=\"disarmDrag(event)\" ontouchstart=\"armDrag(event)\" ontouchend=\"disarmDrag(event)\">☰</span><span class=\"item-index\" style=\"background:#2196F3\">'+(i+1)+'</span><span class=\"drag-tip\">按住左侧 ☰ 上下拖动调整顺序</span></div>';" +
                 "    html+='<input type=\"text\" placeholder=\"网站名称\" value=\"'+websites[i].name+'\" onchange=\"websites['+i+'].name=this.value\">';" +
                 "    html+='<input type=\"url\" placeholder=\"网站地址\" value=\"'+websites[i].url+'\" onchange=\"websites['+i+'].url=this.value\">';" +
                 "    html+='<label class=\"enable-label\"><input type=\"checkbox\" '+(en?'checked':'')+' onchange=\"websites['+i+'].enabled=this.checked;renderWebsites();\"> 启用</label>';" +
@@ -4069,25 +5560,12 @@ public class MainActivity extends AppCompatActivity {
                 "  }" +
                 "  document.getElementById('websites').innerHTML=html;" +
                 "}" +
-                "function renderPlayerVideos(){" +
-                "  var html='';" +
-                "  for(var i=0;i<playerVideos.length;i++){" +
-                "    html+='<div class=\"source-item player-video-item\" draggable=\"true\" data-index=\"'+i+'\" data-type=\"playerVideo\" ondragstart=\"dragStart(event)\" ondragover=\"dragOver(event)\" ondrop=\"drop(event)\" ondragend=\"dragEnd(event)\">';" +
-                "    html+='<div class=\"item-header\"><span class=\"drag-handle\">☰</span><span class=\"item-index\" style=\"background:#FF9800\">'+(i+1)+'</span></div>';" +
-                "    html+='<input type=\"text\" placeholder=\"视频名称\" value=\"'+playerVideos[i].name+'\" onchange=\"playerVideos['+i+'].name=this.value\">';" +
-                "    html+='<input type=\"url\" placeholder=\"视频地址(m3u8/mp4/flv)\" value=\"'+playerVideos[i].url+'\" onchange=\"playerVideos['+i+'].url=this.value\">';" +
-                "    html+='<div class=\"btn-group\">';" +
-                "    html+='<button class=\"btn-up\" onclick=\"movePlayerVideoUp('+i+')\" '+(i===0?'disabled style=\"opacity:0.5\"':'')+'>↑</button>';" +
-                "    html+='<button class=\"btn-down\" onclick=\"movePlayerVideoDown('+i+')\" '+(i===playerVideos.length-1?'disabled style=\"opacity:0.5\"':'')+'>↓</button>';" +
-                "    html+='<button class=\"btn-del\" onclick=\"delPlayerVideo('+i+')\">删除</button>';" +
-                "    html+='</div></div>';" +
-                "  }" +
-                "  document.getElementById('playerVideos').innerHTML=html;" +
-                "}" +
-                "function dragStart(e){draggedItem=e.target;e.target.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('type',e.target.dataset.type);}" +
+                "function armDrag(e){var card=e.target.closest('.source-item');if(card)card.draggable=true;}" +
+                "function disarmDrag(e){var card=e.target.closest('.source-item');if(card)card.draggable=false;}" +
+                "function dragStart(e){var card=e.target.closest('.source-item');if(!card){e.preventDefault();return;}draggedItem=card;card.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('type',card.dataset.type);}" +
                 "function dragOver(e){e.preventDefault();var item=e.target.closest('.source-item');if(item&&item!==draggedItem)item.classList.add('drag-over');}" +
-                "function drop(e){e.preventDefault();var item=e.target.closest('.source-item');if(item&&item!==draggedItem){var from=parseInt(draggedItem.dataset.index);var to=parseInt(item.dataset.index);var type=e.dataTransfer.getData('type');if(type==='source'){var t=sources[from];sources.splice(from,1);sources.splice(to,0,t);renderSources();}else if(type==='playerVideo'){var t=playerVideos[from];playerVideos.splice(from,1);playerVideos.splice(to,0,t);renderPlayerVideos();}else{var t=websites[from];websites.splice(from,1);websites.splice(to,0,t);renderWebsites();}}document.querySelectorAll('.source-item').forEach(el=>el.classList.remove('drag-over'));}" +
-                "function dragEnd(e){e.target.classList.remove('dragging');document.querySelectorAll('.source-item').forEach(el=>el.classList.remove('drag-over'));}" +
+                "function drop(e){e.preventDefault();var item=e.target.closest('.source-item');if(item&&item!==draggedItem){var from=parseInt(draggedItem.dataset.index);var to=parseInt(item.dataset.index);var type=e.dataTransfer.getData('type');if(type==='source'){var t=sources[from];sources.splice(from,1);sources.splice(to,0,t);renderSources();}else{var t=websites[from];websites.splice(from,1);websites.splice(to,0,t);renderWebsites();}}document.querySelectorAll('.source-item').forEach(el=>el.classList.remove('drag-over'));}" +
+                "function dragEnd(e){var card=e.target.closest('.source-item');if(card){card.classList.remove('dragging');card.draggable=false;}document.querySelectorAll('.source-item').forEach(el=>el.classList.remove('drag-over'));}" +
                 "function moveSourceUp(i){if(i>0){var t=sources[i];sources[i]=sources[i-1];sources[i-1]=t;renderSources();}}" +
                 "function moveSourceDown(i){if(i<sources.length-1){var t=sources[i];sources[i+1]=sources[i];sources[i+1]=t;renderSources();}}" +
                 "function delSource(i){if(confirm('确定删除？')){sources.splice(i,1);renderSources();}}" +
@@ -4096,15 +5574,40 @@ public class MainActivity extends AppCompatActivity {
                 "function moveWebsiteDown(i){if(i<websites.length-1){var t=websites[i];websites[i+1]=websites[i];websites[i+1]=t;renderWebsites();}}" +
                 "function delWebsite(i){if(confirm('确定删除？')){websites.splice(i,1);renderWebsites();}}" +
                 "function addWebsite(){websites.push({name:'',url:'',enabled:true});renderWebsites();}" +
-                "function movePlayerVideoUp(i){if(i>0){var t=playerVideos[i];playerVideos[i]=playerVideos[i-1];playerVideos[i-1]=t;renderPlayerVideos();}}" +
-                "function movePlayerVideoDown(i){if(i<playerVideos.length-1){var t=playerVideos[i];playerVideos[i+1]=playerVideos[i];playerVideos[i+1]=t;renderPlayerVideos();}}" +
-                "function delPlayerVideo(i){if(confirm('确定删除？')){playerVideos.splice(i,1);renderPlayerVideos();}}" +
-                "function addPlayerVideo(){playerVideos.push({name:'',url:''});renderPlayerVideos();}" +
                 "function fetchRemote(){var url=document.getElementById('remoteUrl').value;if(!url){alert('请输入URL');return;}fetch('/proxy?url='+encodeURIComponent(url)).then(r=>r.json()).then(d=>{if(d.error){alert('获取失败:'+d.error);}else if(d.sources){sources=d.sources;renderSources();alert('获取成功');}else{alert('格式错误');}}).catch(e=>alert('获取失败:'+e));}" +
-                "function saveConfig(){var d={sources:sources,websites:websites,playerVideoUrls:playerVideos,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28};fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>alert('保存成功！')).catch(e=>alert('保存失败:'+e));}" +
+                "function showLocResult(text,lat,lon){" +
+                "  var wUrl='https://api.open-meteo.com/v1/forecast?latitude='+lat+'&longitude='+lon+'&current_weather=true';" +
+                "  fetch('/proxy?url='+encodeURIComponent(wUrl)).then(r=>r.json()).then(w=>{" +
+                "    var t=(w&&w.current_weather)?w.current_weather.temperature:'?';" +
+                "    document.getElementById('locationResult').innerHTML='✅ <span style=\"color:#2E7D32;font-weight:bold\">'+text+'</span><br>当前气温: '+t+'°C —— 地区有效，点底部\"保存配置\"即可生效';" +
+                "  }).catch(()=>{document.getElementById('locationResult').innerHTML='✅ '+text+'（地区有效，点底部\"保存配置\"生效）';});" +
+                "}" +
+                "function queryLocation(){" +
+                "  var name=document.getElementById('manualLocation').value.trim();" +
+                "  var box=document.getElementById('locationResult');" +
+                "  if(!name){box.innerHTML='<span style=\"color:#C62828\">请先输入地区名称</span>';return;}" +
+                "  box.innerHTML='⏳ 查询中（Open-Meteo未命中会自动尝试OSM乡镇级数据源）...';" +
+                "  var omUrl='https://geocoding-api.open-meteo.com/v1/search?name='+encodeURIComponent(name)+'&count=5&language=zh&format=json';" +
+                "  fetch('/proxy?url='+encodeURIComponent(omUrl)).then(r=>r.json()).then(om=>{" +
+                "    if(om&&om.error){box.innerHTML='<span style=\"color:#C62828\">❌ 数据源连接失败：'+om.error+'</span>';return null;}" +
+                "    if(om&&om.results&&om.results.length){var r0=om.results[0];showLocResult('命中: '+r0.name+(r0.admin1?'（'+r0.admin1+'）':''),r0.latitude,r0.longitude);return null;}" +
+                "    var phUrl='https://photon.komoot.io/api?q='+encodeURIComponent(name)+'&limit=10';" +
+                "    return fetch('/proxy?url='+encodeURIComponent(phUrl)).then(r=>r.json()).then(ph=>{" +
+                "      if(ph&&ph.error){box.innerHTML='<span style=\"color:#C62828\">❌ 数据源连接失败：'+ph.error+'</span>';return null;}" +
+                "      var hit=null;" +
+                "      if(ph&&ph.features){for(var i=0;i<ph.features.length;i++){var f=ph.features[i];var pr=f.properties||{};" +
+                "        if(pr.country!=='中国')continue;var nm=pr.name||'';" +
+                "        var adm=(pr.osm_key==='place')||['county','city','town','district','state','village','suburb','quarter'].indexOf(pr.type)>=0;" +
+                "        var nmMatch=nm&&(nm.indexOf(name)>=0||name.indexOf(nm)>=0);" +
+                "        if(adm||nmMatch){hit=f;break;}}}" +
+                "      if(hit){var c=hit.geometry.coordinates;showLocResult('命中(OSM乡镇级): '+(hit.properties.name||name),c[1],c[0]);}" +
+                "      else{box.innerHTML='<span style=\"color:#C62828\">❌ 未找到该地区——可能不存在，或地名数据源未收录到该乡镇/街道</span>';}" +
+                "    });" +
+                "  }).catch(e=>{box.innerHTML='<span style=\"color:#C62828\">查询失败: '+e+'</span>';});" +
+                "}" +
+                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>alert('保存成功！')).catch(e=>alert('保存失败:'+e));}" +
                 "renderSources();" +
                 "renderWebsites();" +
-                "renderPlayerVideos();" +
                 "</script></body></html>";
         }
     }

@@ -35,3 +35,6 @@ tree_*.json
 commit_*.json
 ref_*.json
 keystore_b64.txt
+
+# WorkBuddy 本地数据
+.workbuddy/
