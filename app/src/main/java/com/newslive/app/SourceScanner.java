@@ -90,18 +90,20 @@ public class SourceScanner {
                     for (List<String[]> items : subItems) {
                         for (String[] it : items) {
                             throwIfStopped();
-                            String key = normName(it[0]);
+                            String disp = cleanDisplay(it[0]);
+                            if (disp == null) continue;
+                            String key = normName(disp);
                             if (key.isEmpty()) continue;
                             Chan c = chans.get(key);
                             if (c == null) {
                                 c = new Chan();
-                                c.display = it[0];
-                                c.group = classify(it[0]);
+                                c.display = disp;
+                                c.group = classify(disp);
                                 c.urls = new LinkedHashSet<>();
                                 chans.put(key, c);
                             }
                             if (!c.urls.contains(it[1])) c.urls.add(it[1]);
-                            if (it[0].length() < c.display.length()) c.display = it[0];
+                            if (disp.length() < c.display.length()) c.display = disp;
                         }
                     }
                     List<String> uniq = new ArrayList<>();
@@ -333,20 +335,7 @@ public class SourceScanner {
         List<String[]> out = new ArrayList<>();
         String[] lines = text.split("\r?\n");
         if (text.contains("#EXTM3U")) {
-            String pend = null;
-            for (String raw : lines) {
-                String line = raw.trim();
-                if (line.isEmpty()) continue;
-                if (line.startsWith("#EXTINF")) {
-                    int c = line.indexOf(',');
-                    pend = c >= 0 ? line.substring(c + 1).trim() : null;
-                } else if (line.startsWith("#")) {
-                    continue;
-                } else if (line.startsWith("http://") || line.startsWith("https://")) {
-                    if (pend != null) out.add(new String[]{pend, line});
-                    pend = null;
-                }
-            }
+            return parseM3uLines(lines);
         } else {
             for (String raw : lines) {
                 String line = raw.trim();
@@ -359,6 +348,26 @@ public class SourceScanner {
                     u = u.trim();
                     if (u.startsWith("http://") || u.startsWith("https://")) out.add(new String[]{name, u});
                 }
+            }
+        }
+        return out;
+    }
+
+    /** m3u:频道名取 #EXTINF 最后一个逗号之后(属性值如 user-agent 可能含逗号) */
+    private List<String[]> parseM3uLines(String[] lines) {
+        List<String[]> out = new ArrayList<>();
+        String pend = null;
+        for (String raw : lines) {
+            String line = raw.trim();
+            if (line.isEmpty()) continue;
+            if (line.startsWith("#EXTINF")) {
+                int c = line.lastIndexOf(',');
+                pend = c >= 0 ? line.substring(c + 1).trim() : null;
+            } else if (line.startsWith("#")) {
+                continue;
+            } else if (line.startsWith("http://") || line.startsWith("https://")) {
+                if (pend != null) out.add(new String[]{pend, line});
+                pend = null;
             }
         }
         return out;
@@ -392,6 +401,76 @@ public class SourceScanner {
     }
 
     // ---------- 归一化与分类（与桌面工具一致） ----------
+
+    private static final String[][] ZH_MAP = {
+            {"(?i)(?:Nei Monggol|Inner Mongol\\w*)\\s+TV", "内蒙古电视"},
+            {"(?i)Anhui\\s+Satellite\\s+TV", "安徽卫视"},
+            {"(?i)Beijing\\s+Satellite\\s+TV", "北京卫视"},
+            {"(?i)Chongqing\\s+Satellite\\s+TV", "重庆卫视"},
+            {"(?i)Dragon\\s+TV", "东方卫视"},
+            {"(?i)Fujian\\s+(?:Southeast|Satellite)\\s+TV", "东南卫视"},
+            {"(?i)Gansu\\s+Satellite\\s+TV", "甘肃卫视"},
+            {"(?i)Guangdong\\s+Satellite\\s+TV", "广东卫视"},
+            {"(?i)Guangxi\\s+Satellite\\s+TV", "广西卫视"},
+            {"(?i)Guizhou\\s+Satellite\\s+TV", "贵州卫视"},
+            {"(?i)Hainan\\s+Satellite\\s+TV", "海南卫视"},
+            {"(?i)Hebei\\s+Satellite\\s+TV", "河北卫视"},
+            {"(?i)Heilongjiang\\s+Satellite\\s+TV", "黑龙江卫视"},
+            {"(?i)Henan\\s+Satellite\\s+TV", "河南卫视"},
+            {"(?i)Hubei\\s+Satellite\\s+TV", "湖北卫视"},
+            {"(?i)Hunan\\s+(?:Satellite\\s+)?TV", "湖南卫视"},
+            {"(?i)Jiangsu\\s+Satellite\\s+TV", "江苏卫视"},
+            {"(?i)Jilin\\s+Satellite\\s+TV", "吉林卫视"},
+            {"(?i)Liaoning\\s+Satellite\\s+TV", "辽宁卫视"},
+            {"(?i)Ningxia\\s+Satellite\\s+TV", "宁夏卫视"},
+            {"(?i)Qinghai\\s+Satellite\\s+TV", "青海卫视"},
+            {"(?i)Shandong\\s+Satellite\\s+TV", "山东卫视"},
+            {"(?i)Shanghai\\s+Satellite\\s+TV", "上海卫视"},
+            {"(?i)Shanxi\\s+Satellite\\s+TV", "山西卫视"},
+            {"(?i)Shenzhen\\s+Satellite\\s+TV", "深圳卫视"},
+            {"(?i)Sichuan\\s+Satellite\\s+TV", "四川卫视"},
+            {"(?i)Tianjin\\s+Satellite\\s+TV", "天津卫视"},
+            {"(?i)Tibet\\s+Satellite\\s+TV", "西藏卫视"},
+            {"(?i)Xinjiang\\s+Satellite\\s+TV", "新疆卫视"},
+            {"(?i)Yunnan\\s+Satellite\\s+TV", "云南卫视"},
+            {"(?i)Zhejiang\\s+Satellite\\s+TV", "浙江卫视"},
+            {"(?i)Shaanxi\\s+(?:Satellite\\s+TV|West\\s+TV)", "陕西卫视"},
+            {"(?i)Jiangxi\\s+Satellite\\s+TV", "江西卫视"},
+            {"(?i)CGTN\\s+Documentary", "CGTN纪录"},
+            {"(?i)CGTN\\s+Spanish", "CGTN西语"},
+            {"(?i)CGTN\\s+French", "CGTN法语"},
+            {"(?i)CGTN\\s+Arabic", "CGTN阿语"},
+            {"(?i)CGTN\\s+Russian", "CGTN俄语"},
+    };
+
+    private static final java.util.regex.Pattern P_RES =
+            java.util.regex.Pattern.compile("\\s*[（(]\\d{3,4}[piP]?\\s*\\)\\s*$");
+    private static final java.util.regex.Pattern P_BRACKET =
+            java.util.regex.Pattern.compile("\\s*\\[[^\\]]*\\]\\s*$");
+    private static final java.util.regex.Pattern P_DOMAIN =
+            java.util.regex.Pattern.compile("^(?:[\\w-]+\\.)+[a-z]{2,}$", java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    /** 清洗展示名:循环剥离分辨率后缀/方括号标记,英文台名映射中文;域名式脏名返回 null */
+    static String cleanDisplay(String name) {
+        if (name == null) return null;
+        String n = name.trim();
+        if (P_DOMAIN.matcher(n).matches()) return null;
+        while (true) {
+            String n2 = P_RES.matcher(n).replaceFirst("");
+            n2 = P_BRACKET.matcher(n2).replaceFirst("");
+            if (n2.equals(n)) break;
+            n = n2;
+        }
+        n = n.replaceAll("[\\s\\-_]+$", "").replaceAll("^[\\s\\-_]+", "");
+        for (String[] m : ZH_MAP) {
+            if (n.matches("(?s).*" + m[0] + ".*")) {
+                n = m[1];
+                break;
+            }
+        }
+        n = n.trim();
+        return n.isEmpty() ? null : n;
+    }
 
     static String normName(String name) {
         if (name == null) return "";
