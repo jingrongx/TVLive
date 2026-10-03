@@ -178,6 +178,90 @@
                 android:gravity="center_horizontal">
 
                 <ImageButton
+                    android:id="@+id/btn_channel_menu"
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:background="@drawable/tv_button_selector"
+                    android:src="@android:drawable/ic_menu_sort_by_size"
+                    android:contentDescription="节目单"
+                    android:scaleType="centerInside"
+                    android:focusable="true"
+                    android:focusableInTouchMode="true"
+                    android:padding="16dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="节目单"
+                    android:textColor="#AAAAAA"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="12dp"
+                android:orientation="vertical"
+                android:gravity="center_horizontal">
+
+                <ImageButton
+                    android:id="@+id/btn_settings"
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:background="@drawable/tv_button_selector"
+                    android:src="@android:drawable/ic_menu_preferences"
+                    android:contentDescription="设置"
+                    android:scaleType="centerInside"
+                    android:focusable="true"
+                    android:focusableInTouchMode="true"
+                    android:padding="16dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="设置"
+                    android:textColor="#AAAAAA"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="12dp"
+                android:orientation="vertical"
+                android:gravity="center_horizontal">
+
+                <ImageButton
+                    android:id="@+id/btn_exit_app"
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:background="@drawable/tv_button_selector"
+                    android:src="@android:drawable/ic_menu_close_clear_cancel"
+                    android:contentDescription="退出应用"
+                    android:scaleType="centerInside"
+                    android:focusable="true"
+                    android:focusableInTouchMode="true"
+                    android:padding="16dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="退出"
+                    android:textColor="#AAAAAA"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="12dp"
+                android:orientation="vertical"
+                android:gravity="center_horizontal">
+
+                <ImageButton
                     android:id="@+id/btn_orientation"
                     android:layout_width="72dp"
                     android:layout_height="72dp"

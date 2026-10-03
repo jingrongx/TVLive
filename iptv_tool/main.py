@@ -30,7 +30,7 @@ DEFAULT_CFG = {
     "subs": DEFAULT_SUBS,
     "concurrency": 30,
     "timeout": 15,
-    "min_speed": 80,
+    "min_speed": 120,
     "top_n": 3,
     "proxy": "",
     "outdir": "",
@@ -457,7 +457,8 @@ class Engine:
                 continue
             for display, us, _ in sorted(result[g], key=lambda x: x[0]):
                 if us:
-                    sources.append({"name": display, "url": us[0]})
+                    sources.append({"name": display, "url": us[0], "group": g,
+                                    "speed": int(speeds.get(us[0], 0))})
         app_cfg = {"sources": sources, "playerModeEnabled": True}
         p_app = os.path.join(outdir, "tv_live_config.json")
         with open(p_app, "w", encoding="utf-8") as f:

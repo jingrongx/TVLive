@@ -39,6 +39,7 @@ import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import android.widget.LinearLayout;
+import android.widget.ListView;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -157,6 +158,9 @@ public class MainActivity extends AppCompatActivity {
     private ImageButton btnSwitchMode;
     private ImageButton btnLockOrientation;
     private ImageButton btnOrientation;
+    private ImageButton btnChannelMenu;
+    private ImageButton btnSettings;
+    private ImageButton btnExitApp;
     private TextView tvSourceInfo;
     private TextView tvConfigInfo;
     private TextView tvNetworkInfo;
@@ -170,6 +174,9 @@ public class MainActivity extends AppCompatActivity {
     // 直播源自动优选（App 内置检测引擎）
     private SourceScanner activeScanner = null;
     private volatile String scanStatusJson = "{\"running\":false}";
+    // 频道菜单数据：分组与测速（与 streamNames/streamUrls 平行）
+    private final java.util.List<String> streamGroups = new java.util.ArrayList<>();
+    private final java.util.List<Integer> streamSpeeds = new java.util.ArrayList<>();
     private boolean isPlaying = false;
     private boolean isControlVisible = true;
     private Runnable hideControlRunnable;
@@ -362,6 +369,9 @@ public class MainActivity extends AppCompatActivity {
         btnSwitchMode = findViewById(R.id.btn_switch_mode);
         btnLockOrientation = findViewById(R.id.btn_lock_orientation);
         btnOrientation = findViewById(R.id.btn_orientation);
+        btnChannelMenu = findViewById(R.id.btn_channel_menu);
+        btnSettings = findViewById(R.id.btn_settings);
+        btnExitApp = findViewById(R.id.btn_exit_app);
         tvSourceInfo = findViewById(R.id.tv_source_info);
         tvConfigInfo = findViewById(R.id.tv_config_info);
         tvNetworkInfo = findViewById(R.id.tv_network_info);
@@ -415,13 +425,17 @@ public class MainActivity extends AppCompatActivity {
         btnSwitchMode.setOnClickListener(v -> switchMode());
         btnLockOrientation.setOnClickListener(v -> toggleOrientationLock());
         btnOrientation.setOnClickListener(v -> toggleScreenOrientation());
+        btnChannelMenu.setOnClickListener(v -> showChannelMenu());
+        btnSettings.setOnClickListener(v -> showSettingsDialog());
+        btnExitApp.setOnClickListener(v -> confirmExit());
 
         // 电视/触屏双模式适配：
         // 1) 按钮的focusableInTouchMode是为电视遥控器焦点导航设计的，
         //    在触屏手机上会导致"第一次点击=抢焦点、第二次才触发"，必须关闭
         boolean tv = isTelevisionDevice();
         ImageButton[] allButtons = {btnPrevSource, btnNextSource,
-            btnSwitchMode, btnOrientation, btnLockOrientation};
+            btnSwitchMode, btnOrientation, btnLockOrientation,
+            btnChannelMenu, btnSettings, btnExitApp};
         for (ImageButton b : allButtons) {
             if (b != null) b.setFocusableInTouchMode(tv);
         }
@@ -2584,11 +2598,23 @@ public class MainActivity extends AppCompatActivity {
         try {
             streamUrls.clear();
             streamNames.clear();
+            streamGroups.clear();
+            streamSpeeds.clear();
             JSONArray sources = config.getJSONArray("sources");
             for (int i = 0; i < sources.length(); i++) {
                 JSONObject source = sources.getJSONObject(i);
                 streamUrls.add(source.getString("url"));
-                streamNames.add(source.optString("name", "源" + (i + 1)));
+                String name = source.optString("name", "源" + (i + 1));
+                streamNames.add(name);
+                // 分组与测速为可选字段(优选工具/App内置扫描会写入),缺失时按名字归类
+                String group = source.optString("group", "");
+                if (group.isEmpty()) group = SourceScanner.classify(name);
+                streamGroups.add(group);
+                int speed = 0;
+                Object sp = source.opt("speed");
+                if (sp instanceof Number) speed = ((Number) sp).intValue();
+                else if (sp instanceof String) { try { speed = Integer.parseInt(((String) sp).trim()); } catch (Exception ignore) {} }
+                streamSpeeds.add(speed);
             }
             bufferMinMs = config.optInt("bufferMin", 10000);
             bufferMaxMs = config.optInt("bufferMax", 60000);
@@ -2605,6 +2631,8 @@ public class MainActivity extends AppCompatActivity {
                 JSONObject source = new JSONObject();
                 source.put("name", streamNames.get(i));
                 source.put("url", streamUrls.get(i));
+                if (i < streamGroups.size()) source.put("group", streamGroups.get(i));
+                if (i < streamSpeeds.size() && streamSpeeds.get(i) > 0) source.put("speed", streamSpeeds.get(i));
                 sources.put(source);
             }
             config.put("sources", sources);
@@ -3826,16 +3854,21 @@ public class MainActivity extends AppCompatActivity {
                                                 progressBar.setVisibility(View.GONE);
                                                 scheduleGiveUpRecovery();
                                             }
-                                        } else if (seekRetryCount[0] < 3) {
-                                            seekRetryCount[0]++;
-                                            if (!finalSilent) {
-                                                Toast.makeText(MainActivity.this, "缓冲超时，重连中(" + seekRetryCount[0] + "/3)...", Toast.LENGTH_SHORT).show();
-                                            }
-                                            // 直播流 seek 无意义，改为重新 prepare
-                                            player.setMediaItem(MediaItem.fromUri(Uri.parse(url)));
-                                            player.prepare();
-                                            bufferingTime[0] = 0;
+                                    } else if (seekRetryCount[0] < 3) {
+                                        seekRetryCount[0]++;
+                                        if (!finalSilent) {
+                                            Toast.makeText(MainActivity.this, "缓冲超时，重连中(" + seekRetryCount[0] + "/3)...", Toast.LENGTH_SHORT).show();
                                         }
+                                        // 直播流 seek 无意义，改为重新 prepare
+                                        player.setMediaItem(MediaItem.fromUri(Uri.parse(url)));
+                                        player.prepare();
+                                        bufferingTime[0] = 0;
+                                    } else if (!useWebMode && streamUrls.size() > 1) {
+                                        // 播放器模式：重试无效，自动换下一条线路（优选列表按速度排序，下一条通常更快）
+                                        bufferingTime[0] = 0;
+                                        Toast.makeText(MainActivity.this, "当前线路持续卡顿，自动切换下一条线路…", Toast.LENGTH_SHORT).show();
+                                        switchToNextSource();
+                                    }
                                     } else {
                                         handler.postDelayed(this, 1000);
                                     }
@@ -4886,6 +4919,169 @@ public class MainActivity extends AppCompatActivity {
         currentUrlIndex = (currentUrlIndex - 1 + streamUrls.size()) % streamUrls.size();
         loadStreamFromConfig(currentUrlIndex);
     }
+
+    /** 频道节目单：左侧分组、右侧频道（显示测速），点击直接播放。OK键/节目单按钮呼出 */
+    private void showChannelMenu() {
+        if (streamUrls.isEmpty()) {
+            Toast.makeText(this, "暂无直播源，请先在设置页优选或添加源", Toast.LENGTH_LONG).show();
+            return;
+        }
+        float density = getResources().getDisplayMetrics().density;
+
+        // 分组提取（保持出现顺序）+「全部」
+        java.util.LinkedHashSet<String> groupSet = new java.util.LinkedHashSet<>();
+        for (String g : streamGroups) groupSet.add(g == null || g.isEmpty() ? "其他" : g);
+        final java.util.List<String> groups = new java.util.ArrayList<>();
+        groups.add("全部");
+        groups.addAll(groupSet);
+        final String[] selGroup = {groups.get(0)};
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.HORIZONTAL);
+        int pad = (int) (12 * density);
+        root.setPadding(pad, pad, pad, pad);
+
+        ListView lvGroups = new ListView(this);
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(
+                (int) (106 * density), LinearLayout.LayoutParams.MATCH_PARENT);
+        glp.rightMargin = (int) (8 * density);
+        lvGroups.setLayoutParams(glp);
+        lvGroups.setDivider(null);
+
+        ListView lvChannels = new ListView(this);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
+        lvChannels.setLayoutParams(clp);
+
+        root.addView(lvGroups);
+        root.addView(lvChannels);
+
+        android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(this)
+                .setTitle("节目单（" + streamUrls.size() + " 个频道）")
+                .setView(root)
+                .setNegativeButton("关闭", null)
+                .create();
+
+        final java.util.List<Integer> idxHolder = new java.util.ArrayList<>();
+        final android.widget.ArrayAdapter<String> groupAdapter =
+                new android.widget.ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, groups) {
+                    @Override
+                    public View getView(int position, View convertView, ViewGroup parent) {
+                        View v = super.getView(position, convertView, parent);
+                        android.widget.TextView tv = v.findViewById(android.R.id.text1);
+                        if (groups.get(position).equals(selGroup[0])) {
+                            tv.setTextColor(0xFF2196F3);
+                            tv.setTypeface(null, android.graphics.Typeface.BOLD);
+                        } else {
+                            tv.setTextColor(0xFF333333);
+                            tv.setTypeface(null, android.graphics.Typeface.NORMAL);
+                        }
+                        return v;
+                    }
+                };
+
+        Runnable updateChannels = () -> {
+            idxHolder.clear();
+            for (int i = 0; i < streamUrls.size(); i++) {
+                String g = i < streamGroups.size() ? streamGroups.get(i) : "其他";
+                if (g == null || g.isEmpty()) g = "其他";
+                if ("全部".equals(selGroup[0]) || selGroup[0].equals(g)) idxHolder.add(i);
+            }
+            java.util.List<String> rows = new java.util.ArrayList<>();
+            for (int idx : idxHolder) {
+                String speed = (idx < streamSpeeds.size() && streamSpeeds.get(idx) > 0)
+                        ? streamSpeeds.get(idx) + "KB/s" : "";
+                String mark = idx == currentUrlIndex ? "▶ " : "    ";
+                rows.add(mark + streamNames.get(idx) + (speed.isEmpty() ? "" : "  「" + speed + "」"));
+            }
+            android.widget.ArrayAdapter<String> chAdapter =
+                    new android.widget.ArrayAdapter<String>(MainActivity.this,
+                            android.R.layout.simple_list_item_1, rows) {
+                        @Override
+                        public View getView(int position, View convertView, ViewGroup parent) {
+                            View v = super.getView(position, convertView, parent);
+                            android.widget.TextView tv = v.findViewById(android.R.id.text1);
+                            if (idxHolder.get(position) == currentUrlIndex) {
+                                tv.setTextColor(0xFF2196F3);
+                            } else {
+                                tv.setTextColor(0xFFEEEEEE);
+                            }
+                            return v;
+                        }
+                    };
+            lvChannels.setAdapter(chAdapter);
+            int cur = idxHolder.indexOf(currentUrlIndex);
+            if (cur >= 0) lvChannels.setSelection(Math.max(cur - 3, 0));
+        };
+
+        lvGroups.setAdapter(groupAdapter);
+        lvGroups.setOnItemClickListener((parent, view, position, id) -> {
+            selGroup[0] = groups.get(position);
+            groupAdapter.notifyDataSetChanged();
+            updateChannels.run();
+        });
+        lvChannels.setOnItemClickListener((parent, view, position, id) -> {
+            dialog.dismiss();
+            currentUrlIndex = idxHolder.get(position);
+            loadStreamFromConfig(currentUrlIndex);
+        });
+
+        dialog.show();
+        updateChannels.run();
+    }
+
+    /** App 内打开配置页（内置 WebView 走 127.0.0.1 回环，不依赖外部浏览器） */
+    private void showSettingsDialog() {
+        if (!isNetworkAvailable) {
+            Toast.makeText(this, "网络不可用，配置服务未启动", Toast.LENGTH_SHORT).show();
+        }
+        float density = getResources().getDisplayMetrics().density;
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setBackgroundColor(0xFF2196F3);
+        bar.setPadding((int) (12 * density), (int) (8 * density), (int) (12 * density), (int) (8 * density));
+        android.widget.TextView title = new android.widget.TextView(this);
+        title.setText("⚙ 设置（本机配置页 http://127.0.0.1:" + HTTP_PORT + "）");
+        title.setTextColor(0xFFFFFFFF);
+        title.setTextSize(15);
+        android.widget.TextView close = new android.widget.TextView(this);
+        close.setText("✕ 关闭");
+        close.setTextColor(0xFFFFFFFF);
+        close.setTextSize(15);
+        close.setPadding((int) (16 * density), 0, 0, 0);
+        bar.addView(title, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        bar.addView(close);
+        WebView wv = new WebView(this);
+        wv.getSettings().setJavaScriptEnabled(true);
+        wv.getSettings().setDomStorageEnabled(true);
+        LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT);
+        root.addView(bar);
+        root.addView(wv, wlp);
+
+        android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(this, android.R.style.Theme_Black_NoTitleBar)
+                .setView(root)
+                .create();
+        close.setOnClickListener(v -> dialog.dismiss());
+        dialog.setOnDismissListener(d -> {
+            wv.loadUrl("about:blank");
+            wv.destroy();
+        });
+        dialog.show();
+        wv.loadUrl("http://127.0.0.1:" + HTTP_PORT);
+    }
+
+    /** 退出应用（沉浸式下返回键难找时的兜底入口） */
+    private void confirmExit() {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("退出")
+                .setMessage("确定退出新闻直播吗？")
+                .setPositiveButton("退出", (d, w) -> finishAndRemoveTask())
+                .setNegativeButton("取消", null)
+                .show();
+    }
     
     private void switchToNextChannel() {
         switchMode();
@@ -5191,7 +5387,8 @@ public class MainActivity extends AppCompatActivity {
                         // WebView模式下，确认键模拟点击当前焦点元素
                         return super.dispatchKeyEvent(event);
                     }
-                    togglePlayPause();
+                    // 播放器模式：OK键呼出节目单（市面直播App习惯），暂停走播放/暂停键或面板
+                    showChannelMenu();
                     return true;
 
                 case KeyEvent.KEYCODE_DPAD_LEFT:
@@ -5573,22 +5770,29 @@ public class MainActivity extends AppCompatActivity {
         }
 
         private String getHtmlPage() {
-            StringBuilder sourcesJson = new StringBuilder("[");
+            // 用 org.json 生成,自动转义引号/反斜杠,避免特殊字符破坏内嵌 JS
+            JSONArray sourcesArr = new JSONArray();
             for (int i = 0; i < streamUrls.size(); i++) {
-                if (i > 0) sourcesJson.append(",");
-                sourcesJson.append("{\"name\":\"").append(streamNames.get(i))
-                    .append("\",\"url\":\"").append(streamUrls.get(i)).append("\"}");
+                JSONObject o = new JSONObject();
+                try {
+                    o.put("name", streamNames.get(i));
+                    o.put("url", streamUrls.get(i));
+                    sourcesArr.put(o);
+                } catch (Exception ignore) { }
             }
-            sourcesJson.append("]");
+            String sourcesJson = sourcesArr.toString();
 
-            StringBuilder webSitesJson = new StringBuilder("[");
+            JSONArray webSitesArr = new JSONArray();
             for (int i = 0; i < webSiteUrls.size(); i++) {
-                if (i > 0) webSitesJson.append(",");
-                webSitesJson.append("{\"name\":\"").append(webSiteNames.get(i))
-                    .append("\",\"url\":\"").append(webSiteUrls.get(i))
-                    .append("\",\"enabled\":").append(i < webSiteEnabled.size() && webSiteEnabled.get(i) ? "true" : "false").append("}");
+                JSONObject o = new JSONObject();
+                try {
+                    o.put("name", webSiteNames.get(i));
+                    o.put("url", webSiteUrls.get(i));
+                    o.put("enabled", i < webSiteEnabled.size() && webSiteEnabled.get(i));
+                    webSitesArr.put(o);
+                } catch (Exception ignore) { }
             }
-            webSitesJson.append("]");
+            String webSitesJson = webSitesArr.toString();
 
             return "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>新闻直播配置</title>" +
                 "<style>" +
@@ -5653,16 +5857,17 @@ public class MainActivity extends AppCompatActivity {
                 "</div>" +
                 "<div class='section'>" +
                 "<div class='section-title'>📺 直播源列表</div>" +
-                "<div class='tip'>播放器模式下使用以下源（从远程配置获取）</div>" +
+                "<div class='tip'>播放器模式下使用以下源。数量多时自动分页浏览，支持搜索过滤。</div>" +
+                "<input type='text' id='srcSearch' placeholder='🔍 搜索频道名 / URL 过滤' oninput='srcSearchChanged(this.value)' style='width:100%;box-sizing:border-box;margin-bottom:6px'>" +
                 "<div id='sources'></div>" +
-                "<button class='btn-add' onclick='addSource()'>+ 添加直播源</button>" +
+                "<button class='btn-add' onclick='addSource();srcPage=999;renderSources()'>+ 添加直播源</button>" +
                 "</div>" +
                 "<div class='section' style='background:#EDE7F6;border:1px solid #7E57C2'>" +
                 "<div class='section-title'>🔍 直播源自动优选（App 内置检测）</div>" +
                 "<div class='tip'>拉取订阅 → 逐条连通验证与分片测速 → 每频道保留最快线路 → 自动替换上方直播源列表。建议在 WiFi 下运行，约 1~3 分钟；移动数据下测速结果仅代表当前网络。</div>" +
                 "<textarea id='scanSubs' rows='3' style='width:100%;box-sizing:border-box;font-size:12px'>https://vbskycn.github.io/iptv/tv/iptv4.txt\nhttps://iptv-org.github.io/iptv/countries/cn.m3u</textarea>" +
                 "<div class='buffer-inputs' style='margin-top:6px'>" +
-                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>淘汰线 KB/s</label><input type='number' id='scanMin' value='80'></div>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>淘汰线 KB/s</label><input type='number' id='scanMin' value='120'></div>" +
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>并发数</label><input type='number' id='scanConc' value='15'></div>" +
                 "</div>" +
                 "<div class='btn-group'><button class='btn-fetch' id='scanBtn' onclick='startScan()'>🚀 开始优选</button></div>" +
@@ -5705,9 +5910,19 @@ public class MainActivity extends AppCompatActivity {
                 "var sources=" + sourcesJson.toString() + ";" +
                 "var websites=" + webSitesJson.toString() + ";" +
                 "var draggedItem=null;" +
+                "var srcPage=0;var srcFilter='';var SRC_PAGE_SIZE=20;" +
                 "function renderSources(){" +
-                "  var html='';" +
+                "  var list=[];" +
                 "  for(var i=0;i<sources.length;i++){" +
+                "    if(!srcFilter||(sources[i].name+' '+sources[i].url).toLowerCase().indexOf(srcFilter)>=0)list.push(i);" +
+                "  }" +
+                "  var totalPages=Math.max(1,Math.ceil(list.length/SRC_PAGE_SIZE));" +
+                "  if(srcPage>=totalPages)srcPage=totalPages-1;" +
+                "  if(srcPage<0)srcPage=0;" +
+                "  var pageItems=list.slice(srcPage*SRC_PAGE_SIZE,srcPage*SRC_PAGE_SIZE+SRC_PAGE_SIZE);" +
+                "  var html='';" +
+                "  for(var j=0;j<pageItems.length;j++){" +
+                "    var i=pageItems[j];" +
                 "    html+='<div class=\"source-item\" data-index=\"'+i+'\" data-type=\"source\" ondragstart=\"dragStart(event)\" ondragover=\"dragOver(event)\" ondrop=\"drop(event)\" ondragend=\"dragEnd(event)\">';" +
                 "    html+='<div class=\"item-header\"><span class=\"drag-handle\" draggable=\"true\" title=\"按住我拖动调整顺序\" onmousedown=\"armDrag(event)\" onmouseup=\"disarmDrag(event)\" ontouchstart=\"armDrag(event)\" ontouchend=\"disarmDrag(event)\">☰</span><span class=\"item-index\">'+(i+1)+'</span><span class=\"drag-tip\">按住左侧 ☰ 上下拖动调整顺序</span></div>';" +
                 "    html+='<input type=\"text\" placeholder=\"名称\" value=\"'+sources[i].name+'\" onchange=\"sources['+i+'].name=this.value\">';" +
@@ -5718,8 +5933,14 @@ public class MainActivity extends AppCompatActivity {
                 "    html+='<button class=\"btn-del\" onclick=\"delSource('+i+')\">删除</button>';" +
                 "    html+='</div></div>';" +
                 "  }" +
+                "  if(!list.length)html='<div class=\"tip\">无匹配的源</div>';" +
+                "  html+='<div style=\"text-align:center;margin-top:8px\">'+"+
+                "    '<button onclick=\"srcPage--;renderSources()\">◀ 上一页</button> '+"+
+                "    '<span style=\"margin:0 8px\">第 '+(srcPage+1)+' / '+totalPages+' 页 · 共 '+list.length+' 条</span> '+"+
+                "    '<button onclick=\"srcPage++;renderSources()\">下一页 ▶</button></div>';" +
                 "  document.getElementById('sources').innerHTML=html;" +
                 "}" +
+                "function srcSearchChanged(v){srcFilter=(v||'').toLowerCase();srcPage=0;renderSources();}" +
                 "function renderWebsites(){" +
                 "  var html='';" +
                 "  for(var i=0;i<websites.length;i++){" +
