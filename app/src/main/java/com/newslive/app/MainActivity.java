@@ -5234,6 +5234,28 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadStreamFromConfig(int index) {
+        // 兼容节目单混合模式:从网页模式直接点播放器源时,先收起网页并初始化播放器
+        // (此前该路径下 player==null 会导致 NPE 崩溃)
+        if (useWebMode) {
+            useWebMode = false;
+            prefs.edit().putBoolean(KEY_USE_WEB_MODE, false).apply();
+            cancelWebViewTimeoutTimer();
+            cancelWebRefreshFallback();
+            stopWebVideoStallDetector();
+            silentRefreshPending = false;
+            fullscreenRetryCount = 0;
+            if (webView != null) {
+                webView.pauseTimers();
+                webView.onPause();
+                webView.setVisibility(View.GONE);
+            }
+            playerContainer.setVisibility(View.VISIBLE);
+            hideSwitchOverlay();
+        }
+        if (player == null) {
+            initPlayer();
+        }
+
         if (streamUrls.isEmpty()) {
             progressBar.setVisibility(View.GONE);
             Toast.makeText(this, "没有配置直播源", Toast.LENGTH_LONG).show();
