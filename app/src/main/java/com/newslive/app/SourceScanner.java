@@ -164,21 +164,26 @@ public class SourceScanner {
                     } catch (InterruptedException ignore) { }
                     throwIfStopped();
 
-                    // ---- 4. 每频道优选最快 1 条 ----
+                    // ---- 4. 每频道优选最快前3条(同名连续多行,第一行最快;卡顿时可在同频道线路内轮换) ----
                     List<Chan> picked = new ArrayList<>();
                     List<Float> allSpeed = new ArrayList<>();
                     for (Chan c : chans.values()) {
-                        String best = null;
-                        float bestS = 0;
-                        for (String u : c.urls) {
+                        List<String> ranked = new ArrayList<>(c.urls);
+                        Collections.sort(ranked, (a, b) -> Float.compare(
+                                speeds.containsKey(b) ? speeds.get(b) : 0,
+                                speeds.containsKey(a) ? speeds.get(a) : 0));
+                        List<String> good = new ArrayList<>();
+                        for (String u : ranked) {
                             float s = speeds.containsKey(u) ? speeds.get(u) : 0;
-                            if (s > bestS) { bestS = s; best = u; }
+                            if (s >= minSpeed) {
+                                good.add(u);
+                                if (good.size() >= 3) break;
+                            }
                         }
-                        if (best == null) continue;
-                        if (bestS < minSpeed) continue; // 淘汰低速
-                        c.best = best;
-                        c.bestSpeed = bestS;
-                        allSpeed.add(bestS);
+                        if (good.isEmpty()) continue; // 该频道所有线路低速,淘汰
+                        c.top = good;
+                        c.bestSpeed = speeds.get(good.get(0));
+                        allSpeed.add(c.bestSpeed);
                         picked.add(c);
                     }
                     if (picked.isEmpty()) {
@@ -201,14 +206,20 @@ public class SourceScanner {
 
                     // ---- 5. 生成配置 JSON ----
                     StringBuilder sb = new StringBuilder("{\"playerModeEnabled\":true,\"sources\":[");
-                    for (int i = 0; i < picked.size(); i++) {
-                        if (i > 0) sb.append(",");
-                        Chan c = picked.get(i);
-                        sb.append("{\"name\":\"").append(esc(c.display))
-                          .append("\",\"url\":\"").append(esc(c.best))
-                          .append("\",\"group\":\"").append(esc(c.group))
-                          .append("\",\"speed\":").append(Math.max(1, Math.round(c.bestSpeed)))
-                          .append("}");
+                    int outLines = 0;
+                    boolean firstSrc = true;
+                    for (Chan c : picked) {
+                        for (int li = 0; li < c.top.size(); li++) {
+                            if (!firstSrc) sb.append(",");
+                            firstSrc = false;
+                            float s = speeds.containsKey(c.top.get(li)) ? speeds.get(c.top.get(li)) : 0;
+                            sb.append("{\"name\":\"").append(esc(c.display))
+                              .append("\",\"url\":\"").append(esc(c.top.get(li)))
+                              .append("\",\"group\":\"").append(esc(c.group))
+                              .append("\",\"speed\":").append(Math.max(1, Math.round(s)))
+                              .append("}");
+                            outLines++;
+                        }
                     }
                     sb.append("]}");
                     float median = allSpeed.get(allSpeed.size() / 2);
@@ -234,7 +245,7 @@ public class SourceScanner {
         String display;
         String group;
         LinkedHashSet<String> urls;
-        String best;
+        java.util.List<String> top = new ArrayList<>(); // 最快前3条(降序)
         float bestSpeed;
     }
 

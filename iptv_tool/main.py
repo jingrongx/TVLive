@@ -450,15 +450,16 @@ class Engine:
         with open(p_rep, "w", encoding="utf-8") as f:
             f.write("\n".join(rep) + "\n")
 
-        # 生成 App 配置 JSON(TVLive/NewsLive 格式):每频道取最快 1 条线路,按分组顺序排序
+        # 生成 App 配置 JSON(TVLive/NewsLive 格式):每频道保留全部达标线路(≤3条,同名多行连续,
+        # 第一行最快),App 端按同名连续段识别"频道↔线路",卡顿在同频道线路内轮换
         sources = []
         for g in GROUP_ORDER:
             if g not in result:
                 continue
             for display, us, _ in sorted(result[g], key=lambda x: x[0]):
-                if us:
-                    sources.append({"name": display, "url": us[0], "group": g,
-                                    "speed": int(speeds.get(us[0], 0))})
+                for u in us:
+                    sources.append({"name": display, "url": u, "group": g,
+                                    "speed": int(speeds.get(u, 0))})
         app_cfg = {"sources": sources, "playerModeEnabled": True}
         p_app = os.path.join(outdir, "tv_live_config.json")
         with open(p_app, "w", encoding="utf-8") as f:
