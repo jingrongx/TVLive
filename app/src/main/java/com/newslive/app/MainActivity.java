@@ -1197,6 +1197,7 @@ public class MainActivity extends AppCompatActivity {
         bannerVisible = prefs.getBoolean(KEY_BANNER_VISIBLE, true);
         bannerFontSize = prefs.getInt(KEY_BANNER_FONT_SIZE, 16);
         bannerHeight = prefs.getInt(KEY_BANNER_HEIGHT, 28);
+        bannerAutoFit = prefs.getBoolean(KEY_BANNER_AUTO_FIT, true);
         webSourceUrl = prefs.getString(KEY_WEB_SOURCE_URL, DEFAULT_WEB_SOURCE_URL);
         isOrientationLocked = prefs.getBoolean(KEY_LOCK_ORIENTATION, false);
         currentSiteIndex = prefs.getInt(KEY_CURRENT_SITE_INDEX, 0);
@@ -1410,8 +1411,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ==================== 横幅字号自适应（单行不换行） ====================
-    private float bannerFitScale = 1f;       // 当前自适应缩放比例（0.5~1）
+    private float bannerFitScale = 1f;       // 当前自适应缩放比例（0.35~1.5）
     private boolean bannerFitScheduled = false;
+    private boolean bannerAutoFit = true;    // 自动调节字号（尽量放大不截断），默认开启
+    private static final float BANNER_MAX_SCALE = 1.5f; // 自动放大上限（16sp基准→24sp封顶）
+    private static final String KEY_BANNER_AUTO_FIT = "banner_auto_fit";
 
     private void scheduleBannerAutoFit() {
         if (handler == null || infoOverlay == null || !bannerVisible) return;
@@ -1424,14 +1428,14 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * 横幅自适应：迭代测量全部文本理想总宽，超出横幅宽度时按比例缩小字号并重新测量，
-     * 收敛到刚好放下（手机竖屏内容总宽可达屏幕2倍以上，单次线性缩放不够）；
-     * 大量富余时逐步恢复字号，恢复后若溢出立即回退。
+     * 横幅自适应总控：竖屏三行 / 横屏单行。
+     * 自动模式（默认）：以"不截断为前提尽量放大"求解公共字号比例——公共scale取各行
+     * 允许值的最小值，一轮比例求解+硬校验，多行之间不博弈不抖动；
+     * 手动模式：尊重用户设定字号，只缩不涨保证不截断。
      */
     private void autoFitBannerTexts() {
         if (infoOverlay == null || !bannerVisible) return;
         if (!(infoOverlay instanceof ViewGroup)) return;
-        // 逐行自适应：竖屏三行各自收敛，横屏整条收敛
         List<ViewGroup> rows = new ArrayList<>();
         if (bannerRow1 != null && bannerRowTime != null && bannerRow2 != null
                 && bannerRowTime.getVisibility() == View.VISIBLE) {
@@ -1439,14 +1443,54 @@ public class MainActivity extends AppCompatActivity {
             rows.add(bannerRowTime);
             rows.add(bannerRow2);
         } else {
-            rows.add((ViewGroup) infoOverlay);
+            // 横屏单行：注意必须用 banner_row1 计算（它带12dp行内padding），
+            // 用外层infoOverlay会高估可用宽度导致日期被截断（v1.0.6回归）
+            rows.add(bannerRow1 != null ? bannerRow1 : (ViewGroup) infoOverlay);
         }
-        for (ViewGroup row : rows) {
-            fitBannerRow(row);
+        if (bannerAutoFit) {
+            // 第一轮：求各行在当前scale下的"允许scale"，取最小作为公共scale
+            float allowed = BANNER_MAX_SCALE;
+            boolean measurable = false;
+            for (ViewGroup row : rows) {
+                int avail = row.getWidth() - row.getPaddingStart() - row.getPaddingEnd();
+                if (avail <= 0) {
+                    scheduleBannerAutoFit(); // 尚未完成布局，稍后重试
+                    return;
+                }
+                List<TextView> texts = new ArrayList<>();
+                collectBannerTextViews(row, texts);
+                int total = measureBannerTotal(texts) + sumBannerExtras(row);
+                if (total <= 0) continue;
+                measurable = true;
+                allowed = Math.min(allowed, bannerFitScale * ((float) avail / total) * 0.97f);
+            }
+            if (!measurable) return;
+            allowed = Math.max(0.35f, Math.min(BANNER_MAX_SCALE, allowed));
+            // 接近目标(±0.5%)则保持稳定，避免每秒微调抖动
+            if (Math.abs(allowed - bannerFitScale) >= 0.005f) {
+                bannerFitScale = allowed;
+                applyBannerFontSizes();
+                // 硬校验：线性近似若有偏差导致任一行仍溢出，整体再缩一档
+                for (ViewGroup row : rows) {
+                    int avail = row.getWidth() - row.getPaddingStart() - row.getPaddingEnd();
+                    List<TextView> texts = new ArrayList<>();
+                    collectBannerTextViews(row, texts);
+                    int total = measureBannerTotal(texts) + sumBannerExtras(row);
+                    if (total > avail) {
+                        bannerFitScale = Math.max(0.35f,
+                            bannerFitScale * ((float) avail / total) * 0.97f);
+                        applyBannerFontSizes();
+                    }
+                }
+            }
+        } else {
+            for (ViewGroup row : rows) {
+                fitBannerRow(row);
+            }
         }
     }
 
-    /** 对单行做字号收敛：超出则按比例缩小并重新测量（只缩不涨，避免反复试探导致的"抽动"） */
+    /** 手动模式的单行收敛：超出则按比例缩小并重新测量（只缩不涨，尊重手动字号） */
     private void fitBannerRow(ViewGroup row) {
         int avail = row.getWidth() - row.getPaddingStart() - row.getPaddingEnd();
         if (avail <= 0) {
@@ -4991,6 +5035,11 @@ public class MainActivity extends AppCompatActivity {
                 bannerHeight = config.optInt("bannerHeight", 28);
                 prefs.edit().putInt(KEY_BANNER_HEIGHT, bannerHeight).apply();
             }
+            if (config.has("bannerAutoFit")) {
+                bannerAutoFit = config.optBoolean("bannerAutoFit", true);
+                prefs.edit().putBoolean(KEY_BANNER_AUTO_FIT, bannerAutoFit).apply();
+                applyBannerStyle(); // 重新收敛字号（自动=尽量放大 / 手动=固定基准）
+            }
             if (config.has("manualLocation")) {
                 // 手动地区：先验证（查得到天气坐标才生效），通过后保存并立即刷新定位与天气
                 handleManualLocationUpdate(config.optString("manualLocation", ""));
@@ -5526,11 +5575,12 @@ public class MainActivity extends AppCompatActivity {
                 "<div class='section'>" +
                 "<div class='section-title'>📊 顶部信息横幅</div>" +
                 "<label><input type='checkbox' id='bannerVisible' " + (bannerVisible ? "checked" : "") + "> 显示顶部信息横幅（农历/时间/天气）</label>" +
+                "<label><input type='checkbox' id='bannerAutoFit' " + (bannerAutoFit ? "checked" : "") + "> 自动调节字号（推荐：不截断遮挡任何文字的前提下尽量放大）</label>" +
                 "<div class='buffer-inputs' style='margin-top:8px'>" +
-                "<div><label style='display:block;margin-bottom:4px'>字号基准 (9-18)</label><input type='number' id='bannerFontSize' min='9' max='18' style='width:100%' value='" + bannerFontSize + "'></div>" +
+                "<div><label style='display:block;margin-bottom:4px'>手动字号基准 (9-18，关闭自动调节时生效)</label><input type='number' id='bannerFontSize' min='9' max='18' style='width:100%' value='" + bannerFontSize + "'></div>" +
                 "<div><label style='display:block;margin-bottom:4px'>区域高度 dp (20-60)</label><input type='number' id='bannerHeight' min='20' max='60' style='width:100%' value='" + bannerHeight + "'></div>" +
                 "</div>" +
-                "<div class='tip'>字号基准：主文字=基准，节气/温度=基准-1，标签=基准-2，图标=基准+2</div>" +
+                "<div class='tip'>自动调节：横屏/竖屏各行按内容自动收敛到\"恰好放满\"的最大字号（上限24sp）；关闭后使用手动字号，超宽时只缩小保证不截断。</div>" +
                 "</div>" +
                 "<div class='section'>" +
                 "<div class='section-title'>📍 地区设置（定位/天气）</div>" +
@@ -5627,7 +5677,7 @@ public class MainActivity extends AppCompatActivity {
                 "    });" +
                 "  }).catch(e=>{box.innerHTML='<span style=\"color:#C62828\">查询失败: '+e+'</span>';});" +
                 "}" +
-                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>alert('保存成功！')).catch(e=>alert('保存失败:'+e));}" +
+                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>alert('保存成功！')).catch(e=>alert('保存失败:'+e));}" +
                 "renderSources();" +
                 "renderWebsites();" +
                 "</script></body></html>";
