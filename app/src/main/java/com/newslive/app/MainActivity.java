@@ -3873,10 +3873,21 @@ public class MainActivity extends AppCompatActivity {
                                         player.prepare();
                                         bufferingTime[0] = 0;
                                     } else if (!useWebMode && streamUrls.size() > 1) {
-                                        // 播放器模式：重试无效，自动换下一条线路（优选列表按速度排序，下一条通常更快）
-                                        bufferingTime[0] = 0;
-                                        Toast.makeText(MainActivity.this, "当前线路持续卡顿，自动切换下一条线路…", Toast.LENGTH_SHORT).show();
-                                        switchToNextSource();
+                                        // 播放器模式：重试无效,在同频道的备用线路内轮换(不跨频道)
+                                        int[] range = currentChannelRange();
+                                        if (currentUrlIndex < range[1]) {
+                                            bufferingTime[0] = 0;
+                                            Toast.makeText(MainActivity.this, "当前线路卡顿，切换同频道备用线路…", Toast.LENGTH_SHORT).show();
+                                            currentUrlIndex++;
+                                            loadStreamFromConfig(currentUrlIndex);
+                                        } else {
+                                            // 该频道全部线路都试过:回到最快线路重连,提示手动换台
+                                            bufferingTime[0] = 0;
+                                            seekRetryCount[0] = 0;
+                                            Toast.makeText(MainActivity.this, "该频道线路均卡顿，可按OK节目单换台", Toast.LENGTH_SHORT).show();
+                                            player.setMediaItem(MediaItem.fromUri(Uri.parse(url)));
+                                            player.prepare();
+                                        }
                                     }
                                     } else {
                                         handler.postDelayed(this, 1000);
@@ -4924,16 +4935,36 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /** 当前频道(同名连续段)范围:[start, end] */
+    private int[] currentChannelRange() {
+        if (streamUrls.isEmpty()) return new int[]{0, 0};
+        int idx = Math.min(currentUrlIndex, streamUrls.size() - 1);
+        String name = streamNames.get(idx);
+        int start = idx;
+        while (start > 0 && streamNames.get(start - 1).equals(name)) start--;
+        int end = idx;
+        while (end < streamUrls.size() - 1 && streamNames.get(end + 1).equals(name)) end++;
+        return new int[]{start, end};
+    }
+
+    /** 换台:跳过同名线路段,直接到下一个频道的最快线路 */
     private void switchToNextSource() {
         if (streamUrls.isEmpty()) return;
-        currentUrlIndex = (currentUrlIndex + 1) % streamUrls.size();
-        loadStreamFromConfig(currentUrlIndex);
+        int[] range = currentChannelRange();
+        int next = (range[1] + 1) % streamUrls.size();
+        currentUrlIndex = next;
+        loadStreamFromConfig(next);
     }
 
     private void switchToPrevSource() {
         if (streamUrls.isEmpty()) return;
-        currentUrlIndex = (currentUrlIndex - 1 + streamUrls.size()) % streamUrls.size();
-        loadStreamFromConfig(currentUrlIndex);
+        int[] range = currentChannelRange();
+        int prev = (range[0] - 1 + streamUrls.size()) % streamUrls.size();
+        // 落到上一个频道的线路段时,定位到该段首(最快线路)
+        int segStart = prev;
+        while (segStart > 0 && streamNames.get(segStart - 1).equals(streamNames.get(prev))) segStart--;
+        currentUrlIndex = segStart;
+        loadStreamFromConfig(segStart);
     }
 
     /** 安全切到网页模式并载入指定网站(兼容启动即播放器模式时 WebView 未初始化的情况) */
@@ -5052,32 +5083,46 @@ public class MainActivity extends AppCompatActivity {
 
         Runnable updateChannels = () -> {
             idxHolder.clear();
-            for (int i = 0; i < streamUrls.size(); i++) {
+            // 直播源按同名连续段聚合为频道(段首=最快线路);网页频道单列
+            java.util.List<int[]> chRanges = new java.util.ArrayList<>(); // {start,end}
+            int i = 0;
+            while (i < streamUrls.size()) {
+                int j = i;
+                while (j + 1 < streamUrls.size() && streamNames.get(j + 1).equals(streamNames.get(i))) j++;
                 String g = i < streamGroups.size() ? streamGroups.get(i) : "其他";
                 if (g == null || g.isEmpty()) g = "其他";
-                if ("全部".equals(selGroup[0]) || selGroup[0].equals(g)) idxHolder.add(i);
+                if ("全部".equals(selGroup[0]) || selGroup[0].equals(g)) chRanges.add(new int[]{i, j});
+                i = j + 1;
             }
             boolean includeWeb = !webSiteUrls.isEmpty()
                     && ("全部".equals(selGroup[0]) || "🌐 网页".equals(selGroup[0]));
             if (includeWeb) {
-                for (int i = 0; i < webSiteUrls.size(); i++) {
-                    if (i < webSiteEnabled.size() && !webSiteEnabled.get(i)) continue;
-                    idxHolder.add(WEB_ENTRY_MARK + i);
+                for (int w = 0; w < webSiteUrls.size(); w++) {
+                    if (w < webSiteEnabled.size() && !webSiteEnabled.get(w)) continue;
+                    chRanges.add(new int[]{WEB_ENTRY_MARK + w, WEB_ENTRY_MARK + w});
                 }
             }
             java.util.List<android.text.SpannableString> rows = new java.util.ArrayList<>();
-            for (int code : idxHolder) {
-                if (code >= WEB_ENTRY_MARK) {
-                    int wIdx = code - WEB_ENTRY_MARK;
+            for (int[] r : chRanges) {
+                if (r[0] >= WEB_ENTRY_MARK) {
+                    int wIdx = r[0] - WEB_ENTRY_MARK;
                     String wName = wIdx < webSiteNames.size() ? webSiteNames.get(wIdx) : "网页" + (wIdx + 1);
                     boolean wCur = useWebMode && wIdx == currentSiteIndex;
                     rows.add(new android.text.SpannableString((wCur ? "▶ " : "") + "🌐 " + wName));
+                    idxHolder.add(r[0]);
                     continue;
                 }
-                int idx = code;
-                int sp = idx < streamSpeeds.size() ? streamSpeeds.get(idx) : 0;
-                String mark = idx == currentUrlIndex ? "▶ " : "";
-                String base = mark + streamNames.get(idx);
+                int start = r[0], end = r[1];
+                int lines = end - start + 1;
+                // 段内最快速度
+                int sp = 0;
+                for (int k = start; k <= end && k < streamSpeeds.size(); k++) {
+                    sp = Math.max(sp, streamSpeeds.get(k));
+                }
+                String name = streamNames.get(start);
+                boolean cur = currentUrlIndex >= start && currentUrlIndex <= end;
+                String mark = cur ? "▶ " : "";
+                String base = mark + name + (lines > 1 ? " (" + lines + "条线路)" : "");
                 String speedTxt;
                 int speedColor;
                 if (sp >= 500) { speedTxt = "   ⚡ " + sp + "KB/s"; speedColor = 0xFF8BC34A; }        // 快:绿
@@ -5088,6 +5133,7 @@ public class MainActivity extends AppCompatActivity {
                 ss.setSpan(new android.text.style.ForegroundColorSpan(speedColor),
                         base.length(), ss.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                 rows.add(ss);
+                idxHolder.add(start); // 点击播该频道最快线路
             }
             android.widget.ArrayAdapter<android.text.SpannableString> chAdapter =
                     new android.widget.ArrayAdapter<android.text.SpannableString>(MainActivity.this,
@@ -5424,8 +5470,15 @@ public class MainActivity extends AppCompatActivity {
 
     private void updateSourceInfo() {
         if (!streamUrls.isEmpty() && currentUrlIndex < streamNames.size()) {
+            int[] range = currentChannelRange();
+            int lines = range[1] - range[0] + 1;
             String name = streamNames.get(currentUrlIndex);
-            tvSourceInfo.setText(name + " (" + (currentUrlIndex + 1) + "/" + streamUrls.size() + ")");
+            if (lines > 1) {
+                int lineNo = currentUrlIndex - range[0] + 1;
+                tvSourceInfo.setText(name + " · 线路" + lineNo + "/" + lines);
+            } else {
+                tvSourceInfo.setText(name);
+            }
         } else if (!streamUrls.isEmpty()) {
             tvSourceInfo.setText("源 " + (currentUrlIndex + 1) + "/" + streamUrls.size() + ")");
         }
