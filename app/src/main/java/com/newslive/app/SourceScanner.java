@@ -180,7 +180,10 @@ public class SourceScanner {
                         if (i > 0) sb.append(",");
                         Chan c = picked.get(i);
                         sb.append("{\"name\":\"").append(esc(c.display))
-                          .append("\",\"url\":\"").append(esc(c.best)).append("\"}");
+                          .append("\",\"url\":\"").append(esc(c.best))
+                          .append("\",\"group\":\"").append(esc(c.group))
+                          .append("\",\"speed\":").append(Math.max(1, Math.round(c.bestSpeed)))
+                          .append("}");
                     }
                     sb.append("]}");
                     float median = allSpeed.get(allSpeed.size() / 2);
