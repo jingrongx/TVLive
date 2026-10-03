@@ -30,7 +30,7 @@ DEFAULT_CFG = {
     "subs": DEFAULT_SUBS,
     "concurrency": 30,
     "timeout": 15,
-    "min_speed": 250,
+    "min_speed": 1024,
     "top_n": 3,
     "proxy": "",
     "outdir": "",

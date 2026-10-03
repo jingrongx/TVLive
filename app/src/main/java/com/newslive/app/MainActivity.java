@@ -425,7 +425,13 @@ public class MainActivity extends AppCompatActivity {
         });
         btnLockOrientation.setOnClickListener(v -> toggleOrientationLock());
         btnOrientation.setOnClickListener(v -> toggleScreenOrientation());
-        btnChannelMenu.setOnClickListener(v -> showChannelMenu());
+        btnChannelMenu.setOnClickListener(v -> {
+            try { showChannelMenu(); }
+            catch (Exception menuEx) {
+                LogUtil.e("NewsLive", "节目单打开失败", menuEx);
+                Toast.makeText(this, "节目单打开失败，请重试", Toast.LENGTH_SHORT).show();
+            }
+        });
         btnSettings.setOnClickListener(v -> showSettingsDialog());
         btnExitApp.setOnClickListener(v -> confirmExit());
 
@@ -4938,6 +4944,37 @@ public class MainActivity extends AppCompatActivity {
         loadStreamFromConfig(currentUrlIndex);
     }
 
+    /** 安全切到网页模式并载入指定网站(兼容启动即播放器模式时 WebView 未初始化的情况) */
+    private void switchToWebSite(int siteIndex) {
+        if (!useWebMode) {
+            useWebMode = true;
+            prefs.edit().putBoolean(KEY_USE_WEB_MODE, true).apply();
+            cancelStreamRotation();
+            if (player != null) {
+                player.stop();
+                player.setPlayWhenReady(false);
+            }
+            if (webView == null) initWebView(); // 启动为播放器模式时 WebView 尚未创建
+            webView.setVisibility(View.VISIBLE);
+            playerContainer.setVisibility(View.GONE);
+            webView.onResume();
+            webView.resumeTimers();
+            webViewRetryCount = 0;
+        }
+        cancelWebViewTimeoutTimer();
+        cancelWebRefreshFallback();
+        stopWebVideoStallDetector();
+        silentRefreshPending = false;
+        fullscreenRetryCount = 0;
+        if (siteIndex >= 0 && siteIndex < webSiteUrls.size()) {
+            currentSiteIndex = siteIndex;
+            webSourceUrl = webSiteUrls.get(currentSiteIndex);
+            prefs.edit().putInt(KEY_CURRENT_SITE_INDEX, currentSiteIndex).apply();
+        }
+        loadWebSource();
+        updateWebChannelLabel();
+    }
+
     /** 频道节目单：左侧分组、右侧频道（速度分级着色），半透明暗色卡片，OK键/节目单按钮呼出 */
     private void showChannelMenu() {
         if (streamUrls.isEmpty()) {
@@ -5096,15 +5133,8 @@ public class MainActivity extends AppCompatActivity {
             int code = idxHolder.get(position);
             dialog.dismiss();
             if (code >= WEB_ENTRY_MARK) {
-                // 网页频道:必要时先切到网页模式,再载入选中的网址
-                int wIdx = code - WEB_ENTRY_MARK;
-                if (!useWebMode) switchMode();
-                if (wIdx < webSiteUrls.size()) {
-                    currentSiteIndex = wIdx;
-                    webSourceUrl = webSiteUrls.get(wIdx);
-                    prefs.edit().putInt(KEY_CURRENT_SITE_INDEX, currentSiteIndex).apply();
-                }
-                loadWebSource();
+                // 网页频道:安全切到网页模式(自动初始化WebView),再载入选中的网址
+                switchToWebSite(code - WEB_ENTRY_MARK);
             } else {
                 currentUrlIndex = code;
                 loadStreamFromConfig(code);
@@ -5146,7 +5176,7 @@ public class MainActivity extends AppCompatActivity {
         bar.setBackgroundColor(0xFF2196F3);
         bar.setPadding((int) (12 * density), (int) (8 * density), (int) (12 * density), (int) (8 * density));
         android.widget.TextView title = new android.widget.TextView(this);
-        title.setText("⚙ 设置（本机配置页 http://127.0.0.1:" + HTTP_PORT + "）");
+        title.setText("⚙ 设置 · 本机配置页");
         title.setTextColor(0xFFFFFFFF);
         title.setTextSize(15);
         android.widget.TextView close = new android.widget.TextView(this);
@@ -5168,6 +5198,15 @@ public class MainActivity extends AppCompatActivity {
                 .setView(root)
                 .create();
         close.setOnClickListener(v -> dialog.dismiss());
+        dialog.setOnShowListener(d -> {
+            android.view.Window w = dialog.getWindow();
+            if (w != null) {
+                // 手机竖屏全宽+90%高,白底——避免配置页内容挤压错乱
+                w.setLayout(android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        (int) (getResources().getDisplayMetrics().heightPixels * 0.92f));
+                w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0xFFFFFFFF));
+            }
+        });
         dialog.setOnDismissListener(d -> {
             wv.loadUrl("about:blank");
             wv.destroy();
@@ -5509,7 +5548,12 @@ public class MainActivity extends AppCompatActivity {
                         return super.dispatchKeyEvent(event);
                     }
                     // 面板关闭:OK 呼出节目单(市面直播App习惯)
-                    showChannelMenu();
+                    try {
+                        showChannelMenu();
+                    } catch (Exception menuEx) {
+                        LogUtil.e("NewsLive", "节目单打开失败", menuEx);
+                        Toast.makeText(this, "节目单打开失败，请重试", Toast.LENGTH_SHORT).show();
+                    }
                     return true;
 
                 case KeyEvent.KEYCODE_DPAD_LEFT:
@@ -5997,7 +6041,7 @@ public class MainActivity extends AppCompatActivity {
                 "<div class='tip' style='color:#2E7D32'>💡 高清流畅参考：1080p 需 ≥250KB/s，⚡ 标记（≥500KB/s）的台最稳；节目单里按速度着色可辨识。</div>" +
                 "<textarea id='scanSubs' rows='3' style='width:100%;box-sizing:border-box;font-size:12px'>https://vbskycn.github.io/iptv/tv/iptv4.txt\nhttps://iptv-org.github.io/iptv/countries/cn.m3u</textarea>" +
                 "<div class='buffer-inputs' style='margin-top:6px'>" +
-                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>淘汰线 KB/s（1080p 建议 250+）</label><input type='number' id='scanMin' value='250'></div>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>淘汰线 KB/s</label><input type='number' id='scanMin' value='1024'></div>" +
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>并发数</label><input type='number' id='scanConc' value='15'></div>" +
                 "</div>" +
                 "<div class='btn-group'><button class='btn-fetch' id='scanBtn' onclick='startScan()'>🚀 开始优选</button>" +
