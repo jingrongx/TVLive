@@ -4920,7 +4920,7 @@ public class MainActivity extends AppCompatActivity {
         loadStreamFromConfig(currentUrlIndex);
     }
 
-    /** 频道节目单：左侧分组、右侧频道（显示测速），点击直接播放。OK键/节目单按钮呼出 */
+    /** 频道节目单：左侧分组、右侧频道（速度分级着色），半透明暗色卡片，OK键/节目单按钮呼出 */
     private void showChannelMenu() {
         if (streamUrls.isEmpty()) {
             Toast.makeText(this, "暂无直播源，请先在设置页优选或添加源", Toast.LENGTH_LONG).show();
@@ -4937,29 +4937,49 @@ public class MainActivity extends AppCompatActivity {
         final String[] selGroup = {groups.get(0)};
 
         LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.HORIZONTAL);
-        int pad = (int) (12 * density);
-        root.setPadding(pad, pad, pad, pad);
+        root.setOrientation(LinearLayout.VERTICAL);
+
+        // 标题栏（含遥控器操作提示）
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setBackgroundColor(0xE6145DA0);
+        bar.setPadding((int) (12 * density), (int) (8 * density), (int) (12 * density), (int) (8 * density));
+        android.widget.TextView title = new android.widget.TextView(this);
+        title.setText("📺 节目单 · " + streamUrls.size() + " 频道      OK=播放  返回=关闭");
+        title.setTextColor(0xFFFFFFFF);
+        title.setTextSize(14);
+        bar.addView(title);
+
+        // 内容行：左分组 + 右频道
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.HORIZONTAL);
+        int pad = (int) (10 * density);
+        content.setPadding(pad, pad, pad, pad);
 
         ListView lvGroups = new ListView(this);
         LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(
-                (int) (106 * density), LinearLayout.LayoutParams.MATCH_PARENT);
+                (int) (108 * density), LinearLayout.LayoutParams.MATCH_PARENT);
         glp.rightMargin = (int) (8 * density);
         lvGroups.setLayoutParams(glp);
         lvGroups.setDivider(null);
+        lvGroups.setVerticalScrollBarEnabled(false);
 
         ListView lvChannels = new ListView(this);
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.MATCH_PARENT, 1f);
         lvChannels.setLayoutParams(clp);
+        lvChannels.setDivider(new android.graphics.drawable.ColorDrawable(0x30FFFFFF));
+        lvChannels.setDividerHeight(1);
 
-        root.addView(lvGroups);
-        root.addView(lvChannels);
+        content.addView(lvGroups);
+        content.addView(lvChannels);
+        root.addView(bar, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        root.addView(content, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT));
 
         android.app.AlertDialog dialog = new android.app.AlertDialog.Builder(this)
-                .setTitle("节目单（" + streamUrls.size() + " 个频道）")
                 .setView(root)
-                .setNegativeButton("关闭", null)
                 .create();
 
         final java.util.List<Integer> idxHolder = new java.util.ArrayList<>();
@@ -4969,11 +4989,12 @@ public class MainActivity extends AppCompatActivity {
                     public View getView(int position, View convertView, ViewGroup parent) {
                         View v = super.getView(position, convertView, parent);
                         android.widget.TextView tv = v.findViewById(android.R.id.text1);
+                        tv.setTextSize(14);
                         if (groups.get(position).equals(selGroup[0])) {
-                            tv.setTextColor(0xFF2196F3);
+                            tv.setTextColor(0xFF4FC3F7);
                             tv.setTypeface(null, android.graphics.Typeface.BOLD);
                         } else {
-                            tv.setTextColor(0xFF333333);
+                            tv.setTextColor(0xFFCCCCCC);
                             tv.setTypeface(null, android.graphics.Typeface.NORMAL);
                         }
                         return v;
@@ -4987,31 +5008,44 @@ public class MainActivity extends AppCompatActivity {
                 if (g == null || g.isEmpty()) g = "其他";
                 if ("全部".equals(selGroup[0]) || selGroup[0].equals(g)) idxHolder.add(i);
             }
-            java.util.List<String> rows = new java.util.ArrayList<>();
+            java.util.List<android.text.SpannableString> rows = new java.util.ArrayList<>();
             for (int idx : idxHolder) {
-                String speed = (idx < streamSpeeds.size() && streamSpeeds.get(idx) > 0)
-                        ? streamSpeeds.get(idx) + "KB/s" : "";
-                String mark = idx == currentUrlIndex ? "▶ " : "    ";
-                rows.add(mark + streamNames.get(idx) + (speed.isEmpty() ? "" : "  「" + speed + "」"));
+                int sp = idx < streamSpeeds.size() ? streamSpeeds.get(idx) : 0;
+                String mark = idx == currentUrlIndex ? "▶ " : "";
+                String base = mark + streamNames.get(idx);
+                String speedTxt;
+                int speedColor;
+                if (sp >= 500) { speedTxt = "   ⚡ " + sp + "KB/s"; speedColor = 0xFF8BC34A; }        // 快:绿
+                else if (sp >= 200) { speedTxt = "   " + sp + "KB/s"; speedColor = 0xFFFFD54F; }      // 中:黄
+                else if (sp > 0) { speedTxt = "   " + sp + "KB/s"; speedColor = 0xFFFFAB91; }         // 慢:橙
+                else { speedTxt = "   —"; speedColor = 0xFF78909C; }                                   // 无数据:灰
+                android.text.SpannableString ss = new android.text.SpannableString(base + speedTxt);
+                ss.setSpan(new android.text.style.ForegroundColorSpan(speedColor),
+                        base.length(), ss.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                rows.add(ss);
             }
-            android.widget.ArrayAdapter<String> chAdapter =
-                    new android.widget.ArrayAdapter<String>(MainActivity.this,
+            android.widget.ArrayAdapter<android.text.SpannableString> chAdapter =
+                    new android.widget.ArrayAdapter<android.text.SpannableString>(MainActivity.this,
                             android.R.layout.simple_list_item_1, rows) {
                         @Override
                         public View getView(int position, View convertView, ViewGroup parent) {
                             View v = super.getView(position, convertView, parent);
                             android.widget.TextView tv = v.findViewById(android.R.id.text1);
-                            if (idxHolder.get(position) == currentUrlIndex) {
-                                tv.setTextColor(0xFF2196F3);
+                            tv.setTextSize(14);
+                            boolean cur = idxHolder.get(position) == currentUrlIndex;
+                            if (cur) {
+                                tv.setTextColor(0xFF4FC3F7);
+                                tv.setTypeface(null, android.graphics.Typeface.BOLD);
                             } else {
-                                tv.setTextColor(0xFFEEEEEE);
+                                tv.setTextColor(0xFFE0E0E0);
+                                tv.setTypeface(null, android.graphics.Typeface.NORMAL);
                             }
                             return v;
                         }
                     };
             lvChannels.setAdapter(chAdapter);
             int cur = idxHolder.indexOf(currentUrlIndex);
-            if (cur >= 0) lvChannels.setSelection(Math.max(cur - 3, 0));
+            if (cur >= 0) lvChannels.setSelection(Math.max(cur - 2, 0));
         };
 
         lvGroups.setAdapter(groupAdapter);
@@ -5026,6 +5060,22 @@ public class MainActivity extends AppCompatActivity {
             loadStreamFromConfig(currentUrlIndex);
         });
 
+        dialog.setOnShowListener(d -> {
+            android.view.Window w = dialog.getWindow();
+            if (w != null) {
+                w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0xE6101010));
+                android.view.WindowManager.LayoutParams lp = w.getAttributes();
+                lp.width = (int) (getResources().getDisplayMetrics().widthPixels * 0.86f);
+                lp.height = (int) (getResources().getDisplayMetrics().heightPixels * 0.74f);
+                w.setAttributes(lp);
+            }
+            // 遥控器：焦点直接落在频道列表并定位到当前台
+            lvChannels.post(() -> {
+                lvChannels.requestFocus();
+                int cur = idxHolder.indexOf(currentUrlIndex);
+                if (cur >= 0) lvChannels.setSelection(Math.max(cur - 2, 0));
+            });
+        });
         dialog.show();
         updateChannels.run();
     }
@@ -5184,6 +5234,10 @@ public class MainActivity extends AppCompatActivity {
         if (controlPanel != null) {
             controlPanel.setVisibility(View.VISIBLE);
             isControlVisible = true;
+            // 遥控器:面板打开后焦点落到第一个按钮,方向键即可导航全部按钮
+            if (isTelevisionDevice() && btnPrevSource != null) {
+                btnPrevSource.post(() -> btnPrevSource.requestFocus());
+            }
         }
         updatePortraitPlayOverlay();
     }
