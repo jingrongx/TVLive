@@ -99,7 +99,9 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_MANUAL_LOCATION = "manual_location"; // 手动配置地区（空=自动IP定位）
     private static final int HTTP_PORT = 8765;
     
-    private static final String DEFAULT_REMOTE_URL = "https://gitee.com/xujingrong/tv-live-config/raw/master/tv-live-source.json";
+    private static final String DEFAULT_REMOTE_URL = "https://gitee.com/xujingrong/tv-live-config/releases/download/live/tv_live_config.json";
+    /** 旧版 gitee raw 地址（raw 下载受限），loadSavedConfig 时自动迁移到 release 直链 */
+    private static final String LEGACY_REMOTE_URL = "https://gitee.com/xujingrong/tv-live-config/raw/master/tv-live-source.json";
     private static final String DEFAULT_WEB_SOURCE_URL = "https://m-live.cctvnews.cctv.com/live/landscape.html?liveRoomNumber=16265686808730585228";
     
     // [名称, URL, 启用标记] "1"=启用 "0"=停用，启动时加载到 webSiteNames/webSiteUrls/webSiteEnabled
@@ -165,6 +167,9 @@ public class MainActivity extends AppCompatActivity {
     private SharedPreferences prefs;
     private String remoteConfigUrl = "";
     private boolean autoUpdateConfig = false;
+    // 直播源自动优选（App 内置检测引擎）
+    private SourceScanner activeScanner = null;
+    private volatile String scanStatusJson = "{\"running\":false}";
     private boolean isPlaying = false;
     private boolean isControlVisible = true;
     private Runnable hideControlRunnable;
@@ -1189,6 +1194,11 @@ public class MainActivity extends AppCompatActivity {
 
     private void loadSavedConfig() {
         remoteConfigUrl = prefs.getString(KEY_REMOTE_URL, DEFAULT_REMOTE_URL);
+        // 旧版 gitee raw 地址下载受限，静默迁移到 release 直链
+        if (LEGACY_REMOTE_URL.equals(remoteConfigUrl)) {
+            remoteConfigUrl = DEFAULT_REMOTE_URL;
+            prefs.edit().putString(KEY_REMOTE_URL, remoteConfigUrl).apply();
+        }
         autoUpdateConfig = prefs.getBoolean(KEY_AUTO_UPDATE, false);
         bufferMinMs = prefs.getInt(KEY_BUFFER_MIN, 10000);
         bufferMaxMs = prefs.getInt(KEY_BUFFER_MAX, 60000);
@@ -2641,6 +2651,63 @@ public class MainActivity extends AppCompatActivity {
                 );
             }
         });
+    }
+
+    /** 直播源自动优选：解析 /scan_start 请求并启动内置检测引擎（单例防重入） */
+    private String handleScanStart(String request) {
+        try {
+            String query = request.contains("?") ? request.split("\\?")[1].split(" ")[0] : "";
+            String subsParam = "";
+            int min = 80, conc = 15;
+            for (String kv : query.split("&")) {
+                if (kv.startsWith("subs=")) subsParam = java.net.URLDecoder.decode(kv.substring(5), "UTF-8");
+                else if (kv.startsWith("min=")) min = Integer.parseInt(kv.substring(4));
+                else if (kv.startsWith("conc=")) conc = Integer.parseInt(kv.substring(5));
+            }
+            String[] subs = subsParam.split("\\|");
+            java.util.List<String> valid = new java.util.ArrayList<>();
+            for (String s : subs) if (s.startsWith("http")) valid.add(s.trim());
+            if (valid.isEmpty()) return "{\"status\":\"error\",\"msg\":\"没有有效订阅URL\"}";
+            if (activeScanner != null && activeScanner.isRunning()) {
+                return "{\"status\":\"running\"}";
+            }
+            activeScanner = new SourceScanner();
+            scanStatusJson = "{\"running\":true,\"phase\":\"启动\",\"cur\":0,\"total\":0,\"msg\":\"\"}";
+            final java.util.List<String> fSubs = valid;
+            final int fMin = min, fConc = conc;
+            activeScanner.scan(fSubs.toArray(new String[0]), fConc, fMin, new SourceScanner.Callback() {
+                @Override
+                public void onProgress(String phase, int cur, int total, String msg) {
+                    scanStatusJson = "{\"running\":true,\"phase\":\"" + jsonEsc(phase)
+                            + "\",\"cur\":" + cur + ",\"total\":" + total
+                            + ",\"msg\":\"" + jsonEsc(msg) + "\"}";
+                }
+
+                @Override
+                public void onDone(String configJson, int channels, int medianKB) {
+                    scanStatusJson = "{\"running\":false,\"done\":true,\"channels\":" + channels
+                            + ",\"median\":" + medianKB + "}";
+                    try {
+                        updateConfig(configJson); // 复用现有逻辑：parseConfig + 保存 + 刷新播放
+                    } catch (Exception e) {
+                        LogUtil.e("scan", "应用优选结果失败: " + e);
+                    }
+                }
+
+                @Override
+                public void onError(String msg) {
+                    scanStatusJson = "{\"running\":false,\"error\":\"" + jsonEsc(msg) + "\"}";
+                }
+            });
+            return "{\"status\":\"started\",\"subs\":" + fSubs.size() + "}";
+        } catch (Exception e) {
+            return "{\"status\":\"error\",\"msg\":\"" + e.getMessage() + "\"}";
+        }
+    }
+
+    private static String jsonEsc(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ").replace("\r", "");
     }
 
     private void startHttpServer() {
@@ -5465,6 +5532,13 @@ public class MainActivity extends AppCompatActivity {
                     String proxyResult = fetchUrlContent(proxyUrl);
                     String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + proxyResult;
                     client.getOutputStream().write(response.getBytes());
+                } else if (request != null && request.startsWith("GET") && request.contains("/scan_start")) {
+                    String resp = handleScanStart(request);
+                    String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + resp;
+                    client.getOutputStream().write(response.getBytes());
+                } else if (request != null && request.startsWith("GET") && request.contains("/scan_status")) {
+                    String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + scanStatusJson;
+                    client.getOutputStream().write(response.getBytes());
                 } else {
                     String html = getHtmlPage();
                     String response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + html;
@@ -5583,6 +5657,17 @@ public class MainActivity extends AppCompatActivity {
                 "<div id='sources'></div>" +
                 "<button class='btn-add' onclick='addSource()'>+ 添加直播源</button>" +
                 "</div>" +
+                "<div class='section' style='background:#EDE7F6;border:1px solid #7E57C2'>" +
+                "<div class='section-title'>🔍 直播源自动优选（App 内置检测）</div>" +
+                "<div class='tip'>拉取订阅 → 逐条连通验证与分片测速 → 每频道保留最快线路 → 自动替换上方直播源列表。建议在 WiFi 下运行，约 1~3 分钟；移动数据下测速结果仅代表当前网络。</div>" +
+                "<textarea id='scanSubs' rows='3' style='width:100%;box-sizing:border-box;font-size:12px'>https://vbskycn.github.io/iptv/tv/iptv4.txt\nhttps://iptv-org.github.io/iptv/countries/cn.m3u</textarea>" +
+                "<div class='buffer-inputs' style='margin-top:6px'>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>淘汰线 KB/s</label><input type='number' id='scanMin' value='80'></div>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>并发数</label><input type='number' id='scanConc' value='15'></div>" +
+                "</div>" +
+                "<div class='btn-group'><button class='btn-fetch' id='scanBtn' onclick='startScan()'>🚀 开始优选</button></div>" +
+                "<div id='scanProgress' class='tip' style='text-align:left'></div>" +
+                "</div>" +
                 "<div class='group-header'>⚙️ 系统设置区</div>" +
                 "<div class='section'>" +
                 "<div class='section-title'>⏱️ 缓冲设置 (毫秒)</div>" +
@@ -5700,6 +5785,31 @@ public class MainActivity extends AppCompatActivity {
                 "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>alert('保存成功！')).catch(e=>alert('保存失败:'+e));}" +
                 "renderSources();" +
                 "renderWebsites();" +
+                "var scanTimer=null;" +
+                "function startScan(){" +
+                "  var subs=document.getElementById('scanSubs').value.split('\\n').map(function(s){return s.trim();}).filter(function(s){return s.indexOf('http')===0;});" +
+                "  if(!subs.length){alert('请先填写订阅URL');return;}" +
+                "  if(!confirm('开始优选?将逐条连通验证与测速(约1~3分钟),完成后自动替换直播源列表。'))return;" +
+                "  document.getElementById('scanBtn').disabled=true;" +
+                "  var q='/scan_start?min='+(parseInt(document.getElementById('scanMin').value)||80)+'&conc='+(parseInt(document.getElementById('scanConc').value)||15)+'&subs='+encodeURIComponent(subs.join('|'));" +
+                "  fetch(q).then(function(r){return r.json();}).then(function(d){" +
+                "    if(d.status==='error'){alert(d.msg||'启动失败');document.getElementById('scanBtn').disabled=false;return;}" +
+                "    if(d.status==='running'){alert('已有优选任务在运行');document.getElementById('scanBtn').disabled=false;return;}" +
+                "    pollScan();" +
+                "  }).catch(function(e){alert('启动失败:'+e);document.getElementById('scanBtn').disabled=false;});" +
+                "}" +
+                "function pollScan(){" +
+                "  if(scanTimer)clearInterval(scanTimer);" +
+                "  scanTimer=setInterval(function(){" +
+                "    fetch('/scan_status').then(function(r){return r.json();}).then(function(d){" +
+                "      var box=document.getElementById('scanProgress');" +
+                "      if(d.error){clearInterval(scanTimer);box.innerHTML='<span style=\"color:#C62828\">❌ '+d.error+'</span>';document.getElementById('scanBtn').disabled=false;return;}" +
+                "      if(!d.running&&d.done){clearInterval(scanTimer);box.innerHTML='✅ 优选完成:'+d.channels+' 个频道(中位 '+d.median+' KB/s),已自动替换直播源列表';alert('优选完成:'+d.channels+' 个频道(中位 '+d.median+' KB/s),已自动替换直播源列表并开始播放');setTimeout(function(){location.reload();},1500);return;}" +
+                "      var pct=d.total>0?Math.round(d.cur/d.total*100):0;" +
+                "      box.innerHTML='⏳ '+d.phase+' '+d.cur+'/'+d.total+' ('+pct+'%) '+(d.msg||'');" +
+                "    }).catch(function(){});" +
+                "  },1000);" +
+                "}" +
                 "</script></body></html>";
         }
     }

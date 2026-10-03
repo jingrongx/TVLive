@@ -1,6 +1,6 @@
 # 新闻直播 (NewsLive)
 
-Android TV / 手机直播应用，聚合央视多频道直播源，支持开机自启动、区县级定位天气、遥控器与触屏双模式操作。
+Android TV / 手机直播应用 + Windows 桌面源筛选工具。App 聚合央视多频道直播源，支持开机自启动、区县级定位天气、遥控器与触屏双模式操作；**内置直播源自动优选引擎**，配合桌面端工具与 Gitee Release 自动发版，实现"订阅 → 验证 → 测速 → 优选 → 下发"全自动源维护。
 
 ## 主要功能
 
@@ -45,6 +45,44 @@ Android TV / 手机直播应用，聚合央视多频道直播源，支持开机�
 - 缓冲参数、手动地区设置（带实时查询验证）
 - 远程配置 URL + 启动自动更新
 
+### 直播源自动优选（App 内置检测引擎）
+- 配置页（浏览器）新增「🔍 直播源自动优选」区块：填订阅 URL（TVBox txt / m3u 均可，已预填两个持续维护的聚合源）
+- 一键启动：拉取订阅 → 逐条连通验证（m3u8 追到分片）→ 分片级测速（HLS 按分片大小÷耗时计速）→ 频道名归一化合并 → 按分组排序 → **每频道保留最快 1 条线路** → 自动替换直播源列表并开始播放
+- 参数可调：淘汰速度线（默认 80 KB/s）、并发数（默认 15）；支持中途停止（重新进配置页再点即可）
+- 建议 WiFi 环境运行，约 1~3 分钟；进度实时显示在页面
+
+### 远程下发（Gitee Release 直链，无下载限制）
+- App 内置远程配置机制：配置页填「远程配置 URL」+ 勾选「启动时自动更新」→ 每次启动自动拉取最新优选结果
+- 默认地址（Gitee Release 附件直链，**无 raw 下载限制**，已实测匿名 200）：
+  `https://gitee.com/xujingrong/tv-live-config/releases/download/live/tv_live_config.json`
+- 固定 tag `live` 方案：桌面工具每次发布 = 删除旧 release → 同 tag 重建 → 上传新附件，**URL 永不变，无版本号匹配问题**
+- 旧版 gitee raw 地址（`.../raw/master/tv-live-source.json`）已内置迁移逻辑，升级 App 后自动切到新地址
+- 也支持局域网下发：任意静态 HTTP 服务指向该文件，App 远程 URL 填 `http://<PC_IP>:<端口>/tv_live_config.json`（App 已允许明文 HTTP）
+
+## IPTV 源筛选工具（Windows 桌面版）
+
+仓库 `iptv_tool/` 目录，单文件免安装 exe（PyInstaller 打包），双击即用。
+
+### 功能
+- **多订阅管理**：每行一个 URL，同时支持 TVBox txt 与 m3u 格式，预填两个持续维护的聚合源
+- **全自动筛选**：拉取订阅 → 逐条连通验证（m3u8 追到分片级）→ 分片级测速（HLS 按「分片大小÷下载耗时」计速，规避分片间隙假低速）→ 频道名归一化合并（CCTV-1综合 → CCTV1）→ 自动 12 分组（央视/卫视/电影/体育/少儿/纪录/音乐/春晚/港澳台及国际/地方/其他/海外）→ 每频道保留最快 N 条线路
+- **Gitee 自动发版**：填入 Gitee 私人令牌后，筛选完成自动上传 `tv_live_config.json` 到 release 附件（固定 tag 覆盖更新），也可单独点「立即发布」
+- **产物**：`final_live.txt`（精选订阅）、`final_live_full.txt`（完整订阅）、`tv_live_config.json`（App 配置格式）、`report.md`（全量明细+每频道线路速度）
+- 参数可调：并发数、超时、淘汰速度线（默认 80 KB/s）、每频道保留线路数；支持代理与中途停止；设置持久化（config.json）
+
+### 使用流程
+1. 双击 exe（或从 Releases 下载）→ 点「开始筛选」（约 1 分钟）
+2. 完成后自动发布到 Gitee Release（已配置 token 时），App 重启即拿到最新源
+3. 结果浏览页可按分组查看频道与线路速度，明细见 `report.md`
+
+### 本地构建（Python 3.10+）
+```bash
+cd iptv_tool
+pip install aiohttp pyinstaller pillow
+pyinstaller --onefile --noconsole --clean --name IPTVSourceTool --icon app.ico main.py
+# 产物: dist/IPTVSourceTool.exe
+```
+
 ## 配置文件格式
 
 本地配置页与远程配置（JSON）字段一致：
@@ -65,7 +103,7 @@ Android TV / 手机直播应用，聚合央视多频道直播源，支持开机�
   "bannerFontSize": 13,
   "bannerHeight": 28,
   "manualLocation": "江西省抚州市临川区",
-  "remoteUrl": "https://gitee.com/xujingrong/tv-live-config/raw/master/tv-live-source.json",
+  "remoteUrl": "https://gitee.com/xujingrong/tv-live-config/releases/download/live/tv_live_config.json",
   "autoUpdate": true
 }
 ```
@@ -83,30 +121,33 @@ Android TV / 手机直播应用，聚合央视多频道直播源，支持开机�
 | `remoteUrl` / `autoUpdate` | 远程配置地址与启动自动更新 |
 
 > **v1.0.6 起**：移除 `playerVideoUrls` 字段（与 `sources` 功能重复，App 已不再读取，远程配置中保留也不会报错）。
+>
+> **远程配置按字段合并**：JSON 里只放 `sources` 不会覆盖其他设置——`tv_live_config.json` 即只含 `sources` + `playerModeEnabled`。
 
 ## 技术栈
 
-- **语言**: Java
-- **最低 SDK**: 21 (Android 5.0)
-- **目标 SDK**: 28 (Android 9.0)
-- **播放器**: AndroidX Media3 / ExoPlayer 1.2.1
-- **构建工具**: Gradle 8.14.3
+- **App**: Java，minSdk 21 (Android 5.0)，targetSdk 28，AndroidX Media3 / ExoPlayer 1.2.1，Gradle 8.14.3
+- **桌面工具**: Python 3（tkinter + aiohttp），PyInstaller 单文件打包
 - **签名**: release keystore 签名
 
 ## 项目结构
 
 ```
 app/src/main/java/com/newslive/app/
-├── MainActivity.java      # 主界面、播放逻辑、无缝续播、配置管理
+├── MainActivity.java      # 主界面、播放逻辑、无缝续播、配置管理、HTTP 配置面板
+├── SourceScanner.java     # 直播源自动优选引擎（下载订阅/连通验证/分片测速/归一化分类）
 ├── BootReceiver.java      # 开机自启动接收器
 ├── LunarCalendar.java     # 农历日期计算
-└── ShichenUtil.java       # 时辰计算工具
+├── ShichenUtil.java       # 时辰计算工具
+└── LogUtil.java           # 日志工具
 
-app/src/main/res/
-├── layout/activity_main.xml        # 主布局（WebView + ExoPlayer + 多行横幅 + 换台遮罩）
-└── drawable/ic_swap_mode.xml       # 切换模式图标
+iptv_tool/                          # Windows 桌面 IPTV 源筛选工具
+├── main.py                         # 全部逻辑（GUI + 检测引擎 + CLI 模式 + Gitee 发版）
+├── app.ico                         # 应用图标
+└── dist/IPTV源筛选工具.exe          # 构建产物（CI 同步发布到 Releases）
 
-version.properties          # 版本号配置（CI 自动递增）
+.github/workflows/build-release.yml # CI：APK + exe 一起发版
+version.properties                  # 版本号配置（CI 自动递增）
 ```
 
 ## 构建
@@ -120,21 +161,31 @@ version.properties          # 版本号配置（CI 自动递增）
 
 ### CI 自动构建发版
 
-项目配置了 GitHub Action（`.github/workflows/build-release.yml`）：
-- **触发条件**: push 到 main 分支
-- **自动流程**: 打包 → 签名 → 发版 → 版本号递增
-- **APK 命名**: `newslive-v<版本号>.apk`
-- **Release Notes**: 自动使用 commit 内容生成
-- **版本递增**: 每次发版后 VERSION_CODE +1，VERSION_NAME patch +1
+项目配置了 GitHub Action（`.github/workflows/build-release.yml`），**push 到 main 分支自动把 APK 和桌面工具一起发版**：
+
+| Job | 环境 | 产物 |
+|---|---|---|
+| `build-release` | ubuntu-latest | `newslive-v<版本号>.apk`（签名 release） |
+| `build-tool` | windows-latest | `IPTVSourceTool.exe`（PyInstaller 单文件） |
+
+- **触发条件**: push 到 main 分支（也支持手动 workflow_dispatch）
+- **自动流程**: APK 打包签名 → exe 打包 → 两个产物上传到**同一个 GitHub Release** → 版本号递增（VERSION_CODE +1，patch +1）并提交回仓库
+- **Release Notes**: 自动使用本次 push 的 commit 内容生成，并附 APK/工具下载说明
+- **工具图标**: `iptv_tool/app.ico` 随仓库提交，CI 打包时直接使用
 
 下载地址：[Releases 页面](https://github.com/jingrongx/TVLive/releases)
 
 ## 安装
 
-1. 从 [Releases](https://github.com/jingrongx/TVLive/releases) 下载最新 APK
+**App（Android TV / 手机）**
+1. 从 [Releases](https://github.com/jingrongx/TVLive/releases) 下载最新 `newslive-v*.apk`
 2. 在 Android TV/手机上安装（需允许"安装未知来源应用"）
 3. 启动应用，首次使用可设置为默认桌面/开机自启动
 4. 手机浏览器打开控制面板显示的配置地址（如 `http://192.168.x.x:8765`）可修改频道/源/地区等设置
+5. 配置页「直播源自动优选」可一键优选；或在「远程配置」填 Gitee Release 直链开启自动更新
+
+**桌面工具（Windows）**
+- 从 Releases 下载 `IPTVSourceTool.exe`，双击即用（免安装）；填入 Gitee 令牌后筛选完成自动发版
 
 ## 仓库
 

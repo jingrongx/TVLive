@@ -15,6 +15,10 @@ jobs:
       contents: write      # 创建 Release 和提交 version.properties
       packages: write
 
+    outputs:
+      tag: v${{ steps.read_version.outputs.version_name }}
+      version_name: ${{ steps.read_version.outputs.version_name }}
+
     steps:
       # 1. 检出代码
       - name: Checkout code
@@ -93,8 +97,12 @@ jobs:
             echo "### 更新内容"
             echo "$COMMIT_MSG"
             echo ""
+            echo "### 下载"
+            echo "- 📱 **newslive-v*.apk** — Android TV / 手机 App(播放器+网页双模式,内置直播源自动优选)"
+            echo "- 🖥 **IPTVSourceTool.exe** — Windows 桌面 IPTV 源筛选工具(下载订阅→连通验证→分片测速→优选输出→Gitee 自动发版)"
+            echo ""
             echo "### 安装方法"
-            echo "下载下方 APK 文件，在手机/电视上点击安装（需允许\"安装未知来源应用\"）。"
+            echo "下载 APK 在手机/电视上安装(需允许\"安装未知来源应用\");桌面工具免安装,双击即用。"
           } > release_notes.md
 
           echo "Release notes generated:"
@@ -155,3 +163,49 @@ jobs:
           echo "- 版本: ${{ steps.read_version.outputs.version_name }} (build ${{ steps.read_version.outputs.version_code }})" >> $GITHUB_STEP_SUMMARY
           echo "- APK: $(basename $APK_PATH)" >> $GITHUB_STEP_SUMMARY
           echo "- Release: v${{ steps.read_version.outputs.version_name }}" >> $GITHUB_STEP_SUMMARY
+
+  # Windows 上打包 IPTV 源筛选工具(单文件 exe),并上传到同一个 Release
+  build-tool:
+    runs-on: windows-latest
+    needs: build-release
+
+    permissions:
+      contents: write
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. 配置 Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 3. 安装依赖
+      - name: Install dependencies
+        run: pip install aiohttp pyinstaller pillow
+
+      # 4. PyInstaller 打包单文件 exe
+      - name: Build IPTVSourceTool.exe
+        working-directory: iptv_tool
+        run: pyinstaller --onefile --noconsole --clean --name IPTVSourceTool --icon app.ico main.py
+
+      # 5. 验证产物
+      - name: Verify exe
+        run: Get-ChildItem iptv_tool/dist
+
+      # 6. 上传到 APK 同一个 Release(attachment 追加)
+      - name: Upload exe to Release
+        env:
+          GH_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.build-release.outputs.tag }}" "iptv_tool/dist/IPTVSourceTool.exe" --clobber --repo ${{ github.repository }}
+
+      # 7. 构建结果摘要
+      - name: Build summary
+        run: |
+          echo "## IPTV 源筛选工具构建完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 产物: IPTVSourceTool.exe(单文件免安装)" >> $GITHUB_STEP_SUMMARY
+          echo "- 已上传到 Release: ${{ needs.build-release.outputs.tag }}" >> $GITHUB_STEP_SUMMARY

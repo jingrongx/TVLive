@@ -38,3 +38,11 @@ keystore_b64.txt
 
 # WorkBuddy 本地数据
 .workbuddy/
+
+# IPTV 源筛选工具(Python)
+__pycache__/
+iptv_tool/build/
+iptv_tool/dist/
+iptv_tool/output/
+iptv_tool/.venv_gui/
+iptv_tool/*.spec
