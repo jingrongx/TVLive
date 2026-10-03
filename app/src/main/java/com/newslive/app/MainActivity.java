@@ -177,9 +177,6 @@ public class MainActivity extends AppCompatActivity {
     // 频道菜单数据：分组与测速（与 streamNames/streamUrls 平行）
     private final java.util.List<String> streamGroups = new java.util.ArrayList<>();
     private final java.util.List<Integer> streamSpeeds = new java.util.ArrayList<>();
-    // 网页模式虚拟鼠标(遥控器方向键移动光标,OK=点击光标处)
-    private android.widget.TextView mouseCursor;
-    private float mouseX = -1, mouseY = -1;
     /** 节目单里网页频道的编码基数: idx>=此值表示网页频道(实际网页索引=idx-此值) */
     private static final int WEB_ENTRY_MARK = 100000;
     private boolean isPlaying = false;
@@ -1093,8 +1090,9 @@ public class MainActivity extends AppCompatActivity {
                     "    if (video.querySelector('source')) {" +
                     "      src = video.querySelector('source').src || src;" +
                     "    }" +
-                    "    if (src && src.indexOf('blob:') === -1 && window.AndroidVideoBridge) {" +
-                    "      window.AndroidVideoBridge.onVideoPlaying(src);" +
+                    "    var finalSrc = (src && src.indexOf('blob:') === 0) ? (window.__sniffedUrl || '') : src;" +
+                    "    if (finalSrc && window.AndroidVideoBridge) {" +
+                    "      window.AndroidVideoBridge.onVideoPlaying(finalSrc);" +
                     "    }" +
                     "    video.removeEventListener('playing', onPlay, true);" +
                     "    video.removeEventListener('play', onPlay, true);" +
@@ -2913,6 +2911,11 @@ public class MainActivity extends AppCompatActivity {
                     boolean isStream = lower.endsWith(".m3u8") || lower.contains(".m3u8?")
                         || lower.endsWith(".mp4") || lower.contains(".mp4?")
                         || lower.endsWith(".flv") || lower.contains(".flv?");
+                    // 字节系视频存储(TOS)特征:红果短剧网页版用 MSE 播放,分片是
+                    // fetch 拉取的标准 MP4(URL 无后缀,ct=video/mp4),按路径特征嗅探
+                    if (!isStream && (lower.contains("/video/tos/") || lower.contains("qznovelvod.com"))) {
+                        isStream = true;
+                    }
                     if (isStream) {
                         long now = System.currentTimeMillis();
                         // 防抖：切换频道后允许第一次嗅探，之后10秒内不重复触发（避免master+子流重复）
@@ -2922,6 +2925,14 @@ public class MainActivity extends AppCompatActivity {
                         if (lastDetectedVideoUrl.isEmpty() || now - lastSniffTime > 10000) {
                             LogUtil.d("NewsLive", "Sniffed candidate stream: " + url);
                             candidateVideoUrl = url;
+                            // 把候选地址注入页面:红果等 MSE 播放器 video.currentSrc 是 blob:,
+                            // 播放回调上报时需要回退到嗅探地址(见各 playing 监听器的 __sniffedUrl)
+                            final String sniffedJs = url.replace("\\", "\\\\").replace("'", "\'");
+                            runOnUiThread(() -> {
+                                if (webView != null) {
+                                    webView.evaluateJavascript("window.__sniffedUrl='" + sniffedJs + "';", null);
+                                }
+                            });
                             lastSniffTime = now;
                             // 按清晰度变体记录最新候选地址（供403快速恢复/主动轮换优先选择标清）
                             String variant = extractVariantName(url);
@@ -3238,8 +3249,9 @@ public class MainActivity extends AppCompatActivity {
             "    if (video.querySelector('source')) {" +
             "      src = video.querySelector('source').src || src;" +
             "    }" +
-            "    if (src && src.indexOf('blob:') === -1 && window.AndroidVideoBridge) {" +
-            "      window.AndroidVideoBridge.onVideoPlaying(src);" +
+            "    var finalSrc = (src && src.indexOf('blob:') === 0) ? (window.__sniffedUrl || '') : src;" +
+            "    if (finalSrc && window.AndroidVideoBridge) {" +
+            "      window.AndroidVideoBridge.onVideoPlaying(finalSrc);" +
             "    }" +
             "  } catch(e) {}" +
             "}" +
@@ -5266,52 +5278,6 @@ public class MainActivity extends AppCompatActivity {
         wv.loadUrl("http://127.0.0.1:" + HTTP_PORT);
     }
 
-    // ---------- 网页模式虚拟鼠标 ----------
-
-    private void ensureMouseCursor() {
-        if (mouseCursor != null) return;
-        FrameLayout rootLayout = findViewById(R.id.root_layout);
-        mouseCursor = new android.widget.TextView(this);
-        mouseCursor.setText("◉");
-        mouseCursor.setTextColor(0xD9FFFFFF);
-        mouseCursor.setTextSize(20);
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
-        mouseCursor.setLayoutParams(lp);
-        rootLayout.addView(mouseCursor);
-        mouseCursor.bringToFront();
-        if (mouseX < 0) {
-            mouseX = getResources().getDisplayMetrics().widthPixels / 2f;
-            mouseY = getResources().getDisplayMetrics().heightPixels / 2f;
-        }
-        mouseCursor.setX(mouseX);
-        mouseCursor.setY(mouseY);
-    }
-
-    private void moveMouse(float dx, float dy) {
-        ensureMouseCursor();
-        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
-        mouseX = Math.max(10, Math.min(mouseX + dx, dm.widthPixels - 50));
-        mouseY = Math.max(60, Math.min(mouseY + dy, dm.heightPixels - 60));
-        mouseCursor.setX(mouseX);
-        mouseCursor.setY(mouseY);
-        mouseCursor.setVisibility(View.VISIBLE);
-    }
-
-    private void clickMouse() {
-        ensureMouseCursor();
-        if (webView == null || mouseX < 0) return;
-        long now = SystemClock.uptimeMillis();
-        android.view.MotionEvent down = android.view.MotionEvent.obtain(
-                now, now, android.view.MotionEvent.ACTION_DOWN, mouseX, mouseY, 0);
-        android.view.MotionEvent up = android.view.MotionEvent.obtain(
-                now, now + 80, android.view.MotionEvent.ACTION_UP, mouseX, mouseY, 0);
-        webView.dispatchTouchEvent(down);
-        webView.dispatchTouchEvent(up);
-        down.recycle();
-        up.recycle();
-    }
-
     /** 退出应用（沉浸式下返回键难找时的兜底入口） */
     private void confirmExit() {
         new android.app.AlertDialog.Builder(this)
@@ -5667,10 +5633,9 @@ public class MainActivity extends AppCompatActivity {
             switch (event.getKeyCode()) {
                 case KeyEvent.KEYCODE_DPAD_CENTER:
                 case KeyEvent.KEYCODE_ENTER:
-                    if (useWebMode) {
-                        // 网页模式:OK = 点击虚拟光标处(配合方向键移动)
-                        clickMouse();
-                        return true;
+                    if (useWebMode && webView != null && webView.hasFocus()) {
+                        // 网页模式:确认键交给页面焦点元素
+                        return super.dispatchKeyEvent(event);
                     }
                     // 控制面板开着:OK = 点击焦点按钮(遥控器可操作面板全部按钮)
                     if (controlPanel != null && controlPanel.getVisibility() == View.VISIBLE) {
@@ -5687,33 +5652,19 @@ public class MainActivity extends AppCompatActivity {
 
                 case KeyEvent.KEYCODE_DPAD_UP:
                     if (useWebMode) {
-                        moveMouse(0, -45); // 网页模式:方向键=移动虚拟鼠标(切网站走节目单/频道键)
-                        return true;
+                        switchToPrevWebSite(); // 网页模式:上下键换频道(切网站)
+                    } else {
+                        switchToPrevSource();
                     }
-                    switchToPrevSource();
                     return true;
 
                 case KeyEvent.KEYCODE_DPAD_DOWN:
                     if (useWebMode) {
-                        moveMouse(0, 45);
-                        return true;
+                        switchToNextWebSite();
+                    } else {
+                        switchToNextSource();
                     }
-                    switchToNextSource();
                     return true;
-
-                case KeyEvent.KEYCODE_DPAD_LEFT:
-                    if (useWebMode) {
-                        moveMouse(-45, 0);
-                        return true;
-                    }
-                    break;
-
-                case KeyEvent.KEYCODE_DPAD_RIGHT:
-                    if (useWebMode) {
-                        moveMouse(45, 0);
-                        return true;
-                    }
-                    break;
 
                 case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
                 case KeyEvent.KEYCODE_SPACE:
