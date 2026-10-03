@@ -1517,7 +1517,10 @@ public class MainActivity extends AppCompatActivity {
         int desired = 0;
         for (TextView tv : texts) {
             tv.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
-            desired += tv.getMeasuredWidth();
+            // 渲染余量：emoji（📍定位符/天气图标）等fallback字体的实际绘制宽度
+            // 常大于TextView测量宽度，低估会让放大后的文字溢出槽位被相邻视图遮挡
+            // （如"上顿渡"的"渡"字被遮一半）。每个文本加4%+1px的修正。
+            desired += (int) Math.ceil(tv.getMeasuredWidth() * 1.04) + 1;
         }
         return desired;
     }
@@ -5418,24 +5421,41 @@ public class MainActivity extends AppCompatActivity {
 
         private void handleClient(Socket client) {
             try {
-                BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream()));
-                String request = reader.readLine();
-                
-                if (request != null && request.startsWith("POST")) {
-                    StringBuilder body = new StringBuilder();
-                    String line;
-                    int contentLength = 0;
-                    while ((line = reader.readLine()) != null) {
-                        if (line.startsWith("Content-Length:")) {
-                            contentLength = Integer.parseInt(line.substring(15).trim());
-                        }
-                        if (line.isEmpty()) break;
+                java.io.InputStream in = client.getInputStream();
+                // 字节级读取请求头（直到\r\n\r\n）。不能用字符流读头+定长字符读body：
+                // ①BufferedReader会预读吞掉body开头字节；②按字符读contentLength字节，
+                //   含中文时字符数<字节数导致read阻塞/截断→JSON解析报"配置格式错误"（保存偶发失败）
+                java.io.ByteArrayOutputStream headBuf = new java.io.ByteArrayOutputStream();
+                int hb;
+                while ((hb = in.read()) != -1) {
+                    headBuf.write(hb);
+                    byte[] h = headBuf.toByteArray();
+                    int s = h.length;
+                    if (s >= 4 && h[s - 1] == '\n' && h[s - 2] == '\r' && h[s - 3] == '\n' && h[s - 4] == '\r') break;
+                }
+                String headerBlock = headBuf.toString("UTF-8");
+                String[] headerLines = headerBlock.split("\r\n");
+                String request = headerLines.length > 0 ? headerLines[0] : null;
+                int contentLength = 0;
+                for (String hl : headerLines) {
+                    if (hl.toLowerCase().startsWith("content-length:")) {
+                        try {
+                            contentLength = Integer.parseInt(hl.substring(hl.indexOf(':') + 1).trim());
+                        } catch (Exception ignore) { }
                     }
-                    
-                    char[] bodyChars = new char[contentLength];
-                    reader.read(bodyChars, 0, contentLength);
-                    String configBody = new String(bodyChars);
-                    
+                }
+
+                if (request != null && request.startsWith("POST")) {
+                    // 按字节精确读满body再整体UTF-8解码（中文/emoji安全）
+                    java.io.ByteArrayOutputStream bodyBuf = new java.io.ByteArrayOutputStream();
+                    byte[] tmp = new byte[4096];
+                    int remaining = contentLength, n;
+                    while (remaining > 0 && (n = in.read(tmp, 0, Math.min(tmp.length, remaining))) != -1) {
+                        bodyBuf.write(tmp, 0, n);
+                        remaining -= n;
+                    }
+                    String configBody = bodyBuf.toString("UTF-8");
+
                     updateConfig(configBody);
                     
                     String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{\"status\":\"ok\"}";
