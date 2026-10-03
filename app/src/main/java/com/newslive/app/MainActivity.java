@@ -3835,19 +3835,11 @@ public class MainActivity extends AppCompatActivity {
                 switch (playbackState) {
                     case Player.STATE_BUFFERING:
                         // 无缝预载进行中时不弹转圈：旧画面还在播，短暂缓冲不该打扰观看
-                        if (finalSilent || pendingPlayer != null) {
-                            bufferingTime[0] = 0;
-                        } else {
-                            // 短卡累计:频繁进出缓冲(源不稳/网络抖动)达到阈值直接换线
-                            rebufCount[0]++;
+                        if (!finalSilent && pendingPlayer == null) {
                             progressBar.setVisibility(View.VISIBLE);
-                            if (!useWebMode && streamUrls.size() > 1 && rebufCount[0] >= 6) {
-                                rebufCount[0] = 0;
-                                bufferingTime[0] = 0;
-                                Toast.makeText(MainActivity.this, "线路频繁卡顿，自动切换下一条线路…", Toast.LENGTH_SHORT).show();
-                                switchToNextSource();
-                            }
+                            rebufCount[0]++; // 仅统计,不触发换源(偶发缓冲是直播常态,误换会陷入换台循环)
                         }
+                        bufferingTime[0] = 0;
                         handler.postDelayed(new Runnable() {
                             @Override
                             public void run() {
@@ -4981,6 +4973,7 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "暂无直播源，请先在设置页优选或添加源", Toast.LENGTH_LONG).show();
             return;
         }
+        if (controlPanel != null) controlPanel.setVisibility(View.GONE); // 节目单与控制条互斥
         float density = getResources().getDisplayMetrics().density;
 
         // 分组提取（保持出现顺序）+「全部」
@@ -5422,9 +5415,9 @@ public class MainActivity extends AppCompatActivity {
             handler.removeCallbacks(hideControlRunnable);
         }
         hideControlRunnable = () -> {
-            if (isPlaying) {
-                hideControlPanel();
-            }
+            // 无条件隐藏:此前 isPlaying=false(缓冲/出错)时面板常驻,
+            // 导致遥控器 OK 永远走"面板可见"分支,节目单调不出来
+            hideControlPanel();
         };
         handler.postDelayed(hideControlRunnable, 5000);
     }
