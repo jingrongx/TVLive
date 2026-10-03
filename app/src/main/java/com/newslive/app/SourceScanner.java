@@ -117,7 +117,14 @@ public class SourceScanner {
 
                     // ---- 3. 并发验证 + 分片测速 ----
                     final Map<String, Float> speeds = Collections.synchronizedMap(new LinkedHashMap<String, Float>());
-                    pool = Executors.newFixedThreadPool(conc);
+                    pool = Executors.newFixedThreadPool(conc, new java.util.concurrent.ThreadFactory() {
+                        @Override
+                        public Thread newThread(Runnable r) {
+                            Thread t = new Thread(r);
+                            t.setDaemon(true);
+                            return t;
+                        }
+                    });
                     final AtomicInteger done = new AtomicInteger(0);
                     List<Runnable> tasks = new ArrayList<>();
                     for (final String u : uniq) {
@@ -134,11 +141,24 @@ public class SourceScanner {
                             }
                         });
                     }
+                    final long measureDeadline = android.os.SystemClock.uptimeMillis() + 5 * 60 * 1000L;
                     for (Runnable t : tasks) pool.execute(t);
                     pool.shutdown();
                     try {
                         while (!pool.isTerminated()) {
                             if (stopped) pool.shutdownNow();
+                            if (android.os.SystemClock.uptimeMillis() > measureDeadline) {
+                                // 整体兜底:个别任务僵死(DNS挂起/半开连接)时强断,未完成的按失败计
+                                pool.shutdownNow();
+                                cb.onProgress("测速超时兜底", done.get(), uniq.size(),
+                                        "部分源响应过慢，按失败处理");
+                                long w0 = android.os.SystemClock.uptimeMillis();
+                                while (!pool.isTerminated()
+                                        && android.os.SystemClock.uptimeMillis() - w0 < 3000) {
+                                    Thread.sleep(200);
+                                }
+                                break;
+                            }
                             Thread.sleep(300);
                         }
                     } catch (InterruptedException ignore) { }
@@ -238,9 +258,11 @@ public class SourceScanner {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             byte[] tmp = new byte[8192];
             int n;
+            long deadline = android.os.SystemClock.uptimeMillis() + timeoutMs; // 总时长窗
             while ((n = in.read(tmp)) != -1) {
                 buf.write(tmp, 0, n);
                 if (buf.size() > 512 * 1024) break; // 订阅/清单最多读 512KB
+                if (android.os.SystemClock.uptimeMillis() > deadline) break; // 慢速滴流兜底
             }
             in.close();
             return buf.toString("UTF-8");
@@ -269,7 +291,11 @@ public class SourceScanner {
             ByteArrayOutputStream head = new ByteArrayOutputStream();
             byte[] tmp = new byte[8192];
             int n, headLimit = 128 * 1024;
-            while (head.size() < headLimit && (n = in.read(tmp)) != -1) head.write(tmp, 0, n);
+            long headDeadline = android.os.SystemClock.uptimeMillis() + 10000; // 总窗:防慢速滴流
+            while (head.size() < headLimit && (n = in.read(tmp)) != -1) {
+                head.write(tmp, 0, n);
+                if (android.os.SystemClock.uptimeMillis() > headDeadline) break;
+            }
             byte[] headBytes = head.toByteArray();
             if (headBytes.length >= 3 && headBytes[0] == 'F' && headBytes[1] == 'L' && headBytes[2] == 'V') {
                 return windowSpeed(in, headBytes.length, 6000);
