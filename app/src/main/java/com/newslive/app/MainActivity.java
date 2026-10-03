@@ -177,6 +177,9 @@ public class MainActivity extends AppCompatActivity {
     // 频道菜单数据：分组与测速（与 streamNames/streamUrls 平行）
     private final java.util.List<String> streamGroups = new java.util.ArrayList<>();
     private final java.util.List<Integer> streamSpeeds = new java.util.ArrayList<>();
+    // 网页模式虚拟鼠标(遥控器方向键移动光标,OK=点击光标处)
+    private android.widget.TextView mouseCursor;
+    private float mouseX = -1, mouseY = -1;
     /** 节目单里网页频道的编码基数: idx>=此值表示网页频道(实际网页索引=idx-此值) */
     private static final int WEB_ENTRY_MARK = 100000;
     private boolean isPlaying = false;
@@ -4769,6 +4772,15 @@ public class MainActivity extends AppCompatActivity {
         cancelStreamRotation();
         silentRefreshPending = false; // 显式加载（换台/恢复）不再是静默链路，避免误静音
         keyRewriteCapable = false;    // 播放回到WebView，数据源重写不适用
+        // 按站点切换桌面/移动 UA:红果系网页用桌面版布局——横屏电视上内容密集,
+        // 配合虚拟鼠标才可操作;其余站点保持移动 UA(触屏/焦点导航友好)
+        String webUa = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+        String host = "";
+        try { host = android.net.Uri.parse(webSourceUrl).getHost() == null ? "" : android.net.Uri.parse(webSourceUrl).getHost(); } catch (Exception ignore) { }
+        if (host.contains("hongguoduanju.com") || host.contains("novelquickapp.com")) {
+            webUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+        }
+        webView.getSettings().setUserAgentString(webUa);
         webView.setVisibility(View.VISIBLE);
         playerContainer.setVisibility(View.GONE);
         tvSourceInfo.setText(webSiteNames.isEmpty() ? "加载中..." : webSiteNames.get(currentSiteIndex) + "(加载中...)");
@@ -5254,6 +5266,52 @@ public class MainActivity extends AppCompatActivity {
         wv.loadUrl("http://127.0.0.1:" + HTTP_PORT);
     }
 
+    // ---------- 网页模式虚拟鼠标 ----------
+
+    private void ensureMouseCursor() {
+        if (mouseCursor != null) return;
+        FrameLayout rootLayout = findViewById(R.id.root_layout);
+        mouseCursor = new android.widget.TextView(this);
+        mouseCursor.setText("◉");
+        mouseCursor.setTextColor(0xD9FFFFFF);
+        mouseCursor.setTextSize(20);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+        mouseCursor.setLayoutParams(lp);
+        rootLayout.addView(mouseCursor);
+        mouseCursor.bringToFront();
+        if (mouseX < 0) {
+            mouseX = getResources().getDisplayMetrics().widthPixels / 2f;
+            mouseY = getResources().getDisplayMetrics().heightPixels / 2f;
+        }
+        mouseCursor.setX(mouseX);
+        mouseCursor.setY(mouseY);
+    }
+
+    private void moveMouse(float dx, float dy) {
+        ensureMouseCursor();
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        mouseX = Math.max(10, Math.min(mouseX + dx, dm.widthPixels - 50));
+        mouseY = Math.max(60, Math.min(mouseY + dy, dm.heightPixels - 60));
+        mouseCursor.setX(mouseX);
+        mouseCursor.setY(mouseY);
+        mouseCursor.setVisibility(View.VISIBLE);
+    }
+
+    private void clickMouse() {
+        ensureMouseCursor();
+        if (webView == null || mouseX < 0) return;
+        long now = SystemClock.uptimeMillis();
+        android.view.MotionEvent down = android.view.MotionEvent.obtain(
+                now, now, android.view.MotionEvent.ACTION_DOWN, mouseX, mouseY, 0);
+        android.view.MotionEvent up = android.view.MotionEvent.obtain(
+                now, now + 80, android.view.MotionEvent.ACTION_UP, mouseX, mouseY, 0);
+        webView.dispatchTouchEvent(down);
+        webView.dispatchTouchEvent(up);
+        down.recycle();
+        up.recycle();
+    }
+
     /** 退出应用（沉浸式下返回键难找时的兜底入口） */
     private void confirmExit() {
         new android.app.AlertDialog.Builder(this)
@@ -5484,7 +5542,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    public void updateConfig(String jsonConfig) {
+    public boolean updateConfig(String jsonConfig) {
         try {
             JSONObject config = new JSONObject(jsonConfig);
             
@@ -5577,11 +5635,13 @@ public class MainActivity extends AppCompatActivity {
                 }
                 Toast.makeText(this, "配置已更新", Toast.LENGTH_SHORT).show();
             });
+            return true;
         } catch (Exception e) {
             e.printStackTrace();
             runOnUiThread(() -> 
                 Toast.makeText(this, "配置格式错误: " + e.getMessage(), Toast.LENGTH_LONG).show()
             );
+            return false;
         }
     }
     
@@ -5607,9 +5667,10 @@ public class MainActivity extends AppCompatActivity {
             switch (event.getKeyCode()) {
                 case KeyEvent.KEYCODE_DPAD_CENTER:
                 case KeyEvent.KEYCODE_ENTER:
-                    if (useWebMode && webView != null && webView.hasFocus()) {
-                        // WebView模式下，确认键模拟点击当前焦点元素
-                        return super.dispatchKeyEvent(event);
+                    if (useWebMode) {
+                        // 网页模式:OK = 点击虚拟光标处(配合方向键移动)
+                        clickMouse();
+                        return true;
                     }
                     // 控制面板开着:OK = 点击焦点按钮(遥控器可操作面板全部按钮)
                     if (controlPanel != null && controlPanel.getVisibility() == View.VISIBLE) {
@@ -5624,26 +5685,35 @@ public class MainActivity extends AppCompatActivity {
                     }
                     return true;
 
-                case KeyEvent.KEYCODE_DPAD_LEFT:
-                case KeyEvent.KEYCODE_DPAD_RIGHT:
-                    // 左右方向键不再切换模式（统一由眼睛按钮切换），交给页面焦点导航
-                    break;
-
                 case KeyEvent.KEYCODE_DPAD_UP:
                     if (useWebMode) {
-                        switchToPrevWebSite();
-                    } else {
-                        switchToPrevSource();
+                        moveMouse(0, -45); // 网页模式:方向键=移动虚拟鼠标(切网站走节目单/频道键)
+                        return true;
                     }
+                    switchToPrevSource();
                     return true;
 
                 case KeyEvent.KEYCODE_DPAD_DOWN:
                     if (useWebMode) {
-                        switchToNextWebSite();
-                    } else {
-                        switchToNextSource();
+                        moveMouse(0, 45);
+                        return true;
                     }
+                    switchToNextSource();
                     return true;
+
+                case KeyEvent.KEYCODE_DPAD_LEFT:
+                    if (useWebMode) {
+                        moveMouse(-45, 0);
+                        return true;
+                    }
+                    break;
+
+                case KeyEvent.KEYCODE_DPAD_RIGHT:
+                    if (useWebMode) {
+                        moveMouse(45, 0);
+                        return true;
+                    }
+                    break;
 
                 case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
                 case KeyEvent.KEYCODE_SPACE:
@@ -5953,9 +6023,10 @@ public class MainActivity extends AppCompatActivity {
                     }
                     String configBody = bodyBuf.toString("UTF-8");
 
-                    updateConfig(configBody);
-                    
-                    String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{\"status\":\"ok\"}";
+                    boolean ok = updateConfig(configBody);
+
+                    String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+                            + (ok ? "{\"status\":\"ok\"}" : "{\"status\":\"error\",\"error\":\"配置格式错误，请重试\"}");
                     client.getOutputStream().write(response.getBytes());
                 } else if (request != null && request.startsWith("GET") && request.contains("/proxy?url=")) {
                     String proxyUrl = java.net.URLDecoder.decode(request.split("url=")[1].split(" ")[0], "UTF-8");
@@ -6246,7 +6317,7 @@ public class MainActivity extends AppCompatActivity {
                 "    });" +
                 "  }).catch(e=>{box.innerHTML='<span style=\"color:#C62828\">查询失败: '+e+'</span>';});" +
                 "}" +
-                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>alert('保存成功！')).catch(e=>alert('保存失败:'+e));}" +
+                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){alert('保存失败:'+(x.error||'未知错误')+'，请重试');}else{alert('保存成功！');}}).catch(e=>alert('保存失败:'+e));}" +
                 "renderSources();" +
                 "renderWebsites();" +
                 // 页面加载时自动恢复:若有优选任务在跑,继续显示进度(锁屏/刷新后不丢状态)
