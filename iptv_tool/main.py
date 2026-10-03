@@ -69,7 +69,8 @@ def parse_m3u(text):
         if not line:
             continue
         if line.startswith("#EXTINF"):
-            pend = line.split(",", 1)[1].strip() if "," in line else None
+            # 频道名在最后一个逗号之后(属性值如 user-agent 可能含逗号)
+            pend = line.rsplit(",", 1)[1].strip() if "," in line else None
         elif line.startswith("#"):
             continue
         elif line.startswith(("http://", "https://")):
@@ -77,6 +78,71 @@ def parse_m3u(text):
                 groups.setdefault("频道", []).append((pend, line))
             pend = None
     return groups
+
+# 常见频道英文名 → 中文名(覆盖省级行政区卫视与部分主要频道)
+ZH_MAP = [
+    (r"(?i)(?:Nei Monggol|Inner Mongol\w*)\s+TV", "内蒙古电视"),
+    (r"(?i)Anhui\s+Satellite\s+TV", "安徽卫视"),
+    (r"(?i)Beijing\s+Satellite\s+TV", "北京卫视"),
+    (r"(?i)Chongqing\s+Satellite\s+TV", "重庆卫视"),
+    (r"(?i)Dragon\s+TV", "东方卫视"),
+    (r"(?i)Fujian\s+(?:Southeast|Satellite)\s+TV", "东南卫视"),
+    (r"(?i)Gansu\s+Satellite\s+TV", "甘肃卫视"),
+    (r"(?i)Guangdong\s+Satellite\s+TV", "广东卫视"),
+    (r"(?i)Guangxi\s+Satellite\s+TV", "广西卫视"),
+    (r"(?i)Guizhou\s+Satellite\s+TV", "贵州卫视"),
+    (r"(?i)Hainan\s+Satellite\s+TV", "海南卫视"),
+    (r"(?i)Hebei\s+Satellite\s+TV", "河北卫视"),
+    (r"(?i)Heilongjiang\s+Satellite\s+TV", "黑龙江卫视"),
+    (r"(?i)Henan\s+Satellite\s+TV", "河南卫视"),
+    (r"(?i)Hubei\s+Satellite\s+TV", "湖北卫视"),
+    (r"(?i)Hunan\s+(?:Satellite\s+)?TV", "湖南卫视"),
+    (r"(?i)Jiangsu\s+Satellite\s+TV", "江苏卫视"),
+    (r"(?i)Jilin\s+Satellite\s+TV", "吉林卫视"),
+    (r"(?i)Liaoning\s+Satellite\s+TV", "辽宁卫视"),
+    (r"(?i)Ningxia\s+Satellite\s+TV", "宁夏卫视"),
+    (r"(?i)Qinghai\s+Satellite\s+TV", "青海卫视"),
+    (r"(?i)Shandong\s+Satellite\s+TV", "山东卫视"),
+    (r"(?i)Shanghai\s+Satellite\s+TV", "上海卫视"),
+    (r"(?i)Shanxi\s+Satellite\s+TV", "山西卫视"),
+    (r"(?i)Shenzhen\s+Satellite\s+TV", "深圳卫视"),
+    (r"(?i)Sichuan\s+Satellite\s+TV", "四川卫视"),
+    (r"(?i)Tianjin\s+Satellite\s+TV", "天津卫视"),
+    (r"(?i)Tibet\s+Satellite\s+TV", "西藏卫视"),
+    (r"(?i)Xinjiang\s+Satellite\s+TV", "新疆卫视"),
+    (r"(?i)Yunnan\s+Satellite\s+TV", "云南卫视"),
+    (r"(?i)Zhejiang\s+Satellite\s+TV", "浙江卫视"),
+    (r"(?i)Shaanxi\s+(?:Satellite\s+TV|West\s+TV)", "陕西卫视"),
+    (r"(?i)Jiangxi\s+Satellite\s+TV", "江西卫视"),
+    (r"(?i)CGTN\s+Documentary", "CGTN纪录"),
+    (r"(?i)CGTN\s+Spanish", "CGTN西语"),
+    (r"(?i)CGTN\s+French", "CGTN法语"),
+    (r"(?i)CGTN\s+Arabic", "CGTN阿语"),
+    (r"(?i)CGTN\s+Russian", "CGTN俄语"),
+]
+
+_RE_RES = re.compile(r"\s*[（(]\d{3,4}[piP][:id]?\s*\)\s*$")       # (1080p)/(720p)
+_RE_BRACKET = re.compile(r"\s*\[[^\]]*\]\s*$")                      # [Not 24/7]/[Geo-blocked]
+_RE_DOMAIN = re.compile(r"^(?:[\w-]+\.)+[a-z]{2,}$", re.I)          # www.xxx.com 式脏名
+
+def clean_display(name):
+    """清洗展示名:循环剥离分辨率后缀/方括号标记,映射中文台名;脏名返回 None"""
+    n = name.strip()
+    if _RE_DOMAIN.match(n):
+        return None
+    while True:
+        n2 = _RE_RES.sub("", n)
+        n2 = _RE_BRACKET.sub("", n2)
+        if n2 == n:
+            break
+        n = n2
+    n = n.strip(" -_")
+    for pat, zh in ZH_MAP:
+        if re.search(pat, n):
+            n = zh
+            break
+    n = n.strip()
+    return n or None
 
 def norm_name(name):
     n = re.sub(r"[\s\-\_·()\[\]（）【】]", "", name)
@@ -122,14 +188,17 @@ def merge_channels(sub_results):
     for title, groups in sub_results:
         for items in groups.values():
             for name, url in items:
-                key = norm_name(name)
-                if not key or BLACKLIST.search(name):
+                display = clean_display(name)
+                if display is None:
+                    continue  # 域名式等脏名直接丢弃
+                key = norm_name(display)
+                if not key or BLACKLIST.search(display):
                     continue
-                c = chans.setdefault(key, {"display": name, "group": classify(name), "sources": []})
+                c = chans.setdefault(key, {"display": display, "group": classify(display), "sources": []})
                 if url not in c["sources"]:
                     c["sources"].append(url)
-                if len(name) < len(c["display"]):
-                    c["display"] = name
+                if len(display) < len(c["display"]):
+                    c["display"] = display
     return chans
 
 # ---------------- 检测引擎 ----------------
