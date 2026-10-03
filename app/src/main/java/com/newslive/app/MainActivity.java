@@ -4951,8 +4951,8 @@ public class MainActivity extends AppCompatActivity {
         for (String g : streamGroups) groupSet.add(g == null || g.isEmpty() ? "其他" : g);
         final java.util.List<String> groups = new java.util.ArrayList<>();
         groups.add("全部");
-        groups.addAll(groupSet);
         if (!webSiteUrls.isEmpty()) groups.add("🌐 网页");
+        groups.addAll(groupSet);
         final String[] selGroup = {groups.get(0)};
 
         LinearLayout root = new LinearLayout(this);
