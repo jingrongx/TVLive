@@ -92,6 +92,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_WEB_SITES_VERSION = "web_sites_version";
     private static final int CURRENT_WEB_SITES_VERSION = 6; // 版本号递增以触发配置刷新
     private static final String KEY_CURRENT_SITE_INDEX = "current_site_index";
+    private static final String KEY_LAST_SOURCE_NAME = "last_source_name";
     private static final String KEY_LOCK_ORIENTATION = "lock_orientation";
     private static final String KEY_PLAYER_MODE_ENABLED = "player_mode_enabled";
     private static final String KEY_BANNER_VISIBLE = "banner_visible";
@@ -155,7 +156,6 @@ public class MainActivity extends AppCompatActivity {
     private ProgressBar progressBar;
     private ImageButton btnNextSource;
     private ImageButton btnPrevSource;
-    private ImageButton btnSwitchMode;
     private ImageButton btnLockOrientation;
     private ImageButton btnOrientation;
     private ImageButton btnChannelMenu;
@@ -177,6 +177,8 @@ public class MainActivity extends AppCompatActivity {
     // 频道菜单数据：分组与测速（与 streamNames/streamUrls 平行）
     private final java.util.List<String> streamGroups = new java.util.ArrayList<>();
     private final java.util.List<Integer> streamSpeeds = new java.util.ArrayList<>();
+    /** 节目单里网页频道的编码基数: idx>=此值表示网页频道(实际网页索引=idx-此值) */
+    private static final int WEB_ENTRY_MARK = 100000;
     private boolean isPlaying = false;
     private boolean isControlVisible = true;
     private Runnable hideControlRunnable;
@@ -366,7 +368,6 @@ public class MainActivity extends AppCompatActivity {
         progressBar = findViewById(R.id.progress_bar);
         btnNextSource = findViewById(R.id.btn_next_source);
         btnPrevSource = findViewById(R.id.btn_prev_source);
-        btnSwitchMode = findViewById(R.id.btn_switch_mode);
         btnLockOrientation = findViewById(R.id.btn_lock_orientation);
         btnOrientation = findViewById(R.id.btn_orientation);
         btnChannelMenu = findViewById(R.id.btn_channel_menu);
@@ -422,7 +423,6 @@ public class MainActivity extends AppCompatActivity {
                 switchToPrevSource();
             }
         });
-        btnSwitchMode.setOnClickListener(v -> switchMode());
         btnLockOrientation.setOnClickListener(v -> toggleOrientationLock());
         btnOrientation.setOnClickListener(v -> toggleScreenOrientation());
         btnChannelMenu.setOnClickListener(v -> showChannelMenu());
@@ -434,14 +434,14 @@ public class MainActivity extends AppCompatActivity {
         //    在触屏手机上会导致"第一次点击=抢焦点、第二次才触发"，必须关闭
         boolean tv = isTelevisionDevice();
         ImageButton[] allButtons = {btnPrevSource, btnNextSource,
-            btnSwitchMode, btnOrientation, btnLockOrientation,
+            btnOrientation, btnLockOrientation,
             btnChannelMenu, btnSettings, btnExitApp};
         for (ImageButton b : allButtons) {
             if (b != null) b.setFocusableInTouchMode(tv);
         }
         // 2) 操作提示按设备区分
         if (!tv && tvHintInfo != null) {
-            tvHintInfo.setText("点屏幕显示/隐藏面板 | 上/下滑切换频道 | ⇄按钮切换模式 | 双击返回键退出");
+            tvHintInfo.setText("点屏幕显示/隐藏面板 | 上/下滑切换频道 | OK键呼出节目单 | 双击返回键退出");
         }
         // 3) 控制面板窄屏自适应（手机竖屏按钮不超屏）
         applyControlPanelLayout();
@@ -1297,8 +1297,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void updatePlayerModeButtons() {
-        // 模式切换只保留一个按钮（网页↔播放器）
-        if (btnSwitchMode != null) btnSwitchMode.setVisibility(View.VISIBLE);
+        // 模式切换已并入节目单(网页频道混合展示),无独立按钮
     }
 
     // ==================== 顶部横幅多行排版（竖屏独立布局） ====================
@@ -3809,6 +3808,8 @@ public class MainActivity extends AppCompatActivity {
             currentPlayerListener = null;
         }
         final int[] bufferingTime = {0};
+        final int[] rebufCount = {0};          // 短卡累计:频繁进出缓冲直接换线
+        final Runnable[] stableClear = {null}; // 稳定播放30秒后清零
         final boolean[] hasError = {false};
         final int[] seekRetryCount = {0};
         final int[] pauseRetryCount = {0};
@@ -3828,10 +3829,19 @@ public class MainActivity extends AppCompatActivity {
                 switch (playbackState) {
                     case Player.STATE_BUFFERING:
                         // 无缝预载进行中时不弹转圈：旧画面还在播，短暂缓冲不该打扰观看
-                        if (!finalSilent && pendingPlayer == null) {
+                        if (finalSilent || pendingPlayer != null) {
+                            bufferingTime[0] = 0;
+                        } else {
+                            // 短卡累计:频繁进出缓冲(源不稳/网络抖动)达到阈值直接换线
+                            rebufCount[0]++;
                             progressBar.setVisibility(View.VISIBLE);
+                            if (!useWebMode && streamUrls.size() > 1 && rebufCount[0] >= 6) {
+                                rebufCount[0] = 0;
+                                bufferingTime[0] = 0;
+                                Toast.makeText(MainActivity.this, "线路频繁卡顿，自动切换下一条线路…", Toast.LENGTH_SHORT).show();
+                                switchToNextSource();
+                            }
                         }
-                        bufferingTime[0] = 0;
                         handler.postDelayed(new Runnable() {
                             @Override
                             public void run() {
@@ -3840,7 +3850,7 @@ public class MainActivity extends AppCompatActivity {
                                     if (bufferingTime[0] % 5 == 0) {
                                         LogUtil.w("NewsLive", "Buffering " + bufferingTime[0] + "s, pos=" + player.getCurrentPosition() + " buffered=" + player.getBufferedPosition());
                                     }
-                                    if (bufferingTime[0] > 15) {
+                                    if (bufferingTime[0] > 8) {
                                         if (!isRefreshed && useWebMode && seekRetryCount[0] >= 2) {
                                             if (sniffRefreshCount < MAX_SNIFF_REFRESH) {
                                                 sniffRefreshCount++;
@@ -3855,10 +3865,10 @@ public class MainActivity extends AppCompatActivity {
                                                 progressBar.setVisibility(View.GONE);
                                                 scheduleGiveUpRecovery();
                                             }
-                                    } else if (seekRetryCount[0] < 3) {
+                                    } else if (seekRetryCount[0] < 2) {
                                         seekRetryCount[0]++;
                                         if (!finalSilent) {
-                                            Toast.makeText(MainActivity.this, "缓冲超时，重连中(" + seekRetryCount[0] + "/3)...", Toast.LENGTH_SHORT).show();
+                                            Toast.makeText(MainActivity.this, "缓冲超时，重连中(" + seekRetryCount[0] + "/2)...", Toast.LENGTH_SHORT).show();
                                         }
                                         // 直播流 seek 无意义，改为重新 prepare
                                         player.setMediaItem(MediaItem.fromUri(Uri.parse(url)));
@@ -3880,6 +3890,10 @@ public class MainActivity extends AppCompatActivity {
                     case Player.STATE_READY:
                         progressBar.setVisibility(View.GONE);
                         isPlaying = true;
+                        // 稳定播放30秒后清零短卡计数
+                        if (stableClear[0] != null) handler.removeCallbacks(stableClear[0]);
+                        stableClear[0] = () -> { if (player != null && player.isPlaying()) rebufCount[0] = 0; };
+                        handler.postDelayed(stableClear[0], 30000);
                         hasError[0] = false;
                         seekRetryCount[0] = 0;
                         pauseRetryCount[0] = 0;
@@ -4901,7 +4915,10 @@ public class MainActivity extends AppCompatActivity {
             // 旧逻辑优先播网页嗅探的lastDetectedVideoUrl，导致切模式后播的还是网页频道
             // 的视频流，模式切换形同虚设。网页流只在网页模式内使用（嗅探自动接管）。
             if (isStreamListEnabled && !streamUrls.isEmpty()) {
-                loadStreamFromConfig(currentUrlIndex);
+                // 退出记忆:回到上次播放的台(按名字匹配,优选后列表变化也能找回)
+                String lastName = prefs.getString(KEY_LAST_SOURCE_NAME, "");
+                int lastIdx = lastName.isEmpty() ? -1 : streamNames.indexOf(lastName);
+                loadStreamFromConfig(lastIdx >= 0 ? lastIdx : 0);
             } else {
                 Toast.makeText(this, "未启用直播源列表，请到配置页开启并添加源", Toast.LENGTH_LONG).show();
             }
@@ -4935,6 +4952,7 @@ public class MainActivity extends AppCompatActivity {
         final java.util.List<String> groups = new java.util.ArrayList<>();
         groups.add("全部");
         groups.addAll(groupSet);
+        if (!webSiteUrls.isEmpty()) groups.add("🌐 网页");
         final String[] selGroup = {groups.get(0)};
 
         LinearLayout root = new LinearLayout(this);
@@ -5009,8 +5027,24 @@ public class MainActivity extends AppCompatActivity {
                 if (g == null || g.isEmpty()) g = "其他";
                 if ("全部".equals(selGroup[0]) || selGroup[0].equals(g)) idxHolder.add(i);
             }
+            boolean includeWeb = !webSiteUrls.isEmpty()
+                    && ("全部".equals(selGroup[0]) || "🌐 网页".equals(selGroup[0]));
+            if (includeWeb) {
+                for (int i = 0; i < webSiteUrls.size(); i++) {
+                    if (i < webSiteEnabled.size() && !webSiteEnabled.get(i)) continue;
+                    idxHolder.add(WEB_ENTRY_MARK + i);
+                }
+            }
             java.util.List<android.text.SpannableString> rows = new java.util.ArrayList<>();
-            for (int idx : idxHolder) {
+            for (int code : idxHolder) {
+                if (code >= WEB_ENTRY_MARK) {
+                    int wIdx = code - WEB_ENTRY_MARK;
+                    String wName = wIdx < webSiteNames.size() ? webSiteNames.get(wIdx) : "网页" + (wIdx + 1);
+                    boolean wCur = useWebMode && wIdx == currentSiteIndex;
+                    rows.add(new android.text.SpannableString((wCur ? "▶ " : "") + "🌐 " + wName));
+                    continue;
+                }
+                int idx = code;
                 int sp = idx < streamSpeeds.size() ? streamSpeeds.get(idx) : 0;
                 String mark = idx == currentUrlIndex ? "▶ " : "";
                 String base = mark + streamNames.get(idx);
@@ -5033,7 +5067,10 @@ public class MainActivity extends AppCompatActivity {
                             View v = super.getView(position, convertView, parent);
                             android.widget.TextView tv = v.findViewById(android.R.id.text1);
                             tv.setTextSize(14);
-                            boolean cur = idxHolder.get(position) == currentUrlIndex;
+                            int code = idxHolder.get(position);
+                            boolean cur = code >= WEB_ENTRY_MARK
+                                    ? (useWebMode && code - WEB_ENTRY_MARK == currentSiteIndex)
+                                    : code == currentUrlIndex;
                             if (cur) {
                                 tv.setTextColor(0xFF4FC3F7);
                                 tv.setTypeface(null, android.graphics.Typeface.BOLD);
@@ -5056,9 +5093,22 @@ public class MainActivity extends AppCompatActivity {
             updateChannels.run();
         });
         lvChannels.setOnItemClickListener((parent, view, position, id) -> {
+            int code = idxHolder.get(position);
             dialog.dismiss();
-            currentUrlIndex = idxHolder.get(position);
-            loadStreamFromConfig(currentUrlIndex);
+            if (code >= WEB_ENTRY_MARK) {
+                // 网页频道:必要时先切到网页模式,再载入选中的网址
+                int wIdx = code - WEB_ENTRY_MARK;
+                if (!useWebMode) switchMode();
+                if (wIdx < webSiteUrls.size()) {
+                    currentSiteIndex = wIdx;
+                    webSourceUrl = webSiteUrls.get(wIdx);
+                    prefs.edit().putInt(KEY_CURRENT_SITE_INDEX, currentSiteIndex).apply();
+                }
+                loadWebSource();
+            } else {
+                currentUrlIndex = code;
+                loadStreamFromConfig(code);
+            }
         });
 
         dialog.setOnShowListener(d -> {
@@ -5073,7 +5123,9 @@ public class MainActivity extends AppCompatActivity {
             // 遥控器：焦点直接落在频道列表并定位到当前台
             lvChannels.post(() -> {
                 lvChannels.requestFocus();
-                int cur = idxHolder.indexOf(currentUrlIndex);
+                int cur = useWebMode
+                        ? idxHolder.indexOf(WEB_ENTRY_MARK + currentSiteIndex)
+                        : idxHolder.indexOf(currentUrlIndex);
                 if (cur >= 0) lvChannels.setSelection(Math.max(cur - 2, 0));
             });
         });
@@ -5158,6 +5210,13 @@ public class MainActivity extends AppCompatActivity {
             index = 0;
             currentUrlIndex = 0;
         }
+        currentUrlIndex = index;
+        // 退出记忆:记住当前台(按名字,优选后列表变化也能找回)
+        try {
+            if (index < streamNames.size()) {
+                prefs.edit().putString(KEY_LAST_SOURCE_NAME, streamNames.get(index)).apply();
+            }
+        } catch (Exception ignore) { }
         
         isPlaying = false;
         errorRetryCount = 0;
@@ -5393,7 +5452,10 @@ public class MainActivity extends AppCompatActivity {
                 saveConfigLocal();
             }
 
-            currentUrlIndex = 0;
+            // 退出记忆:新配置里若还有上次播放的台,继续播它;没有才回到第一个
+            String lastChannel = prefs.getString(KEY_LAST_SOURCE_NAME, "");
+            int keepIdx = lastChannel.isEmpty() ? -1 : streamNames.indexOf(lastChannel);
+            currentUrlIndex = keepIdx >= 0 ? keepIdx : 0;
             runOnUiThread(() -> {
                 updatePlayerModeButtons();
                 applyBannerStyle();
@@ -5404,7 +5466,7 @@ public class MainActivity extends AppCompatActivity {
                     if (player == null) {
                         initPlayer();
                     }
-                    loadStreamFromConfig(0);
+                    loadStreamFromConfig(currentUrlIndex);
                 }
                 Toast.makeText(this, "配置已更新", Toast.LENGTH_SHORT).show();
             });
@@ -5442,7 +5504,11 @@ public class MainActivity extends AppCompatActivity {
                         // WebView模式下，确认键模拟点击当前焦点元素
                         return super.dispatchKeyEvent(event);
                     }
-                    // 播放器模式：OK键呼出节目单（市面直播App习惯），暂停走播放/暂停键或面板
+                    // 控制面板开着:OK = 点击焦点按钮(遥控器可操作面板全部按钮)
+                    if (controlPanel != null && controlPanel.getVisibility() == View.VISIBLE) {
+                        return super.dispatchKeyEvent(event);
+                    }
+                    // 面板关闭:OK 呼出节目单(市面直播App习惯)
                     showChannelMenu();
                     return true;
 
