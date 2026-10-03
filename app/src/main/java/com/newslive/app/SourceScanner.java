@@ -50,6 +50,8 @@ public class SourceScanner {
     private volatile boolean running = false;
     private volatile boolean stopped = false;
     private volatile long startAt = 0;
+    private android.os.PowerManager.WakeLock wakeLock;
+    private android.net.wifi.WifiManager.WifiLock wifiLock;
 
     /** 运行中且未超时(15 分钟兜底:卡死任务自动视为过期,允许重新启动) */
     public boolean isRunning() {
@@ -59,7 +61,7 @@ public class SourceScanner {
     /** 中途停止（当前进行中的 HTTP 请求会自然超时后退出） */
     public void stop() { stopped = true; }
 
-    public void scan(final String[] subUrls, final int concurrency, final int minSpeedKB, final Callback cb) {
+    public void scan(final android.content.Context ctx, final String[] subUrls, final int concurrency, final int minSpeedKB, final Callback cb) {
         if (running) {
             cb.onError("已有优选任务在运行");
             return;
@@ -67,6 +69,20 @@ public class SourceScanner {
         running = true;
         stopped = false;
         startAt = android.os.SystemClock.uptimeMillis();
+        // 锁屏/休眠时系统会限制后台网络,优选期间持有 WakeLock+WiFiLock 保证任务不被掐断
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager) ctx.getSystemService(android.content.Context.POWER_SERVICE);
+            wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "NewsLive:IPTVScan");
+            wakeLock.setReferenceCounted(false);
+            wakeLock.acquire(10 * 60 * 1000L); // 10分钟自动释放兜底
+            android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager) ctx.getApplicationContext()
+                    .getSystemService(android.content.Context.WIFI_SERVICE);
+            if (wm != null) {
+                wifiLock = wm.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "NewsLive:IPTVScan");
+                wifiLock.setReferenceCounted(false);
+                wifiLock.acquire();
+            }
+        } catch (Exception ignore) { }
         final int conc = Math.max(4, Math.min(concurrency, 60));
         final int minSpeed = Math.max(10, minSpeedKB);
         new Thread(new Runnable() {
@@ -234,6 +250,10 @@ public class SourceScanner {
                 } finally {
                     running = false;
                     if (pool != null) pool.shutdownNow();
+                    try {
+                        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                        if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+                    } catch (Exception ignore) { }
                 }
             }
         }, "SourceScanner").start();

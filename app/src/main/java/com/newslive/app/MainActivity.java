@@ -2709,7 +2709,7 @@ public class MainActivity extends AppCompatActivity {
             scanStatusJson = "{\"running\":true,\"phase\":\"启动\",\"cur\":0,\"total\":0,\"msg\":\"\"}";
             final java.util.List<String> fSubs = valid;
             final int fMin = min, fConc = conc;
-            activeScanner.scan(fSubs.toArray(new String[0]), fConc, fMin, new SourceScanner.Callback() {
+            activeScanner.scan(this, fSubs.toArray(new String[0]), fConc, fMin, new SourceScanner.Callback() {
                 @Override
                 public void onProgress(String phase, int cur, int total, String msg) {
                     scanStatusJson = "{\"running\":true,\"phase\":\"" + jsonEsc(phase)
@@ -6105,7 +6105,7 @@ public class MainActivity extends AppCompatActivity {
                 "</div>" +
                 "<div class='section' style='background:#EDE7F6;border:1px solid #7E57C2'>" +
                 "<div class='section-title'>🔍 直播源自动优选（App 内置检测）</div>" +
-                "<div class='tip'>拉取订阅 → 逐条连通验证与分片测速 → 每频道保留最快线路 → 自动替换上方直播源列表。建议在 WiFi 下运行，约 1~3 分钟；移动数据下测速结果仅代表当前网络。</div>" +
+                "<div class='tip'>拉取订阅 → 逐条连通验证与分片测速 → 每频道保留最快线路 → 自动替换上方直播源列表。约 1~3 分钟。优选在 <b>App 内运行</b>，手机锁屏/关闭网页<b>不影响任务</b>；重新打开本页会自动恢复进度显示。</div>" +
                 "<div class='tip' style='color:#2E7D32'>💡 高清流畅参考：1080p 需 ≥250KB/s，⚡ 标记（≥500KB/s）的台最稳；节目单里按速度着色可辨识。</div>" +
                 "<textarea id='scanSubs' rows='3' style='width:100%;box-sizing:border-box;font-size:12px'>https://vbskycn.github.io/iptv/tv/iptv4.txt\nhttps://iptv-org.github.io/iptv/countries/cn.m3u</textarea>" +
                 "<div class='buffer-inputs' style='margin-top:6px'>" +
@@ -6249,6 +6249,11 @@ public class MainActivity extends AppCompatActivity {
                 "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>alert('保存成功！')).catch(e=>alert('保存失败:'+e));}" +
                 "renderSources();" +
                 "renderWebsites();" +
+                // 页面加载时自动恢复:若有优选任务在跑,继续显示进度(锁屏/刷新后不丢状态)
+                "(function(){fetch('/scan_status').then(function(r){return r.json();}).then(function(d){" +
+                "  if(d.running){document.getElementById('scanBtn').disabled=true;document.getElementById('scanStopBtn').disabled=false;pollScan();}" +
+                "  else if(d.done){document.getElementById('scanProgress').innerHTML='✅ 上次优选完成:'+d.channels+' 个频道(中位 '+d.median+' KB/s)';}" +
+                "}).catch(function(){});})();" +
                 "var scanTimer=null;" +
                 "function startScan(){" +
                 "  var subs=document.getElementById('scanSubs').value.split('\\n').map(function(s){return s.trim();}).filter(function(s){return s.indexOf('http')===0;});" +
