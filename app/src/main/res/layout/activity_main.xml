@@ -150,34 +150,6 @@
                 android:gravity="center_horizontal">
 
                 <ImageButton
-                    android:id="@+id/btn_switch_mode"
-                    android:layout_width="72dp"
-                    android:layout_height="72dp"
-                    android:background="@drawable/tv_button_selector"
-                    android:src="@drawable/ic_swap_mode"
-                    android:contentDescription="切换模式"
-                    android:scaleType="centerInside"
-                    android:focusable="true"
-                    android:focusableInTouchMode="true"
-                    android:padding="16dp" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="2dp"
-                    android:text="切模式"
-                    android:textColor="#AAAAAA"
-                    android:textSize="11sp" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:layout_width="72dp"
-                android:layout_height="wrap_content"
-                android:layout_marginEnd="12dp"
-                android:orientation="vertical"
-                android:gravity="center_horizontal">
-
-                <ImageButton
                     android:id="@+id/btn_channel_menu"
                     android:layout_width="72dp"
                     android:layout_height="72dp"
