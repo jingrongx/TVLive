@@ -2699,6 +2699,7 @@ public class MainActivity extends AppCompatActivity {
             if (activeScanner != null && activeScanner.isRunning()) {
                 return "{\"status\":\"running\"}";
             }
+            if (activeScanner != null) activeScanner.stop(); // 清理过期/卡死任务
             activeScanner = new SourceScanner();
             scanStatusJson = "{\"running\":true,\"phase\":\"启动\",\"cur\":0,\"total\":0,\"msg\":\"\"}";
             final java.util.List<String> fSubs = valid;
@@ -5787,6 +5788,14 @@ public class MainActivity extends AppCompatActivity {
                     String resp = handleScanStart(request);
                     String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + resp;
                     client.getOutputStream().write(response.getBytes());
+                } else if (request != null && request.startsWith("GET") && request.contains("/scan_stop")) {
+                    if (activeScanner != null) {
+                        activeScanner.stop();
+                        activeScanner = null;
+                    }
+                    scanStatusJson = "{\"running\":false}";
+                    String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n{\"status\":\"stopped\"}";
+                    client.getOutputStream().write(response.getBytes());
                 } else if (request != null && request.startsWith("GET") && request.contains("/scan_status")) {
                     String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + scanStatusJson;
                     client.getOutputStream().write(response.getBytes());
@@ -5919,12 +5928,14 @@ public class MainActivity extends AppCompatActivity {
                 "<div class='section' style='background:#EDE7F6;border:1px solid #7E57C2'>" +
                 "<div class='section-title'>🔍 直播源自动优选（App 内置检测）</div>" +
                 "<div class='tip'>拉取订阅 → 逐条连通验证与分片测速 → 每频道保留最快线路 → 自动替换上方直播源列表。建议在 WiFi 下运行，约 1~3 分钟；移动数据下测速结果仅代表当前网络。</div>" +
+                "<div class='tip' style='color:#2E7D32'>💡 高清流畅参考：1080p 需 ≥250KB/s，⚡ 标记（≥500KB/s）的台最稳；节目单里按速度着色可辨识。</div>" +
                 "<textarea id='scanSubs' rows='3' style='width:100%;box-sizing:border-box;font-size:12px'>https://vbskycn.github.io/iptv/tv/iptv4.txt\nhttps://iptv-org.github.io/iptv/countries/cn.m3u</textarea>" +
                 "<div class='buffer-inputs' style='margin-top:6px'>" +
-                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>淘汰线 KB/s</label><input type='number' id='scanMin' value='120'></div>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>淘汰线 KB/s（1080p 建议 250+）</label><input type='number' id='scanMin' value='250'></div>" +
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>并发数</label><input type='number' id='scanConc' value='15'></div>" +
                 "</div>" +
-                "<div class='btn-group'><button class='btn-fetch' id='scanBtn' onclick='startScan()'>🚀 开始优选</button></div>" +
+                "<div class='btn-group'><button class='btn-fetch' id='scanBtn' onclick='startScan()'>🚀 开始优选</button>" +
+                "<button class='btn-del' id='scanStopBtn' onclick='stopScan()' disabled>⏹ 停止</button></div>" +
                 "<div id='scanProgress' class='tip' style='text-align:left'></div>" +
                 "</div>" +
                 "<div class='group-header'>⚙️ 系统设置区</div>" +
@@ -6066,19 +6077,31 @@ public class MainActivity extends AppCompatActivity {
                 "  if(!subs.length){alert('请先填写订阅URL');return;}" +
                 "  if(!confirm('开始优选?将逐条连通验证与测速(约1~3分钟),完成后自动替换直播源列表。'))return;" +
                 "  document.getElementById('scanBtn').disabled=true;" +
-                "  var q='/scan_start?min='+(parseInt(document.getElementById('scanMin').value)||80)+'&conc='+(parseInt(document.getElementById('scanConc').value)||15)+'&subs='+encodeURIComponent(subs.join('|'));" +
+                "  document.getElementById('scanStopBtn').disabled=false;" +
+                "  var q='/scan_start?min='+(parseInt(document.getElementById('scanMin').value)||250)+'&conc='+(parseInt(document.getElementById('scanConc').value)||15)+'&subs='+encodeURIComponent(subs.join('|'));" +
                 "  fetch(q).then(function(r){return r.json();}).then(function(d){" +
-                "    if(d.status==='error'){alert(d.msg||'启动失败');document.getElementById('scanBtn').disabled=false;return;}" +
-                "    if(d.status==='running'){alert('已有优选任务在运行');document.getElementById('scanBtn').disabled=false;return;}" +
+                "    if(d.status==='error'){alert(d.msg||'启动失败');resetScanBtns();return;}" +
+                "    if(d.status==='running'){alert('已有优选任务在运行;若卡住可点「停止优选」后重试');resetScanBtns();return;}" +
                 "    pollScan();" +
-                "  }).catch(function(e){alert('启动失败:'+e);document.getElementById('scanBtn').disabled=false;});" +
+                "  }).catch(function(e){alert('启动失败:'+e);resetScanBtns();});" +
+                "}" +
+                "function stopScan(){" +
+                "  fetch('/scan_stop').then(function(r){return r.json();}).then(function(d){" +
+                "    if(scanTimer)clearInterval(scanTimer);" +
+                "    document.getElementById('scanProgress').innerHTML='⏹ 已停止';" +
+                "    resetScanBtns();" +
+                "  }).catch(function(e){resetScanBtns();});" +
+                "}" +
+                "function resetScanBtns(){" +
+                "  document.getElementById('scanBtn').disabled=false;" +
+                "  document.getElementById('scanStopBtn').disabled=true;" +
                 "}" +
                 "function pollScan(){" +
                 "  if(scanTimer)clearInterval(scanTimer);" +
                 "  scanTimer=setInterval(function(){" +
                 "    fetch('/scan_status').then(function(r){return r.json();}).then(function(d){" +
                 "      var box=document.getElementById('scanProgress');" +
-                "      if(d.error){clearInterval(scanTimer);box.innerHTML='<span style=\"color:#C62828\">❌ '+d.error+'</span>';document.getElementById('scanBtn').disabled=false;return;}" +
+                "      if(d.error){clearInterval(scanTimer);box.innerHTML='<span style=\"color:#C62828\">❌ '+d.error+'</span>';resetScanBtns();return;}" +
                 "      if(!d.running&&d.done){clearInterval(scanTimer);box.innerHTML='✅ 优选完成:'+d.channels+' 个频道(中位 '+d.median+' KB/s),已自动替换直播源列表';alert('优选完成:'+d.channels+' 个频道(中位 '+d.median+' KB/s),已自动替换直播源列表并开始播放');setTimeout(function(){location.reload();},1500);return;}" +
                 "      var pct=d.total>0?Math.round(d.cur/d.total*100):0;" +
                 "      box.innerHTML='⏳ '+d.phase+' '+d.cur+'/'+d.total+' ('+pct+'%) '+(d.msg||'');" +

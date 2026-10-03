@@ -49,8 +49,12 @@ public class SourceScanner {
 
     private volatile boolean running = false;
     private volatile boolean stopped = false;
+    private volatile long startAt = 0;
 
-    public boolean isRunning() { return running; }
+    /** 运行中且未超时(15 分钟兜底:卡死任务自动视为过期,允许重新启动) */
+    public boolean isRunning() {
+        return running && (android.os.SystemClock.uptimeMillis() - startAt < 15 * 60 * 1000L);
+    }
 
     /** 中途停止（当前进行中的 HTTP 请求会自然超时后退出） */
     public void stop() { stopped = true; }
@@ -62,6 +66,7 @@ public class SourceScanner {
         }
         running = true;
         stopped = false;
+        startAt = android.os.SystemClock.uptimeMillis();
         final int conc = Math.max(4, Math.min(concurrency, 60));
         final int minSpeed = Math.max(10, minSpeedKB);
         new Thread(new Runnable() {
@@ -290,16 +295,19 @@ public class SourceScanner {
             long t0 = android.os.SystemClock.uptimeMillis();
             HttpURLConnection c2 = (HttpURLConnection) new URL(segUrl).openConnection();
             c2.setConnectTimeout(6000);
-            c2.setReadTimeout(12000);
+            c2.setReadTimeout(8000);
             c2.setRequestProperty("User-Agent", UA);
             try {
                 if (c2.getResponseCode() != 200) return 0;
                 InputStream sIn = c2.getInputStream();
                 ByteArrayOutputStream segBuf = new ByteArrayOutputStream();
                 byte[] b2 = new byte[16384];
-                while ((n = sIn.read(b2)) != -1) {
-                    segBuf.write(b2, 0, n);
+                long segDeadline = t0 + 12000; // 分片下载总时长窗:readTimeout 只管单次 read,
+                int n2;                        // 慢速滴流源(如 mp4/慢CDN)必须靠总窗兜底,否则任务挂死
+                while ((n2 = sIn.read(b2)) != -1) {
+                    segBuf.write(b2, 0, n2);
                     if (segBuf.size() > 8 * 1024 * 1024) break;
+                    if (android.os.SystemClock.uptimeMillis() > segDeadline) break;
                 }
                 sIn.close();
                 long dt = android.os.SystemClock.uptimeMillis() - t0;
