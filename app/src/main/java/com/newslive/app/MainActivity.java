@@ -184,6 +184,8 @@ public class MainActivity extends AppCompatActivity {
     // 红果短剧剧列表缓存:{seriesId, name}(从 novelquickapp.com SSR 首页解析)
     private java.util.List<String[]> hongguoDramas;
     private volatile boolean hongguoLoading = false;
+    private long hongguoLastAttempt = 0; // 上次拉取尝试(30秒节流,防失败循环)
+    private boolean channelMenuShowing = false;
     private static final int HONGGUO_MARK = -1000000; // 节目单里红果条目的编码基数(负数区)
     /** 红果网页连播辅助JS(幂等):__hgNext/__hgPrev 下一/上一集,__hgJump(n) 跳第n集,__hgInfo 剧名与集数 */
     private static final String HONGGUO_JS =
@@ -5211,16 +5213,15 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
             if (hongguoGroup) {
-                // 注意:此处不可用带回调的 loadHongguoDramasAsync(回调触发 updateChannels 重刷会无限递归 StackOverflow)
-                if (hongguoDramas == null && !hongguoLoading) {
-                    loadHongguoDramasAsync(null); // 首次拉取(null 回调安全)
-                } else if (hongguoDramas != null && !hongguoDramas.isEmpty()) {
-                    int seq = 0;
-                    for (String[] d : hongguoDramas) {
-                        chRanges.add(new int[]{HONGGUO_MARK - seq, HONGGUO_MARK - seq});
-                        hongguoPick.put(HONGGUO_MARK - seq, d);
-                        seq++;
-                    }
+                // 首次/超30秒重试:拉取(回调只刷一次UI,hongguoDramas非空后不再触发加载,无递归)
+                if (hongguoDramas == null && !hongguoLoading
+                        && SystemClock.uptimeMillis() - hongguoLastAttempt > 30000) {
+                    hongguoLastAttempt = SystemClock.uptimeMillis();
+                    loadHongguoDramasAsync(() -> runOnUiThread(() -> {
+                        if (channelMenuShowing && updateChannelsRef[0] != null) {
+                            updateChannelsRef[0].run(); // 数据到达/失败后刷新一次(节流防递归)
+                        }
+                    }));
                 }
             }
             java.util.List<android.text.SpannableString> rows = new java.util.ArrayList<>();
@@ -5229,6 +5230,15 @@ public class MainActivity extends AppCompatActivity {
                     int ep = EPISODE_MARK - r[0];
                     boolean isCur = ep == dramaCurEp;
                     rows.add(new android.text.SpannableString((isCur ? "▶ 第" + ep + "集" : "第" + ep + "集")));
+                    idxHolder.add(r[0]);
+                    continue;
+                }
+                if (r[0] == HONGGUO_MARK) {
+                    // 红果组加载状态行(数据未到时不空白)
+                    String hint = hongguoLoading ? "⏳ 正在加载红果短剧热榜…"
+                            : (hongguoDramas != null && hongguoDramas.isEmpty() ? "暂无剧数据"
+                            : "加载失败，稍后自动重试");
+                    rows.add(new android.text.SpannableString(hint));
                     idxHolder.add(r[0]);
                     continue;
                 }
@@ -5368,7 +5378,9 @@ public class MainActivity extends AppCompatActivity {
                 if (cur >= 0) lvChannels.setSelection(Math.max(cur - 2, 0));
             });
         });
+        dialog.setOnDismissListener(d -> channelMenuShowing = false);
         dialog.show();
+        channelMenuShowing = true;
         updateChannels.run();
     }
 
