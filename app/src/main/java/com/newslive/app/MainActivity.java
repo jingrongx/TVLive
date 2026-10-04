@@ -181,7 +181,7 @@ public class MainActivity extends AppCompatActivity {
     private static final int WEB_ENTRY_MARK = 100000;
     // 短剧连播模式(红果):嗅探到 TOS 流时置 true,播完一集自动驱动网页播放下一集
     private volatile boolean dramaMode = false;
-    // 红果短剧剧列表缓存:{seriesId, name}(从 novelquickapp.com SSR 首页解析)
+    // 红果短剧剧列表缓存:{seriesId, name}(从 hongguoduanju.com SSR 页面解析)
     private java.util.List<String[]> hongguoDramas;
     private volatile boolean hongguoLoading = false;
     private long hongguoLastAttempt = 0; // 上次拉取尝试(30秒节流,防失败循环)
@@ -5132,7 +5132,7 @@ public class MainActivity extends AppCompatActivity {
         final java.util.List<String> groups = new java.util.ArrayList<>();
         groups.add("全部");
         if (!webSiteUrls.isEmpty()) groups.add("🌐 网页");
-        groups.add("📺 红果短剧");
+        groups.add("红果短剧");
         groups.addAll(groupSet);
         final String[] selGroup = {groups.get(0)};
         final java.util.Map<Integer, String[]> hongguoPick = new java.util.HashMap<>();
@@ -5223,7 +5223,7 @@ public class MainActivity extends AppCompatActivity {
                 if ("全部".equals(selGroup[0]) || selGroup[0].equals(g)) chRanges.add(new int[]{i, j});
                 i = j + 1;
             }
-            boolean hongguoGroup = "📺 红果短剧".equals(selGroup[0]);
+            boolean hongguoGroup = "红果短剧".equals(selGroup[0]);
             boolean dramaView = dramaMode && hongguoGroup; // 短剧播放中:该分组顶部显示当前剧集列表
             if (dramaView && dramaEpisodes != null && !dramaEpisodes.isEmpty()) {
             // 当前剧集列表(点击跳集)
@@ -5237,7 +5237,7 @@ public class MainActivity extends AppCompatActivity {
                 // 首次/超30秒重试:拉取(回调只刷一次UI,hongguoDramas非空后不再触发加载,无递归)
                 if (hongguoDramas == null && !hongguoLoading
                         && (hongguoLastAttempt == 0
-                            || SystemClock.uptimeMillis() - hongguoLastAttempt > 30000)) {
+                            || SystemClock.uptimeMillis() - hongguoLastAttempt > 10000)) {
                     hongguoLastAttempt = SystemClock.uptimeMillis();
                     loadHongguoDramasAsync(() -> runOnUiThread(() -> {
                         if (channelMenuShowing && updateChannelsRef[0] != null) {
@@ -5253,7 +5253,7 @@ public class MainActivity extends AppCompatActivity {
                     String hint;
                     if (hongguoDramas != null && hongguoDramas.isEmpty()) hint = "暂无剧数据(官网未返回)";
                     else if (hongguoLoading) hint = "⏳ 正在加载红果短剧热榜…";
-                    else hint = "加载失败，重新选择本分类可重试";
+                    else hint = "⚠ 加载失败，点击本行立即重试";
                     rows.add(new android.text.SpannableString(hint));
                     idxHolder.add(r[0]);
                     continue;
@@ -5350,8 +5350,8 @@ public class MainActivity extends AppCompatActivity {
         });
         updateChannelsRef[0] = updateChannels;
         // 短剧播放中:默认选中红果组,并提取当前剧集列表供选集
-        if (dramaMode && groups.contains("📺 红果短剧")) {
-            selGroup[0] = "📺 红果短剧";
+        if (dramaMode && groups.contains("红果短剧")) {
+            selGroup[0] = "红果短剧";
             if (webView != null) {
                 webView.evaluateJavascript("(window.__hgEpisodes ? window.__hgEpisodes() : '{}')", r -> {
                     try {
@@ -5490,46 +5490,72 @@ public class MainActivity extends AppCompatActivity {
 
     /** 解析红果官网 SSR 页面(首页+多个榜单页):提取剧名与 series_id,合并去重 */
     private java.util.List<String[]> fetchHongguoDramas() {
-        String[] pages = {
-            "https://novelquickapp.com/",
-            "https://novelquickapp.com/rank/hot-drama",
-            "https://novelquickapp.com/rank/hot-real-drama",
-            "https://novelquickapp.com/rank/hot-comic-drama"
+        // 主域名直连:novelquickapp.com 会 301 重定向到 hongguoduanju.com,部分 Android 设备跟随失败
+        final String[] pages = {
+            "https://hongguoduanju.com/",
+            "https://hongguoduanju.com/rank/hot-drama",
+            "https://hongguoduanju.com/rank/hot-comic-drama"
         };
-        java.util.List<String[]> out = new java.util.ArrayList<>();
-        java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
-        for (String pageUrl : pages) {
-            try {
-            java.net.URL url = new java.net.URL(pageUrl);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(10000);
-            conn.setReadTimeout(15000);
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0");
-            if (conn.getResponseCode() != 200) continue;
-            java.io.BufferedReader reader = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            char[] buf = new char[8192];
-            int n;
-            long deadline = System.currentTimeMillis() + 15000;
-            while ((n = reader.read(buf)) != -1 && sb.length() < 700 * 1024
-                    && System.currentTimeMillis() < deadline) {
-                sb.append(buf, 0, n);
-            }
-            reader.close();
+        final java.util.List<String[]> out =
+                java.util.Collections.synchronizedList(new java.util.ArrayList<String[]>());
+        final java.util.Set<String> seen =
+                java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<String>());
+        final java.util.concurrent.CountDownLatch latch =
+                new java.util.concurrent.CountDownLatch(pages.length);
+        for (final String pageUrl : pages) {
+            new Thread(() -> {
+                try {
+                    java.net.URL url = new java.net.URL(pageUrl);
+                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setConnectTimeout(8000);
+                    conn.setReadTimeout(10000);
+                    conn.setRequestProperty("User-Agent",
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0");
+                    // 防 gzip:HttpURLConnection 不会自动解压,压缩内容按 UTF-8 直读会乱码导致解析 0 部
+                    conn.setRequestProperty("Accept-Encoding", "identity");
+                    int code = conn.getResponseCode();
+                    if (code != 200) {
+                        LogUtil.w("NewsLive", "hongguo page " + pageUrl + " code=" + code);
+                        return;
+                    }
+                    java.io.BufferedReader reader = new java.io.BufferedReader(
+                            new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
+                    StringBuilder sb = new StringBuilder();
+                    char[] buf = new char[8192];
+                    int n;
+                    long deadline = System.currentTimeMillis() + 12000;
+                    while ((n = reader.read(buf)) != -1 && sb.length() < 700 * 1024
+                            && System.currentTimeMillis() < deadline) {
+                        sb.append(buf, 0, n);
+                    }
+                    reader.close();
 
-            java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("aria-label=\"查看([^\"]{2,40})\"[^>]*href=\"/detail\\?series_id=(\\d+)\"")
-                .matcher(sb.toString());
-            while (m.find() && out.size() < 60) {
-                String name = m.group(1).trim();
-                String id = m.group(2);
-                if (!seen.add(id)) continue;
-                out.add(new String[]{id, name});
-            }
-            } catch (Exception pageErr) { /* 单页失败跳过 */ }
+                    java.util.regex.Matcher m = java.util.regex.Pattern
+                        .compile("aria-label=\"查看([^\"]{2,40})\"[^>]*href=\"/detail\\?series_id=(\\d+)\"")
+                        .matcher(sb.toString());
+                    int hits = 0;
+                    while (m.find() && out.size() < 60) {
+                        String name = m.group(1).trim();
+                        String id = m.group(2);
+                        if (!seen.add(id)) continue;
+                        out.add(new String[]{id, name});
+                        hits++;
+                    }
+                    LogUtil.i("NewsLive", "hongguo page ok: " + pageUrl
+                            + " bytes=" + sb.length() + " hits=" + hits);
+                } catch (Exception pageErr) {
+                    LogUtil.w("NewsLive", "hongguo page fail: " + pageUrl + " " + pageErr);
+                } finally {
+                    latch.countDown();
+                }
+            }).start();
         }
-        return out;
+        try {
+            latch.await(20, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Exception ignore) { }
+        LogUtil.i("NewsLive", "hongguo fetch done, total=" + out.size());
+        return new java.util.ArrayList<>(out);
     }
 
     /** 播放红果短剧:网页模式加载详情页,自动点"播放正片",嗅探接管后自动连播全剧 */
