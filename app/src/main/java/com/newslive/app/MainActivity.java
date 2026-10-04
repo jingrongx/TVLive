@@ -194,9 +194,14 @@ public class MainActivity extends AppCompatActivity {
         "window.__hgPrev=function(){var l=eps();var c=curIdx(l);if(c<=0)return 'no-prev';l[c-1].click();return 'ok:'+l[c-1].innerText.trim();};" +
         "window.__hgJump=function(n){var l=eps();for(var i=0;i<l.length;i++){var m=(l[i].innerText.match(/\\d+/)||[0])[0];if(parseInt(m)===n){l[i].click();return 'ok';}}return 'not-found';};" +
         "window.__hgInfo=function(){var t=document.querySelector('[class*=\"pc-title\"]');var l=eps();var c=curIdx(l);return JSON.stringify({title:t?t.innerText.trim():'',ep:c+1,total:l.length});};" +
+        "window.__hgEpisodes=function(){var l=eps();var c=curIdx(l);var arr=[];for(var i=0;i<l.length;i++){arr.push(parseInt((l[i].innerText.match(/\\d+/)||[0])[0]));}return JSON.stringify({cur:c+1,total:l.length,eps:arr});};" +
         "})();";
     /** 当前节目单的刷新入口(loadHongguoDramasAsync 拉取完成后重刷剧列表) */
     final Runnable[] updateChannelsRef = new Runnable[1];
+    // 短剧模式:当前剧的集列表(菜单选集用,由 __hgEpisodes 异步提取)
+    private java.util.List<Integer> dramaEpisodes;
+    private int dramaCurEp = 0;
+    private static final int EPISODE_MARK = -2000000; // 节目单里"集"条目的编码基数
     private boolean isPlaying = false;
     private boolean isControlVisible = true;
     private Runnable hideControlRunnable;
@@ -5180,6 +5185,14 @@ public class MainActivity extends AppCompatActivity {
             idxHolder.clear();
             // 直播源按同名连续段聚合为频道(段首=最快线路);网页频道单列
             java.util.List<int[]> chRanges = new java.util.ArrayList<>(); // {start,end}
+            boolean includeWeb = !webSiteUrls.isEmpty()
+                    && ("全部".equals(selGroup[0]) || "🌐 网页".equals(selGroup[0]));
+            if (includeWeb) {
+                for (int w = 0; w < webSiteUrls.size(); w++) {
+                    if (w < webSiteEnabled.size() && !webSiteEnabled.get(w)) continue;
+                    chRanges.add(new int[]{WEB_ENTRY_MARK + w, WEB_ENTRY_MARK + w});
+                }
+            }
             int i = 0;
             while (i < streamUrls.size()) {
                 int j = i;
@@ -5189,15 +5202,14 @@ public class MainActivity extends AppCompatActivity {
                 if ("全部".equals(selGroup[0]) || selGroup[0].equals(g)) chRanges.add(new int[]{i, j});
                 i = j + 1;
             }
-            boolean includeWeb = !webSiteUrls.isEmpty()
-                    && ("全部".equals(selGroup[0]) || "🌐 网页".equals(selGroup[0]));
-            if (includeWeb) {
-                for (int w = 0; w < webSiteUrls.size(); w++) {
-                    if (w < webSiteEnabled.size() && !webSiteEnabled.get(w)) continue;
-                    chRanges.add(new int[]{WEB_ENTRY_MARK + w, WEB_ENTRY_MARK + w});
+            boolean hongguoGroup = "📺 红果短剧".equals(selGroup[0]);
+            boolean dramaView = dramaMode && hongguoGroup; // 短剧播放中:该分组顶部显示当前剧集列表
+            if (dramaView && dramaEpisodes != null && !dramaEpisodes.isEmpty()) {
+                // 当前剧集列表(点击跳集)
+                for (int ep : dramaEpisodes) {
+                    chRanges.add(new int[]{EPISODE_MARK - ep, EPISODE_MARK - ep});
                 }
             }
-            boolean hongguoGroup = "📺 红果短剧".equals(selGroup[0]);
             if (hongguoGroup) {
                 loadHongguoDramasAsync(() -> runOnUiThread(() -> { if (updateChannelsRef[0] != null) updateChannelsRef[0].run(); }));
             }
@@ -5217,6 +5229,13 @@ public class MainActivity extends AppCompatActivity {
             }
             java.util.List<android.text.SpannableString> rows = new java.util.ArrayList<>();
             for (int[] r : chRanges) {
+                if (r[0] <= EPISODE_MARK) {
+                    int ep = EPISODE_MARK - r[0];
+                    boolean isCur = ep == dramaCurEp;
+                    rows.add(new android.text.SpannableString((isCur ? "▶ 第" + ep + "集" : "第" + ep + "集")));
+                    idxHolder.add(r[0]);
+                    continue;
+                }
                 if (r[0] <= HONGGUO_MARK) {
                     String[] d = hongguoPick.get(r[0]);
                     String nm = d == null ? "红果短剧" : d[1];
@@ -5265,7 +5284,9 @@ public class MainActivity extends AppCompatActivity {
                             android.widget.TextView tv = v.findViewById(android.R.id.text1);
                             tv.setTextSize(14);
                             int code = idxHolder.get(position);
-                            boolean cur = code >= WEB_ENTRY_MARK
+                            boolean cur = code <= EPISODE_MARK
+                                    ? (EPISODE_MARK - code == dramaCurEp)
+                                    : code >= WEB_ENTRY_MARK
                                     ? (useWebMode && code - WEB_ENTRY_MARK == currentSiteIndex)
                                     : code == currentUrlIndex;
                             if (cur) {
@@ -5290,12 +5311,39 @@ public class MainActivity extends AppCompatActivity {
             updateChannels.run();
         });
         updateChannelsRef[0] = updateChannels;
+        // 短剧播放中:默认选中红果组,并提取当前剧集列表供选集
+        if (dramaMode && groups.contains("📺 红果短剧")) {
+            selGroup[0] = "📺 红果短剧";
+            if (webView != null) {
+                webView.evaluateJavascript("(window.__hgEpisodes ? window.__hgEpisodes() : '{}')", r -> {
+                    try {
+                        org.json.JSONObject j = new org.json.JSONObject(r == null ? "{}" : r.replaceAll("^\"|\"$", ""));
+                        if (j.has("eps")) {
+                            org.json.JSONArray arr = j.getJSONArray("eps");
+                            java.util.List<Integer> eps = new java.util.ArrayList<>();
+                            for (int i = 0; i < arr.length(); i++) eps.add(arr.getInt(i));
+                            dramaEpisodes = eps;
+                            dramaCurEp = j.optInt("cur", 0);
+                            if (updateChannelsRef[0] != null) updateChannelsRef[0].run();
+                        }
+                    } catch (Exception ignore) { }
+                });
+            }
+        }
         lvChannels.setOnItemClickListener((parent, view, position, id) -> {
             int code = idxHolder.get(position);
             dialog.dismiss();
             if (code >= WEB_ENTRY_MARK) {
                 // 网页频道:安全切到网页模式(自动初始化WebView),再载入选中的网址
                 switchToWebSite(code - WEB_ENTRY_MARK);
+            } else if (code <= EPISODE_MARK) {
+                // 跳集:驱动红果网页跳到指定集(新流由嗅探接管)
+                int ep = EPISODE_MARK - code;
+                dialog.dismiss();
+                if (webView != null) {
+                    webView.evaluateJavascript("(window.__hgJump ? window.__hgJump(" + ep + ") : 'no-fn')", null);
+                    Toast.makeText(this, "跳转到第" + ep + "集", Toast.LENGTH_SHORT).show();
+                }
             } else if (code <= HONGGUO_MARK) {
                 // 红果短剧:加载详情页并自动连播
                 String[] d = hongguoPick.get(code);
@@ -5382,29 +5430,35 @@ public class MainActivity extends AppCompatActivity {
 
     /** 后台拉取红果短剧热榜剧列表(SSR 首页解析,无需逆向接口) */
     private void loadHongguoDramasAsync(Runnable onLoaded) {
-        if (hongguoDramas != null) {
-            if (onLoaded != null) onLoaded.run();
-            return;
-        }
         if (hongguoLoading) return; // 正在拉取
         hongguoLoading = true;
+        final java.util.List<String[]> cached = hongguoDramas; // 失败兜底
         executorService.execute(() -> {
-            java.util.List<String[]> list = fetchHongguoDramas();
-            if (list != null && !list.isEmpty()) hongguoDramas = list;
+            java.util.List<String[]> fresh = fetchHongguoDramas(); // 每次重拉:热榜每日更新
+            if (fresh != null && !fresh.isEmpty()) hongguoDramas = fresh;
             hongguoLoading = false;
             if (onLoaded != null) runOnUiThread(onLoaded);
         });
     }
 
-    /** 解析 novelquickapp.com SSR 首页:提取 a[href*=series_id] 的剧名与 ID */
+    /** 解析红果官网 SSR 页面(首页+多个榜单页):提取剧名与 series_id,合并去重 */
     private java.util.List<String[]> fetchHongguoDramas() {
-        try {
-            java.net.URL url = new java.net.URL("https://novelquickapp.com/");
+        String[] pages = {
+            "https://novelquickapp.com/",
+            "https://novelquickapp.com/rank/hot-drama",
+            "https://novelquickapp.com/rank/hot-real-drama",
+            "https://novelquickapp.com/rank/hot-comic-drama"
+        };
+        java.util.List<String[]> out = new java.util.ArrayList<>();
+        java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+        for (String pageUrl : pages) {
+            try {
+            java.net.URL url = new java.net.URL(pageUrl);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(15000);
             conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0");
-            if (conn.getResponseCode() != 200) return null;
+            if (conn.getResponseCode() != 200) continue;
             java.io.BufferedReader reader = new java.io.BufferedReader(
                     new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
             StringBuilder sb = new StringBuilder();
@@ -5417,22 +5471,18 @@ public class MainActivity extends AppCompatActivity {
             }
             reader.close();
 
-            java.util.List<String[]> out = new java.util.ArrayList<>();
-            java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
             java.util.regex.Matcher m = java.util.regex.Pattern
                 .compile("aria-label=\"查看([^\"]{2,40})\"[^>]*href=\"/detail\\?series_id=(\\d+)\"")
                 .matcher(sb.toString());
-            while (m.find() && out.size() < 40) {
+            while (m.find() && out.size() < 60) {
+                String name = m.group(1).trim();
                 String id = m.group(2);
                 if (!seen.add(id)) continue;
-                String name = m.group(1).trim();
-                if (name != null) out.add(new String[]{id, name});
+                out.add(new String[]{id, name});
             }
-            reader.close();
-            return out;
-        } catch (Exception e) {
-            return null;
+            } catch (Exception pageErr) { /* 单页失败跳过 */ }
         }
+        return out;
     }
 
     /** 播放红果短剧:网页模式加载详情页,自动点"播放正片",嗅探接管后自动连播全剧 */
