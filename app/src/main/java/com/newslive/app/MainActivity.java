@@ -5530,8 +5530,8 @@ public class MainActivity extends AppCompatActivity {
                     java.net.URL url = new java.net.URL(pageUrl);
                     HttpURLConnection conn = (HttpURLConnection) url.openConnection();
                     conn.setInstanceFollowRedirects(true);
-                    conn.setConnectTimeout(8000);
-                    conn.setReadTimeout(10000);
+                    conn.setConnectTimeout(10000);
+                    conn.setReadTimeout(20000);
                     conn.setRequestProperty("User-Agent",
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0");
                     conn.setRequestProperty("Accept", "text/html,application/xhtml+xml");
@@ -5551,8 +5551,8 @@ public class MainActivity extends AppCompatActivity {
                     StringBuilder sb = new StringBuilder();
                     char[] buf = new char[8192];
                     int n;
-                    long deadline = System.currentTimeMillis() + 12000;
-                    while ((n = reader.read(buf)) != -1 && sb.length() < 700 * 1024
+                    long deadline = System.currentTimeMillis() + 30000; // 页面 190KB+ 且首张卡片在 ~56KB 处,慢网络需放宽
+                    while ((n = reader.read(buf)) != -1 && sb.length() < 900 * 1024
                             && System.currentTimeMillis() < deadline) {
                         sb.append(buf, 0, n);
                     }
@@ -5617,15 +5617,49 @@ public class MainActivity extends AppCompatActivity {
             }).start();
         }
         try {
-            latch.await(20, java.util.concurrent.TimeUnit.SECONDS);
+            latch.await(45, java.util.concurrent.TimeUnit.SECONDS);
         } catch (Exception ignore) { }
-        hongguoLastError = errs.toString().trim();
-        LogUtil.i("NewsLive", "hongguo fetch done, total=" + out.size()
+        java.util.List<String[]> result = new java.util.ArrayList<>(out);
+        if (result.isEmpty()) {
+            // 网络解析失败:回退到内置清单,保证短剧功能始终可用
+            result = loadHongguoFallbackList();
+            LogUtil.i("NewsLive", "hongguo fetch empty, use built-in list: " + result.size());
+            if (result.isEmpty()) {
+                hongguoLastError = errs.length() == 0 ? "网络无响应" : errs.toString().trim();
+            }
+        } else {
+            hongguoLastError = errs.toString().trim();
+        }
+        LogUtil.i("NewsLive", "hongguo fetch done, total=" + result.size()
                 + " err=" + hongguoLastError);
-        return new java.util.ArrayList<>(out);
+        return result;
     }
 
     /** 播放红果短剧:网页模式加载详情页,自动点"播放正片",嗅探接管后自动连播全剧 */
+    /** 读取 assets 内置红果剧清单(网络解析失败时的兜底,保证功能可用) */
+    private java.util.List<String[]> loadHongguoFallbackList() {
+        java.util.List<String[]> list = new java.util.ArrayList<>();
+        try {
+            java.io.InputStream is = getAssets().open("hongguo_drama_list.txt");
+            java.io.BufferedReader br = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(is, "UTF-8"));
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                int p = line.indexOf('|');
+                if (p <= 0) continue;
+                String id = line.substring(0, p).trim();
+                String name = line.substring(p + 1).trim();
+                if (!id.isEmpty() && !name.isEmpty()) list.add(new String[]{id, name});
+            }
+            br.close();
+        } catch (Exception e) {
+            LogUtil.w("NewsLive", "hongguo fallback list load fail: " + e);
+        }
+        return list;
+    }
+
     /** 失败原因短文本(直接显示在菜单状态行里,便于用户截图反馈) */
     private String shortErr() {
         String e = hongguoLastError == null ? "" : hongguoLastError.trim();
