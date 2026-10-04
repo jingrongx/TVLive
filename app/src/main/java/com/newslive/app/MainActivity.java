@@ -5420,21 +5420,12 @@ public class MainActivity extends AppCompatActivity {
             java.util.List<String[]> out = new java.util.ArrayList<>();
             java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
             java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("<a[^>]*href=\"[^\"]*series_id=(\\d+)[^\"]*\"[^>]*>([\\s\\S]{0,600}?)</a>")
+                .compile("aria-label=\"查看([^\"]{2,40})\"[^>]*href=\"/detail\\?series_id=(\\d+)\"")
                 .matcher(sb.toString());
             while (m.find() && out.size() < 40) {
-                String id = m.group(1);
+                String id = m.group(2);
                 if (!seen.add(id)) continue;
-                String block = m.group(2).replaceAll("<[^>]+>", "\\n");
-                String name = null;
-                for (String line : block.split("\\n")) {
-                    String t = line.trim();
-                    if (t.length() > 1 && !t.matches("全\\d+集") && !t.matches("^\\d{2}:\\d{2}.*")
-                            && !t.startsWith("http") && !t.contains("红果")) {
-                        name = t;
-                        break;
-                    }
-                }
+                String name = m.group(1).trim();
                 if (name != null) out.add(new String[]{id, name});
             }
             reader.close();
