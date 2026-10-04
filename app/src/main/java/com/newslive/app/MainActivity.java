@@ -498,6 +498,11 @@ public class MainActivity extends AppCompatActivity {
         initNetworkMonitor();
         initOrientationListener();
         loadSavedConfig();
+        // 预置红果短剧内置清单:即使网络完全不可用,短剧分组也始终有可播放的剧
+        try {
+            java.util.List<String[]> preset = loadHongguoFallbackList();
+            if (preset != null && !preset.isEmpty()) hongguoDramas = preset;
+        } catch (Exception ignore) { }
         applyBannerStyle();
         // 横幅尺寸变化（旋转/首帧布局/文字变化）时重新自适应字号
         if (infoOverlay != null) {
@@ -5235,14 +5240,14 @@ public class MainActivity extends AppCompatActivity {
             if (hongguoGroup) {
                 // 状态占位行(渲染时显示 加载中/失败/暂无)
                 chRanges.add(new int[]{HONGGUO_MARK, HONGGUO_MARK});
-                // 首次/超30秒重试:拉取(回调只刷一次UI,hongguoDramas非空后不再触发加载,无递归)
-                if (hongguoDramas == null && !hongguoLoading
+                // 尝试拉官网最新热榜(5分钟节流);失败时保留内置清单,短剧分组始终有剧可看
+                if (!hongguoLoading
                         && (hongguoLastAttempt == 0
-                            || SystemClock.uptimeMillis() - hongguoLastAttempt > 10000)) {
+                            || SystemClock.uptimeMillis() - hongguoLastAttempt > 5 * 60 * 1000L)) {
                     hongguoLastAttempt = SystemClock.uptimeMillis();
                     loadHongguoDramasAsync(() -> runOnUiThread(() -> {
                         if (channelMenuShowing && updateChannelsRef[0] != null) {
-                            updateChannelsRef[0].run(); // 数据到达/失败后刷新一次(节流防递归)
+                            updateChannelsRef[0].run(); // 成功后刷新为最新热榜
                         }
                     }));
                 }
@@ -5655,7 +5660,10 @@ public class MainActivity extends AppCompatActivity {
             }
             br.close();
         } catch (Exception e) {
-            LogUtil.w("NewsLive", "hongguo fallback list load fail: " + e);
+            LogUtil.w("NewsLive", "hongguo fallback assets load fail: " + e);
+        }
+        if (list.isEmpty()) {
+            list = DramaCatalog.list(); // assets 不可用时用编译进 dex 的内置清单
         }
         return list;
     }
