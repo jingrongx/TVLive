@@ -2913,21 +2913,22 @@ public class MainActivity extends AppCompatActivity {
                 updateWebChannelLabel();
                 // 持久化保存cookie（保留登录态）
                 CookieManager.getInstance().flush();
-                // 短剧模式:红果页面加载完,注入连播辅助JS并自动点"播放正片"
+                // 短剧模式:红果页面加载完,注入连播辅助JS并轮询自动点"播放正片"(直到video出现,最多15次)
                 if (dramaMode && url != null && url.contains("hongguoduanju.com")) {
                     view.evaluateJavascript(HONGGUO_JS, null);
-                    handler.postDelayed(() -> {
-                        if (webView != null && dramaMode) {
-                            webView.evaluateJavascript(
-                                "(function(){var c=[].slice.call(document.querySelectorAll('div,button,span,a')).filter(function(el){return /播放正片|立即播放/.test((el.innerText||'').trim())&&el.offsetParent!==null&&(el.innerText||'').trim().length<10;});if(c.length){c[0].click();return 'ok';}return 'no-btn';})()", null);
-                        }
-                    }, 3500);
-                    handler.postDelayed(() -> {
-                        if (webView != null && dramaMode) {
-                            webView.evaluateJavascript(
-                                "(function(){var c=[].slice.call(document.querySelectorAll('div,button,span,a')).filter(function(el){return /播放正片|立即播放/.test((el.innerText||'').trim())&&el.offsetParent!==null&&(el.innerText||'').trim().length<10;});if(c.length){c[0].click();return 'ok';}return 'no-btn';})()", null);
-                        }
-                    }, 6000);
+                    final android.webkit.WebView fv = view;
+                    final java.util.concurrent.atomic.AtomicInteger tries = new java.util.concurrent.atomic.AtomicInteger(0);
+                    final Runnable[] poll = new Runnable[1];
+                    poll[0] = () -> {
+                        if (fv == null || !dramaMode || tries.get() >= 15) return;
+                        tries.incrementAndGet();
+                        fv.evaluateJavascript(
+                            "(function(){var v=document.querySelector('video');if(v)return 'has-video';"
+                            + "var c=[].slice.call(document.querySelectorAll('div,button,span,a')).filter(function(el){return /播放正片|立即播放/.test((el.innerText||'').trim())&&el.offsetParent!==null&&(el.innerText||'').trim().length<10;});"
+                            + "if(c.length){c[0].click();return 'clicked';}return 'no-btn';})()", null);
+                        handler.postDelayed(poll[0], 2000);
+                    };
+                    handler.postDelayed(poll[0], 2000);
                 }
                 // 静默刷新模式：网页在后台加载，立即静音网页视频，避免与ExoPlayer声音叠加
                 if (silentRefreshPending) {
@@ -2985,6 +2986,12 @@ public class MainActivity extends AppCompatActivity {
                 if (url != null && url.length() > 0) {
                     String lower = url.toLowerCase();
                     // 屏蔽广告和非必要资源，减少卡顿（保留视频流、页面、JS、CSS）
+                    boolean hongguoPage = lower.contains("hongguoduanju.com") || dramaMode;
+                    if (hongguoPage && (lower.endsWith(".woff") || lower.endsWith(".woff2") || lower.endsWith(".ttf")
+                        || lower.contains("mon.zijieapi.com") || lower.contains("abtestvm.bytedance.com")
+                        || lower.contains("safe.usergrowth.com.cn"))) {
+                        return new WebResourceResponse("text/plain", "utf-8", new java.io.ByteArrayInputStream("".getBytes()));
+                    }
                     if (lower.contains("admaster") || lower.contains("doubleclick") || lower.contains("googlesyndication")
                         || lower.contains("umeng") || lower.contains("baidustatic")
                         || (lower.endsWith(".gif") && !lower.contains("cctv"))
@@ -4893,8 +4900,10 @@ public class MainActivity extends AppCompatActivity {
         cancelStreamRotation();
         silentRefreshPending = false; // 显式加载（换台/恢复）不再是静默链路，避免误静音
         keyRewriteCapable = false;    // 播放回到WebView，数据源重写不适用
-        // 非红果网页:退出短剧模式
-        if (webSourceUrl != null && !webSourceUrl.contains("hongguoduanju.com")) {
+        // 红果域名统一进入短剧模式(覆盖:网页频道条目/红果分组/手动加的红果站),自动点播放+连播+选集全部生效
+        if (webSourceUrl != null && webSourceUrl.contains("hongguoduanju.com")) {
+            dramaMode = true;
+        } else {
             dramaMode = false;
             dramaEpisodes = null;
         }
