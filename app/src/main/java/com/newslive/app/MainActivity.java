@@ -5205,20 +5205,16 @@ public class MainActivity extends AppCompatActivity {
             boolean hongguoGroup = "📺 红果短剧".equals(selGroup[0]);
             boolean dramaView = dramaMode && hongguoGroup; // 短剧播放中:该分组顶部显示当前剧集列表
             if (dramaView && dramaEpisodes != null && !dramaEpisodes.isEmpty()) {
-                // 当前剧集列表(点击跳集)
+            // 当前剧集列表(点击跳集)
                 for (int ep : dramaEpisodes) {
                     chRanges.add(new int[]{EPISODE_MARK - ep, EPISODE_MARK - ep});
                 }
             }
             if (hongguoGroup) {
-                loadHongguoDramasAsync(() -> runOnUiThread(() -> { if (updateChannelsRef[0] != null) updateChannelsRef[0].run(); }));
-            }
-            if (hongguoGroup) {
-                if (hongguoDramas == null) {
-                    if (!hongguoLoading) loadHongguoDramasAsync(null);
-                } else if (hongguoDramas.isEmpty()) {
-                    // 无条目
-                } else {
+                // 注意:此处不可用带回调的 loadHongguoDramasAsync(回调触发 updateChannels 重刷会无限递归 StackOverflow)
+                if (hongguoDramas == null && !hongguoLoading) {
+                    loadHongguoDramasAsync(null); // 首次拉取(null 回调安全)
+                } else if (hongguoDramas != null && !hongguoDramas.isEmpty()) {
                     int seq = 0;
                     for (String[] d : hongguoDramas) {
                         chRanges.add(new int[]{HONGGUO_MARK - seq, HONGGUO_MARK - seq});
