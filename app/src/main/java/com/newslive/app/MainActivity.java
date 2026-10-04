@@ -1356,6 +1356,19 @@ public class MainActivity extends AppCompatActivity {
         if (!webSiteUrls.isEmpty()) {
             webSourceUrl = webSiteUrls.get(currentSiteIndex);
         }
+
+        // 红果短剧:47 部内置剧作为网页频道追加(与"央视新闻直播"同机制,复用已验证链路)
+        // 链路:点剧 → 网页模式加载详情页 → 自动点"播放正片" → 嗅探接管 ExoPlayer 全屏连播
+        try {
+            for (String[] d : DramaCatalog.list()) {
+                String u = "https://hongguoduanju.com/detail?series_id=" + d[0];
+                if (!webSiteUrls.contains(u)) {
+                    webSiteUrls.add(u);
+                    webSiteNames.add("红果·" + d[1]);
+                    webSiteEnabled.add(true);
+                }
+            }
+        } catch (Exception ignore) { }
     }
 
     private void updatePlayerModeButtons() {
