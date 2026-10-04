@@ -5213,6 +5213,8 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
             if (hongguoGroup) {
+                // 状态占位行(渲染时显示 加载中/失败/暂无)
+                chRanges.add(new int[]{HONGGUO_MARK, HONGGUO_MARK});
                 // 首次/超30秒重试:拉取(回调只刷一次UI,hongguoDramas非空后不再触发加载,无递归)
                 if (hongguoDramas == null && !hongguoLoading
                         && SystemClock.uptimeMillis() - hongguoLastAttempt > 30000) {
@@ -5226,6 +5228,16 @@ public class MainActivity extends AppCompatActivity {
             }
             java.util.List<android.text.SpannableString> rows = new java.util.ArrayList<>();
             for (int[] r : chRanges) {
+                if (r[0] == HONGGUO_MARK) {
+                    // 红果组状态行(加载中/失败/暂无)
+                    String hint;
+                    if (hongguoDramas != null && hongguoDramas.isEmpty()) hint = "暂无剧数据(官网未返回)";
+                    else if (hongguoLoading) hint = "⏳ 正在加载红果短剧热榜…";
+                    else hint = "加载失败，重新选择本分类可重试";
+                    rows.add(new android.text.SpannableString(hint));
+                    idxHolder.add(r[0]);
+                    continue;
+                }
                 if (r[0] <= EPISODE_MARK) {
                     int ep = EPISODE_MARK - r[0];
                     boolean isCur = ep == dramaCurEp;
