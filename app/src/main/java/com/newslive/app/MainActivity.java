@@ -185,6 +185,7 @@ public class MainActivity extends AppCompatActivity {
     private java.util.List<String[]> hongguoDramas;
     private volatile boolean hongguoLoading = false;
     private long hongguoLastAttempt = 0; // 上次拉取尝试(30秒节流,防失败循环)
+    private volatile String hongguoLastError = ""; // 最近失败原因(直接显示在菜单里便于排查)
     private boolean channelMenuShowing = false;
     private static final int HONGGUO_MARK = -1000000; // 节目单里红果条目的编码基数(负数区)
     /** 红果网页连播辅助JS(幂等):__hgNext/__hgPrev 下一/上一集,__hgJump(n) 跳第n集,__hgInfo 剧名与集数 */
@@ -5251,9 +5252,13 @@ public class MainActivity extends AppCompatActivity {
                 if (r[0] == HONGGUO_MARK) {
                     // 红果组状态行(加载中/失败/暂无)
                     String hint;
-                    if (hongguoDramas != null && hongguoDramas.isEmpty()) hint = "暂无剧数据(官网未返回)";
-                    else if (hongguoLoading) hint = "⏳ 正在加载红果短剧热榜…";
-                    else hint = "⚠ 加载失败，点击本行立即重试";
+                    if (hongguoDramas != null && hongguoDramas.isEmpty()) {
+                        hint = "暂无剧数据 " + shortErr();
+                    } else if (hongguoLoading) {
+                        hint = "⏳ 正在加载红果短剧热榜…";
+                    } else {
+                        hint = "⚠ 失败:" + shortErr() + " 点击重试";
+                    }
                     rows.add(new android.text.SpannableString(hint));
                     idxHolder.add(r[0]);
                     continue;
@@ -5505,10 +5510,12 @@ public class MainActivity extends AppCompatActivity {
     /** 解析红果官网 SSR 页面(首页+多个榜单页):提取剧名与 series_id,合并去重 */
     private java.util.List<String[]> fetchHongguoDramas() {
         // 主域名直连:novelquickapp.com 会 301 重定向到 hongguoduanju.com,部分 Android 设备跟随失败
+        // 第4项为详情页兜底(首页/榜单被反爬时,详情页"相关短剧"区仍可解析出剧列表)
         final String[] pages = {
             "https://hongguoduanju.com/",
             "https://hongguoduanju.com/rank/hot-drama",
-            "https://hongguoduanju.com/rank/hot-comic-drama"
+            "https://hongguoduanju.com/rank/hot-comic-drama",
+            "https://hongguoduanju.com/detail?series_id=7690413747721997336"
         };
         final java.util.List<String[]> out =
                 java.util.Collections.synchronizedList(new java.util.ArrayList<String[]>());
@@ -5516,6 +5523,7 @@ public class MainActivity extends AppCompatActivity {
                 java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<String>());
         final java.util.concurrent.CountDownLatch latch =
                 new java.util.concurrent.CountDownLatch(pages.length);
+        final StringBuilder errs = new StringBuilder();
         for (final String pageUrl : pages) {
             new Thread(() -> {
                 try {
@@ -5526,11 +5534,16 @@ public class MainActivity extends AppCompatActivity {
                     conn.setReadTimeout(10000);
                     conn.setRequestProperty("User-Agent",
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0");
+                    conn.setRequestProperty("Accept", "text/html,application/xhtml+xml");
+                    conn.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9");
                     // 防 gzip:HttpURLConnection 不会自动解压,压缩内容按 UTF-8 直读会乱码导致解析 0 部
                     conn.setRequestProperty("Accept-Encoding", "identity");
                     int code = conn.getResponseCode();
                     if (code != 200) {
                         LogUtil.w("NewsLive", "hongguo page " + pageUrl + " code=" + code);
+                        synchronized (errs) {
+                            if (errs.length() < 100) errs.append("HTTP").append(code).append(" ");
+                        }
                         return;
                     }
                     java.io.BufferedReader reader = new java.io.BufferedReader(
@@ -5544,10 +5557,12 @@ public class MainActivity extends AppCompatActivity {
                         sb.append(buf, 0, n);
                     }
                     reader.close();
+                    String html = sb.toString();
 
+                    // 规则1:aria-label="查看剧名" + href="/detail?series_id=xxx"(首页/榜单页)
                     java.util.regex.Matcher m = java.util.regex.Pattern
                         .compile("aria-label=\"查看([^\"]{2,40})\"[^>]*href=\"/detail\\?series_id=(\\d+)\"")
-                        .matcher(sb.toString());
+                        .matcher(html);
                     int hits = 0;
                     while (m.find() && out.size() < 60) {
                         String name = m.group(1).trim();
@@ -5556,10 +5571,46 @@ public class MainActivity extends AppCompatActivity {
                         out.add(new String[]{id, name});
                         hits++;
                     }
+                    // 规则2(兜底):href="/detail?series_id=xxx" + 标签内剧名文本(详情页相关短剧区)
+                    if (hits == 0) {
+                        java.util.regex.Matcher m2 = java.util.regex.Pattern
+                            .compile("href=\"/detail\\?series_id=(\\d+)\"[^>]*>([\\s\\S]{0,400}?)</a>")
+                            .matcher(html);
+                        while (m2.find() && out.size() < 60) {
+                            String id = m2.group(1);
+                            if (!seen.add(id)) continue;
+                            String block = m2.group(2).replaceAll("<[^>]+>", "\n");
+                            String name = null;
+                            for (String line : block.split("\n")) {
+                                String t = line.trim();
+                                if (t.length() > 1 && !t.matches("全\\d+集")
+                                        && !t.startsWith("http") && t.length() < 40) {
+                                    name = t;
+                                    break;
+                                }
+                            }
+                            if (name != null) {
+                                out.add(new String[]{id, name});
+                                hits++;
+                            } else {
+                                seen.remove(id);
+                            }
+                        }
+                    }
                     LogUtil.i("NewsLive", "hongguo page ok: " + pageUrl
-                            + " bytes=" + sb.length() + " hits=" + hits);
+                            + " bytes=" + html.length() + " hits=" + hits);
+                    if (hits == 0) {
+                        synchronized (errs) {
+                            if (errs.length() < 100) errs.append("解析0部 ");
+                        }
+                    }
                 } catch (Exception pageErr) {
                     LogUtil.w("NewsLive", "hongguo page fail: " + pageUrl + " " + pageErr);
+                    synchronized (errs) {
+                        if (errs.length() < 100) {
+                            errs.append(pageErr.getClass().getSimpleName()).append(" ");
+                        }
+                    }
                 } finally {
                     latch.countDown();
                 }
@@ -5568,11 +5619,21 @@ public class MainActivity extends AppCompatActivity {
         try {
             latch.await(20, java.util.concurrent.TimeUnit.SECONDS);
         } catch (Exception ignore) { }
-        LogUtil.i("NewsLive", "hongguo fetch done, total=" + out.size());
+        hongguoLastError = errs.toString().trim();
+        LogUtil.i("NewsLive", "hongguo fetch done, total=" + out.size()
+                + " err=" + hongguoLastError);
         return new java.util.ArrayList<>(out);
     }
 
     /** 播放红果短剧:网页模式加载详情页,自动点"播放正片",嗅探接管后自动连播全剧 */
+    /** 失败原因短文本(直接显示在菜单状态行里,便于用户截图反馈) */
+    private String shortErr() {
+        String e = hongguoLastError == null ? "" : hongguoLastError.trim();
+        if (e.isEmpty()) return "点此重试";
+        e = e.replace("java.net.", "").replace("Exception", "E").replace("SSL", "SSL");
+        return e.length() > 34 ? e.substring(0, 34) + "…" : e;
+    }
+
     private void playHongguoDrama(String seriesId, String dramaName) {
         dramaMode = true;
         Toast.makeText(this, "🎬 短剧模式:" + dramaName + "(自动连播)", Toast.LENGTH_SHORT).show();
