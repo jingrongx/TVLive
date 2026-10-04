@@ -5382,6 +5382,20 @@ public class MainActivity extends AppCompatActivity {
                     webView.evaluateJavascript("(window.__hgJump ? window.__hgJump(" + ep + ") : 'no-fn')", null);
                     Toast.makeText(this, "跳转到第" + ep + "集", Toast.LENGTH_SHORT).show();
                 }
+            } else if (code == HONGGUO_MARK) {
+                // 状态占位行:点击立即重试(重置节流并重新拉取)
+                if (hongguoLoading) {
+                    Toast.makeText(this, "正在加载中，请稍候", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                hongguoLastAttempt = 0; // 解除节流
+                Toast.makeText(this, "正在重新加载红果短剧…", Toast.LENGTH_SHORT).show();
+                loadHongguoDramasAsync(() -> runOnUiThread(() -> {
+                    if (channelMenuShowing && updateChannelsRef[0] != null) {
+                        updateChannelsRef[0].run();
+                    }
+                }));
+                if (updateChannelsRef[0] != null) updateChannelsRef[0].run();
             } else if (code <= HONGGUO_MARK) {
                 // 红果短剧:加载详情页并自动连播
                 String[] d = hongguoPick.get(code);
