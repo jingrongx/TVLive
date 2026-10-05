@@ -5293,6 +5293,19 @@ public class MainActivity extends AppCompatActivity {
                 w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0xFFFFFFFF));
             }
         });
+        wv.setWebChromeClient(new android.webkit.WebChromeClient() {
+            @Override
+            public boolean onJsAlert(android.webkit.WebView view, String url, String message,
+                                     android.webkit.JsResult result) {
+                // 配置页内 alert 默认被 WebView 吞掉,转为原生常驻对话框(可截图)
+                new android.app.AlertDialog.Builder(MainActivity.this)
+                        .setMessage(message)
+                        .setPositiveButton("确定", (d2, w2) -> result.confirm())
+                        .setOnCancelListener(d2 -> result.cancel())
+                        .show();
+                return true;
+            }
+        });
         dialog.setOnDismissListener(d -> {
             wv.loadUrl("about:blank");
             wv.destroy();
@@ -5543,6 +5556,22 @@ public class MainActivity extends AppCompatActivity {
             String body = jsonConfig.trim();
             if (body.startsWith("﻿")) body = body.substring(1); // 去 BOM
             JSONObject config = new JSONObject(body);
+
+            // 两阶段保存·阶段1:先校验并应用最易失败的 sources(缺失/空 url 直接失败,无任何部分应用)
+            if (config.has("sources")) {
+                JSONArray preSrc = config.getJSONArray("sources");
+                for (int pi = 0; pi < preSrc.length(); pi++) {
+                    JSONObject ps = preSrc.getJSONObject(pi);
+                    if (ps.optString("url", "").isEmpty()) {
+                        throw new IllegalArgumentException("第 " + (pi + 1) + " 个直播源的 url 为空");
+                    }
+                    if (ps.optString("name", "").isEmpty()) {
+                        throw new IllegalArgumentException("第 " + (pi + 1) + " 个直播源的 name 为空");
+                    }
+                }
+                parseConfig(config);
+                saveConfigLocal();
+            }
             
             if (config.has("remoteUrl")) {
                 remoteConfigUrl = config.optString("remoteUrl", "");
@@ -5608,11 +5637,6 @@ public class MainActivity extends AppCompatActivity {
                 if (!webSiteUrls.isEmpty() && currentSiteIndex < webSiteUrls.size()) {
                     webSourceUrl = webSiteUrls.get(currentSiteIndex);
                 }
-            }
-
-            if (config.has("sources")) {
-                parseConfig(config);
-                saveConfigLocal();
             }
 
             // 退出记忆:新配置里若还有上次播放的台,继续播它;没有才回到第一个
@@ -6205,6 +6229,7 @@ public class MainActivity extends AppCompatActivity {
                 "<div class='btn-group'><button class='btn-fetch' onclick='fetchRemote()'>📥 从URL获取</button></div>" +
                 "</div>" +
                 "<button class='btn-save' onclick='saveConfig()'>💾 保存配置</button>" +
+                "<span id='saveMsg' style='display:inline-block;margin-left:10px;font-size:14px;font-weight:bold'></span>" +
                 "<script>" +
                 "var sources=" + sourcesJson.toString() + ";" +
                 "var websites=" + webSitesJson.toString() + ";" +
@@ -6302,7 +6327,7 @@ public class MainActivity extends AppCompatActivity {
                 "    });" +
                 "  }).catch(e=>{box.innerHTML='<span style=\"color:#C62828\">查询失败: '+e+'</span>';});" +
                 "}" +
-                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){alert('保存失败:'+(x.error||'未知错误')+'，请重试');}else{alert('保存成功！');}}).catch(e=>alert('保存失败:'+e));}" +
+                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};var msg=document.getElementById('saveMsg');msg.textContent='⏳ 正在保存…';msg.style.color='#1565c0';fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){var e='❌ 保存失败: '+(x.error||'未知错误')+' (请截图此行反馈)';msg.textContent=e;msg.style.color='#c62828';alert(e);}else{msg.textContent='✅ 保存成功 '+new Date().toLocaleTimeString();msg.style.color='#2e7d32';}}).catch(e=>{var t='❌ 保存失败: '+e;msg.textContent=t;msg.style.color='#c62828';alert(t);});}" +
                 "renderSources();" +
                 "renderWebsites();" +
                 // 页面加载时自动恢复:若有优选任务在跑,继续显示进度(锁屏/刷新后不丢状态)
