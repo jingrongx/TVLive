@@ -179,32 +179,6 @@ public class MainActivity extends AppCompatActivity {
     private final java.util.List<Integer> streamSpeeds = new java.util.ArrayList<>();
     /** 节目单里网页频道的编码基数: idx>=此值表示网页频道(实际网页索引=idx-此值) */
     private static final int WEB_ENTRY_MARK = 100000;
-    // 短剧连播模式(红果):嗅探到 TOS 流时置 true,播完一集自动驱动网页播放下一集
-    private volatile boolean dramaMode = false;
-    // 红果短剧剧列表缓存:{seriesId, name}(从 hongguoduanju.com SSR 页面解析)
-    private java.util.List<String[]> hongguoDramas;
-    private volatile boolean hongguoLoading = false;
-    private long hongguoLastAttempt = 0; // 上次拉取尝试(30秒节流,防失败循环)
-    private volatile String hongguoLastError = ""; // 最近失败原因(直接显示在菜单里便于排查)
-    private boolean channelMenuShowing = false;
-    private static final int HONGGUO_MARK = -1000000; // 节目单里红果条目的编码基数(负数区)
-    /** 红果网页连播辅助JS(幂等):__hgNext/__hgPrev 下一/上一集,__hgJump(n) 跳第n集,__hgInfo 剧名与集数 */
-    private static final String HONGGUO_JS =
-        "(function(){if(window.__hgJs)return;window.__hgJs=true;" +
-        "function eps(){return [].slice.call(document.querySelectorAll('span,div,li')).filter(function(e){return e.children.length===0&&/^第\\d+集$/.test((e.innerText||'').trim());}).sort(function(a,b){return parseInt((a.innerText.match(/\\d+/)||[0])[0])-parseInt((b.innerText.match(/\\d+/)||[0])[0]);});}" +
-        "function curIdx(list){for(var i=0;i<list.length;i++){var cn=(list[i].className||'')+' '+(list[i].parentElement?(list[i].parentElement.className||''):'');if(/current/i.test(cn))return i;}return -1;}" +
-        "window.__hgNext=function(){var l=eps();var c=curIdx(l);if(c<0)return 'no-current';if(c+1>=l.length)return 'end';l[c+1].click();return 'ok:'+l[c+1].innerText.trim();};" +
-        "window.__hgPrev=function(){var l=eps();var c=curIdx(l);if(c<=0)return 'no-prev';l[c-1].click();return 'ok:'+l[c-1].innerText.trim();};" +
-        "window.__hgJump=function(n){var l=eps();for(var i=0;i<l.length;i++){var m=(l[i].innerText.match(/\\d+/)||[0])[0];if(parseInt(m)===n){l[i].click();return 'ok';}}return 'not-found';};" +
-        "window.__hgInfo=function(){var t=document.querySelector('[class*=\"pc-title\"]');var l=eps();var c=curIdx(l);return JSON.stringify({title:t?t.innerText.trim():'',ep:c+1,total:l.length});};" +
-        "window.__hgEpisodes=function(){var l=eps();var c=curIdx(l);var arr=[];for(var i=0;i<l.length;i++){arr.push(parseInt((l[i].innerText.match(/\\d+/)||[0])[0]));}return JSON.stringify({cur:c+1,total:l.length,eps:arr});};" +
-        "})();";
-    /** 当前节目单的刷新入口(loadHongguoDramasAsync 拉取完成后重刷剧列表) */
-    final Runnable[] updateChannelsRef = new Runnable[1];
-    // 短剧模式:当前剧的集列表(菜单选集用,由 __hgEpisodes 异步提取)
-    private java.util.List<Integer> dramaEpisodes;
-    private int dramaCurEp = 0;
-    private static final int EPISODE_MARK = -2000000; // 节目单里"集"条目的编码基数
     private boolean isPlaying = false;
     private boolean isControlVisible = true;
     private Runnable hideControlRunnable;
@@ -498,11 +472,6 @@ public class MainActivity extends AppCompatActivity {
         initNetworkMonitor();
         initOrientationListener();
         loadSavedConfig();
-        // 预置红果短剧内置清单:即使网络完全不可用,短剧分组也始终有可播放的剧
-        try {
-            java.util.List<String[]> preset = loadHongguoFallbackList();
-            if (preset != null && !preset.isEmpty()) hongguoDramas = preset;
-        } catch (Exception ignore) { }
         applyBannerStyle();
         // 横幅尺寸变化（旋转/首帧布局/文字变化）时重新自适应字号
         if (infoOverlay != null) {
@@ -1121,7 +1090,7 @@ public class MainActivity extends AppCompatActivity {
                     "    if (video.querySelector('source')) {" +
                     "      src = video.querySelector('source').src || src;" +
                     "    }" +
-                    "    var finalSrc = (src && src.indexOf('blob:') === 0) ? (window.__sniffedUrl || '') : src;" +
+                    "    if (src && src.indexOf('blob:') === -1) {" +
                     "    if (finalSrc && window.AndroidVideoBridge) {" +
                     "      window.AndroidVideoBridge.onVideoPlaying(finalSrc);" +
                     "    }" +
@@ -1212,16 +1181,10 @@ public class MainActivity extends AppCompatActivity {
             sniffRefreshCount = 0;
             // 暂停WebView的所有活动和播放
             if (webView != null) {
-                if (dramaMode) {
-                    // 短剧连播:WebView 保持运行(GONE 但 JS/请求继续),用于自动播放下一集
-                    webView.onPause();
-                    webView.setVisibility(View.GONE);
-                } else {
-                    webView.onPause();
-                    webView.pauseTimers();
-                    webView.loadUrl("about:blank");
-                    webView.setVisibility(View.GONE);
-                }
+                webView.onPause();
+                webView.pauseTimers();
+                webView.loadUrl("about:blank");
+                webView.setVisibility(View.GONE);
             }
             playerContainer.setVisibility(View.VISIBLE);
 
@@ -1245,24 +1208,6 @@ public class MainActivity extends AppCompatActivity {
                 playVideoUrlSilent(videoUrl, pageName);
             } else {
                 playVideoUrl(videoUrl, pageName);
-            }
-            if (dramaMode) {
-                // 短剧模式:接管后暂停网页自身video(避免双流),并更新"剧名 第x/N集"显示
-                handler.postDelayed(() -> {
-                    if (webView == null || !dramaMode) return;
-                    webView.evaluateJavascript(
-                        "try{var v=document.querySelector('video');if(v&&!v.paused)v.pause();}catch(e){}"
-                        + "(function(){try{var t=document.querySelector('[class*=\"pc-title\"]');"
-                        + "var eps=[].slice.call(document.querySelectorAll('span,div')).filter(function(e){return e.children.length===0&&/^第\\d+集$/.test((e.innerText||'').trim());});"
-                        + "var cur=-1;for(var i=0;i<eps.length;i++){var cn=(eps[i].className||'')+' '+(eps[i].parentElement?(eps[i].parentElement.className||''):'' );if(/current/i.test(cn))cur=i;"
-                        + "window.__hgState=(t?t.innerText.trim():'')+(cur>=0?(' 第'+(cur+1)+'/'+eps.length+'集'):'');}catch(e){}})()", null);
-                    webView.evaluateJavascript("(window.__hgState||'')", r -> {
-                        if (r != null && r.length() > 2 && tvSourceInfo != null) {
-                            String s = r.replaceAll("^\"|\"$", "");
-                            if (!s.isEmpty()) tvSourceInfo.setText("🎬 " + s);
-                        }
-                    });
-                }, 2000);
             }
             // 不再强制横屏：方向跟随设备旋转，竖屏持机时视频以黑边居中显示，横过来即全屏
         });
@@ -1357,18 +1302,6 @@ public class MainActivity extends AppCompatActivity {
             webSourceUrl = webSiteUrls.get(currentSiteIndex);
         }
 
-        // 红果短剧:47 部内置剧作为网页频道追加(与"央视新闻直播"同机制,复用已验证链路)
-        // 链路:点剧 → 网页模式加载详情页 → 自动点"播放正片" → 嗅探接管 ExoPlayer 全屏连播
-        try {
-            for (String[] d : DramaCatalog.list()) {
-                String u = "https://hongguoduanju.com/detail?series_id=" + d[0];
-                if (!webSiteUrls.contains(u)) {
-                    webSiteUrls.add(u);
-                    webSiteNames.add("红果·" + d[1]);
-                    webSiteEnabled.add(true);
-                }
-            }
-        } catch (Exception ignore) { }
     }
 
     private void updatePlayerModeButtons() {
@@ -2913,23 +2846,6 @@ public class MainActivity extends AppCompatActivity {
                 updateWebChannelLabel();
                 // 持久化保存cookie（保留登录态）
                 CookieManager.getInstance().flush();
-                // 短剧模式:红果页面加载完,注入连播辅助JS并轮询自动点"播放正片"(直到video出现,最多15次)
-                if (dramaMode && url != null && url.contains("hongguoduanju.com")) {
-                    view.evaluateJavascript(HONGGUO_JS, null);
-                    final android.webkit.WebView fv = view;
-                    final java.util.concurrent.atomic.AtomicInteger tries = new java.util.concurrent.atomic.AtomicInteger(0);
-                    final Runnable[] poll = new Runnable[1];
-                    poll[0] = () -> {
-                        if (fv == null || !dramaMode || tries.get() >= 15) return;
-                        tries.incrementAndGet();
-                        fv.evaluateJavascript(
-                            "(function(){var v=document.querySelector('video');if(v)return 'has-video';"
-                            + "var c=[].slice.call(document.querySelectorAll('div,button,span,a')).filter(function(el){return /播放正片|立即播放/.test((el.innerText||'').trim())&&el.offsetParent!==null&&(el.innerText||'').trim().length<10;});"
-                            + "if(c.length){c[0].click();return 'clicked';}return 'no-btn';})()", null);
-                        handler.postDelayed(poll[0], 2000);
-                    };
-                    handler.postDelayed(poll[0], 2000);
-                }
                 // 静默刷新模式：网页在后台加载，立即静音网页视频，避免与ExoPlayer声音叠加
                 if (silentRefreshPending) {
                     view.evaluateJavascript(
@@ -2986,12 +2902,6 @@ public class MainActivity extends AppCompatActivity {
                 if (url != null && url.length() > 0) {
                     String lower = url.toLowerCase();
                     // 屏蔽广告和非必要资源，减少卡顿（保留视频流、页面、JS、CSS）
-                    boolean hongguoPage = lower.contains("hongguoduanju.com") || dramaMode;
-                    if (hongguoPage && (lower.endsWith(".woff") || lower.endsWith(".woff2") || lower.endsWith(".ttf")
-                        || lower.contains("mon.zijieapi.com") || lower.contains("abtestvm.bytedance.com")
-                        || lower.contains("safe.usergrowth.com.cn"))) {
-                        return new WebResourceResponse("text/plain", "utf-8", new java.io.ByteArrayInputStream("".getBytes()));
-                    }
                     if (lower.contains("admaster") || lower.contains("doubleclick") || lower.contains("googlesyndication")
                         || lower.contains("umeng") || lower.contains("baidustatic")
                         || (lower.endsWith(".gif") && !lower.contains("cctv"))
@@ -3002,14 +2912,6 @@ public class MainActivity extends AppCompatActivity {
                     boolean isStream = lower.endsWith(".m3u8") || lower.contains(".m3u8?")
                         || lower.endsWith(".mp4") || lower.contains(".mp4?")
                         || lower.endsWith(".flv") || lower.contains(".flv?");
-                    // 字节系视频存储(TOS)特征:红果短剧网页版用 MSE 播放,分片是
-                    // fetch 拉取的标准 MP4(URL 无后缀,ct=video/mp4),按路径特征嗅探
-                    if (!isStream && (lower.contains("/video/tos/") || lower.contains("qznovelvod.com"))) {
-                        isStream = true;
-                    }
-                    if (isStream && (lower.contains("/video/tos/") || lower.contains("qznovelvod"))) {
-                        dramaMode = true; // 红果短剧:进入短剧连播模式
-                    }
                     if (isStream) {
                         long now = System.currentTimeMillis();
                         // 防抖：切换频道后允许第一次嗅探，之后10秒内不重复触发（避免master+子流重复）
@@ -3019,14 +2921,6 @@ public class MainActivity extends AppCompatActivity {
                         if (lastDetectedVideoUrl.isEmpty() || now - lastSniffTime > 10000) {
                             LogUtil.d("NewsLive", "Sniffed candidate stream: " + url);
                             candidateVideoUrl = url;
-                            // 把候选地址注入页面:红果等 MSE 播放器 video.currentSrc 是 blob:,
-                            // 播放回调上报时需要回退到嗅探地址(见各 playing 监听器的 __sniffedUrl)
-                            final String sniffedJs = url.replace("\\", "\\\\").replace("'", "\'");
-                            runOnUiThread(() -> {
-                                if (webView != null) {
-                                    webView.evaluateJavascript("window.__sniffedUrl='" + sniffedJs + "';", null);
-                                }
-                            });
                             lastSniffTime = now;
                             // 按清晰度变体记录最新候选地址（供403快速恢复/主动轮换优先选择标清）
                             String variant = extractVariantName(url);
@@ -3343,7 +3237,7 @@ public class MainActivity extends AppCompatActivity {
             "    if (video.querySelector('source')) {" +
             "      src = video.querySelector('source').src || src;" +
             "    }" +
-            "    var finalSrc = (src && src.indexOf('blob:') === 0) ? (window.__sniffedUrl || '') : src;" +
+            "    if (src && src.indexOf('blob:') === -1) {" +
             "    if (finalSrc && window.AndroidVideoBridge) {" +
             "      window.AndroidVideoBridge.onVideoPlaying(finalSrc);" +
             "    }" +
@@ -3634,9 +3528,6 @@ public class MainActivity extends AppCompatActivity {
 
     private void autoClickPlayButton() {
         String js = "(function() {" +
-            // 红果短剧网页:点"播放正片"文字按钮(该页无标准播放器按钮)
-            "var hg=[].slice.call(document.querySelectorAll('div,button,span,a')).filter(function(el){return /播放正片|立即播放/.test((el.innerText||'').trim())&&el.offsetParent!==null&&(el.innerText||'').trim().length<10;});" +
-            "if(hg.length){hg[0].click();return 'clicked: hongguo-play';}" +
             // 移除播放覆盖层
             "var covers = ['.prism-cover','.vjs-cover','.video-cover','.player-cover','.mask-layer','.bp-overlay','.bpx-player-cover','.bilibili-player-video-cover','.video-mask','.ad-mask'];" +
             "covers.forEach(function(sel){" +
@@ -3975,6 +3866,7 @@ public class MainActivity extends AppCompatActivity {
                                                 progressBar.setVisibility(View.GONE);
                                                 scheduleGiveUpRecovery();
                                             }
+                                        }
                                     } else if (seekRetryCount[0] < 2) {
                                         seekRetryCount[0]++;
                                         if (!finalSilent) {
@@ -3999,16 +3891,6 @@ public class MainActivity extends AppCompatActivity {
                                             Toast.makeText(MainActivity.this, "该频道线路均卡顿，可按OK节目单换台", Toast.LENGTH_SHORT).show();
                                             player.setMediaItem(MediaItem.fromUri(Uri.parse(url)));
                                             player.prepare();
-                                        }
-                                    } else if (dramaMode && webView != null) {
-                                            // 短剧模式:重试耗尽会无动作导致永久卡住——驱动网页重播当前集
-                                            bufferingTime[0] = 0;
-                                            seekRetryCount[0] = 0;
-                                            if (webView != null) {
-                                                webView.evaluateJavascript(
-                                                    "(function(){try{var i=window.__hgEpisodes?JSON.parse(window.__hgEpisodes()):null;if(i&&i.cur){window.__hgJump(i.cur);return 'replay';}return 'no-info';}catch(e){return 'err';}})()",
-                                                    r2 -> Toast.makeText(MainActivity.this, "短剧卡顿，正在重播本集", Toast.LENGTH_SHORT).show());
-                                            }
                                         }
                                     } else {
                                         handler.postDelayed(this, 1000);
@@ -4044,16 +3926,7 @@ public class MainActivity extends AppCompatActivity {
                         break;
                     case Player.STATE_ENDED:
                         progressBar.setVisibility(View.GONE);
-                        // 短剧连播:本集播完,驱动网页切换下一集(新流由嗅探器自动接管)
-                        if (dramaMode && useWebMode && webView != null) {
-                            LogUtil.i("NewsLive", "短剧本集播完,自动播放下一集");
-                            webView.evaluateJavascript("(window.__hgNext ? window.__hgNext() : 'no-fn')", res -> {
-                                String rr = res == null ? "" : res.replaceAll("^\"|\"$", "");
-                                if ("end".equals(rr)) {
-                                    Toast.makeText(MainActivity.this, "本剧已播完，按OK打开节目单换剧", Toast.LENGTH_LONG).show();
-                                }
-                            });
-                        }
+
                         break;
                     case Player.STATE_IDLE:
                         progressBar.setVisibility(View.GONE);
@@ -4900,22 +4773,7 @@ public class MainActivity extends AppCompatActivity {
         cancelStreamRotation();
         silentRefreshPending = false; // 显式加载（换台/恢复）不再是静默链路，避免误静音
         keyRewriteCapable = false;    // 播放回到WebView，数据源重写不适用
-        // 红果域名统一进入短剧模式(覆盖:网页频道条目/红果分组/手动加的红果站),自动点播放+连播+选集全部生效
-        if (webSourceUrl != null && webSourceUrl.contains("hongguoduanju.com")) {
-            dramaMode = true;
-        } else {
-            dramaMode = false;
-            dramaEpisodes = null;
-        }
-        // 按站点切换桌面/移动 UA:红果系网页用桌面版布局——横屏电视上内容密集,
-        // 配合虚拟鼠标才可操作;其余站点保持移动 UA(触屏/焦点导航友好)
-        String webUa = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
-        String host = "";
-        try { host = android.net.Uri.parse(webSourceUrl).getHost() == null ? "" : android.net.Uri.parse(webSourceUrl).getHost(); } catch (Exception ignore) { }
-        if (host.contains("hongguoduanju.com") || host.contains("novelquickapp.com")) {
-            webUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-        }
-        webView.getSettings().setUserAgentString(webUa);
+        webView.getSettings().setUserAgentString("Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
         webView.setVisibility(View.VISIBLE);
         playerContainer.setVisibility(View.GONE);
         tvSourceInfo.setText(webSiteNames.isEmpty() ? "加载中..." : webSiteNames.get(currentSiteIndex) + "(加载中...)");
@@ -5160,11 +5018,8 @@ public class MainActivity extends AppCompatActivity {
         final java.util.List<String> groups = new java.util.ArrayList<>();
         groups.add("全部");
         if (!webSiteUrls.isEmpty()) groups.add("🌐 网页");
-        groups.add("红果短剧");
         groups.addAll(groupSet);
         final String[] selGroup = {groups.get(0)};
-        final java.util.Map<Integer, String[]> hongguoPick = new java.util.HashMap<>();
-
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
 
@@ -5251,69 +5106,8 @@ public class MainActivity extends AppCompatActivity {
                 if ("全部".equals(selGroup[0]) || selGroup[0].equals(g)) chRanges.add(new int[]{i, j});
                 i = j + 1;
             }
-            boolean hongguoGroup = "红果短剧".equals(selGroup[0]);
-            boolean dramaView = dramaMode && hongguoGroup; // 短剧播放中:该分组顶部显示当前剧集列表
-            if (dramaView && dramaEpisodes != null && !dramaEpisodes.isEmpty()) {
-            // 当前剧集列表(点击跳集)
-                for (int ep : dramaEpisodes) {
-                    chRanges.add(new int[]{EPISODE_MARK - ep, EPISODE_MARK - ep});
-                }
-            }
-            if (hongguoGroup) {
-                // 状态占位行(渲染时显示 加载中/失败/暂无)
-                chRanges.add(new int[]{HONGGUO_MARK, HONGGUO_MARK});
-                // 尝试拉官网最新热榜(5分钟节流);失败时保留内置清单,短剧分组始终有剧可看
-                if (!hongguoLoading
-                        && (hongguoLastAttempt == 0
-                            || SystemClock.uptimeMillis() - hongguoLastAttempt > 5 * 60 * 1000L)) {
-                    hongguoLastAttempt = SystemClock.uptimeMillis();
-                    loadHongguoDramasAsync(() -> runOnUiThread(() -> {
-                        if (channelMenuShowing && updateChannelsRef[0] != null) {
-                            updateChannelsRef[0].run(); // 成功后刷新为最新热榜
-                        }
-                    }));
-                }
-            }
             java.util.List<android.text.SpannableString> rows = new java.util.ArrayList<>();
             for (int[] r : chRanges) {
-                if (r[0] == HONGGUO_MARK) {
-                    // 红果组状态行(加载中/失败/暂无)
-                    String hint;
-                    if (hongguoDramas != null && hongguoDramas.isEmpty()) {
-                        hint = "暂无剧数据 " + shortErr();
-                    } else if (hongguoLoading) {
-                        hint = "⏳ 正在加载红果短剧热榜…";
-                    } else {
-                        hint = "⚠ 失败:" + shortErr() + " 点击重试";
-                    }
-                    rows.add(new android.text.SpannableString(hint));
-                    idxHolder.add(r[0]);
-                    continue;
-                }
-                if (r[0] <= EPISODE_MARK) {
-                    int ep = EPISODE_MARK - r[0];
-                    boolean isCur = ep == dramaCurEp;
-                    rows.add(new android.text.SpannableString((isCur ? "▶ 第" + ep + "集" : "第" + ep + "集")));
-                    idxHolder.add(r[0]);
-                    continue;
-                }
-                if (r[0] == HONGGUO_MARK) {
-                    // 红果组加载状态行(数据未到时不空白)
-                    String hint = hongguoLoading ? "⏳ 正在加载红果短剧热榜…"
-                            : (hongguoDramas != null && hongguoDramas.isEmpty() ? "暂无剧数据"
-                            : "加载失败，稍后自动重试");
-                    rows.add(new android.text.SpannableString(hint));
-                    idxHolder.add(r[0]);
-                    continue;
-                }
-                if (r[0] <= HONGGUO_MARK) {
-                    String[] d = hongguoPick.get(r[0]);
-                    String nm = d == null ? "红果短剧" : d[1];
-                    boolean hCur = false;
-                    rows.add(new android.text.SpannableString((hCur ? "▶ " : "") + "📺 " + nm));
-                    idxHolder.add(r[0]);
-                    continue;
-                }
                 if (r[0] >= WEB_ENTRY_MARK) {
                     int wIdx = r[0] - WEB_ENTRY_MARK;
                     String wName = wIdx < webSiteNames.size() ? webSiteNames.get(wIdx) : "网页" + (wIdx + 1);
@@ -5354,9 +5148,7 @@ public class MainActivity extends AppCompatActivity {
                             android.widget.TextView tv = v.findViewById(android.R.id.text1);
                             tv.setTextSize(14);
                             int code = idxHolder.get(position);
-                            boolean cur = code <= EPISODE_MARK
-                                    ? (EPISODE_MARK - code == dramaCurEp)
-                                    : code >= WEB_ENTRY_MARK
+                            boolean cur = code >= WEB_ENTRY_MARK
                                     ? (useWebMode && code - WEB_ENTRY_MARK == currentSiteIndex)
                                     : code == currentUrlIndex;
                             if (cur) {
@@ -5380,58 +5172,12 @@ public class MainActivity extends AppCompatActivity {
             groupAdapter.notifyDataSetChanged();
             updateChannels.run();
         });
-        updateChannelsRef[0] = updateChannels;
-        // 短剧播放中:默认选中红果组,并提取当前剧集列表供选集
-        if (dramaMode && groups.contains("红果短剧")) {
-            selGroup[0] = "红果短剧";
-            if (webView != null) {
-                webView.evaluateJavascript("(window.__hgEpisodes ? window.__hgEpisodes() : '{}')", r -> {
-                    try {
-                        org.json.JSONObject j = new org.json.JSONObject(r == null ? "{}" : r.replaceAll("^\"|\"$", ""));
-                        if (j.has("eps")) {
-                            org.json.JSONArray arr = j.getJSONArray("eps");
-                            java.util.List<Integer> eps = new java.util.ArrayList<>();
-                            for (int i = 0; i < arr.length(); i++) eps.add(arr.getInt(i));
-                            dramaEpisodes = eps;
-                            dramaCurEp = j.optInt("cur", 0);
-                            if (updateChannelsRef[0] != null) updateChannelsRef[0].run();
-                        }
-                    } catch (Exception ignore) { }
-                });
-            }
-        }
         lvChannels.setOnItemClickListener((parent, view, position, id) -> {
             int code = idxHolder.get(position);
             dialog.dismiss();
             if (code >= WEB_ENTRY_MARK) {
                 // 网页频道:安全切到网页模式(自动初始化WebView),再载入选中的网址
                 switchToWebSite(code - WEB_ENTRY_MARK);
-            } else if (code <= EPISODE_MARK) {
-                // 跳集:驱动红果网页跳到指定集(新流由嗅探接管)
-                int ep = EPISODE_MARK - code;
-                dialog.dismiss();
-                if (webView != null) {
-                    webView.evaluateJavascript("(window.__hgJump ? window.__hgJump(" + ep + ") : 'no-fn')", null);
-                    Toast.makeText(this, "跳转到第" + ep + "集", Toast.LENGTH_SHORT).show();
-                }
-            } else if (code == HONGGUO_MARK) {
-                // 状态占位行:点击立即重试(重置节流并重新拉取)
-                if (hongguoLoading) {
-                    Toast.makeText(this, "正在加载中，请稍候", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-                hongguoLastAttempt = 0; // 解除节流
-                Toast.makeText(this, "正在重新加载红果短剧…", Toast.LENGTH_SHORT).show();
-                loadHongguoDramasAsync(() -> runOnUiThread(() -> {
-                    if (channelMenuShowing && updateChannelsRef[0] != null) {
-                        updateChannelsRef[0].run();
-                    }
-                }));
-                if (updateChannelsRef[0] != null) updateChannelsRef[0].run();
-            } else if (code <= HONGGUO_MARK) {
-                // 红果短剧:加载详情页并自动连播
-                String[] d = hongguoPick.get(code);
-                if (d != null) playHongguoDrama(d[0], d[1]);
             } else {
                 currentUrlIndex = code;
                 loadStreamFromConfig(code);
@@ -5456,12 +5202,7 @@ public class MainActivity extends AppCompatActivity {
                 if (cur >= 0) lvChannels.setSelection(Math.max(cur - 2, 0));
             });
         });
-        dialog.setOnDismissListener(d -> {
-            channelMenuShowing = false;
-            updateChannelsRef[0] = null; // 释放对已销毁 dialog/adapter 的引用
-        });
         dialog.show();
-        channelMenuShowing = true;
         updateChannels.run();
     }
 
@@ -5518,193 +5259,14 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** 后台拉取红果短剧热榜剧列表(SSR 首页解析,无需逆向接口) */
-    private void loadHongguoDramasAsync(Runnable onLoaded) {
-        if (hongguoLoading) return; // 正在拉取
-        hongguoLoading = true;
-        final java.util.List<String[]> cached = hongguoDramas; // 失败兜底
-        try {
-        executorService.execute(() -> {
-            java.util.List<String[]> fresh = fetchHongguoDramas(); // 每次重拉:热榜每日更新
-            if (fresh != null && !fresh.isEmpty()) hongguoDramas = fresh;
-            hongguoLoading = false;
-            if (onLoaded != null) runOnUiThread(onLoaded);
-        });
-        } catch (Exception reject) {
-            hongguoLoading = false; // 线程池已关闭(onDestroy)等,避免卡在"加载中"
-        }
-    }
 
     /** 解析红果官网 SSR 页面(首页+多个榜单页):提取剧名与 series_id,合并去重 */
-    private java.util.List<String[]> fetchHongguoDramas() {
-        // 主域名直连:novelquickapp.com 会 301 重定向到 hongguoduanju.com,部分 Android 设备跟随失败
-        // 第4项为详情页兜底(首页/榜单被反爬时,详情页"相关短剧"区仍可解析出剧列表)
-        final String[] pages = {
-            "https://hongguoduanju.com/",
-            "https://hongguoduanju.com/rank/hot-drama",
-            "https://hongguoduanju.com/rank/hot-comic-drama",
-            "https://hongguoduanju.com/detail?series_id=7690413747721997336"
-        };
-        final java.util.List<String[]> out =
-                java.util.Collections.synchronizedList(new java.util.ArrayList<String[]>());
-        final java.util.Set<String> seen =
-                java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<String>());
-        final java.util.concurrent.CountDownLatch latch =
-                new java.util.concurrent.CountDownLatch(pages.length);
-        final StringBuilder errs = new StringBuilder();
-        for (final String pageUrl : pages) {
-            new Thread(() -> {
-                try {
-                    java.net.URL url = new java.net.URL(pageUrl);
-                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                    conn.setInstanceFollowRedirects(true);
-                    conn.setConnectTimeout(10000);
-                    conn.setReadTimeout(20000);
-                    conn.setRequestProperty("User-Agent",
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0");
-                    conn.setRequestProperty("Accept", "text/html,application/xhtml+xml");
-                    conn.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9");
-                    // 防 gzip:HttpURLConnection 不会自动解压,压缩内容按 UTF-8 直读会乱码导致解析 0 部
-                    conn.setRequestProperty("Accept-Encoding", "identity");
-                    int code = conn.getResponseCode();
-                    if (code != 200) {
-                        LogUtil.w("NewsLive", "hongguo page " + pageUrl + " code=" + code);
-                        synchronized (errs) {
-                            if (errs.length() < 100) errs.append("HTTP").append(code).append(" ");
-                        }
-                        return;
-                    }
-                    java.io.BufferedReader reader = new java.io.BufferedReader(
-                            new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
-                    StringBuilder sb = new StringBuilder();
-                    char[] buf = new char[8192];
-                    int n;
-                    long deadline = System.currentTimeMillis() + 30000; // 页面 190KB+ 且首张卡片在 ~56KB 处,慢网络需放宽
-                    while ((n = reader.read(buf)) != -1 && sb.length() < 900 * 1024
-                            && System.currentTimeMillis() < deadline) {
-                        sb.append(buf, 0, n);
-                    }
-                    reader.close();
-                    String html = sb.toString();
-
-                    // 规则1:aria-label="查看剧名" + href="/detail?series_id=xxx"(首页/榜单页)
-                    java.util.regex.Matcher m = java.util.regex.Pattern
-                        .compile("aria-label=\"查看([^\"]{2,40})\"[^>]*href=\"/detail\\?series_id=(\\d+)\"")
-                        .matcher(html);
-                    int hits = 0;
-                    while (m.find() && out.size() < 60) {
-                        String name = m.group(1).trim();
-                        String id = m.group(2);
-                        if (!seen.add(id)) continue;
-                        out.add(new String[]{id, name});
-                        hits++;
-                    }
-                    // 规则2(兜底):href="/detail?series_id=xxx" + 标签内剧名文本(详情页相关短剧区)
-                    if (hits == 0) {
-                        java.util.regex.Matcher m2 = java.util.regex.Pattern
-                            .compile("href=\"/detail\\?series_id=(\\d+)\"[^>]*>([\\s\\S]{0,400}?)</a>")
-                            .matcher(html);
-                        while (m2.find() && out.size() < 60) {
-                            String id = m2.group(1);
-                            if (!seen.add(id)) continue;
-                            String block = m2.group(2).replaceAll("<[^>]+>", "\n");
-                            String name = null;
-                            for (String line : block.split("\n")) {
-                                String t = line.trim();
-                                if (t.length() > 1 && !t.matches("全\\d+集")
-                                        && !t.startsWith("http") && t.length() < 40) {
-                                    name = t;
-                                    break;
-                                }
-                            }
-                            if (name != null) {
-                                out.add(new String[]{id, name});
-                                hits++;
-                            } else {
-                                seen.remove(id);
-                            }
-                        }
-                    }
-                    LogUtil.i("NewsLive", "hongguo page ok: " + pageUrl
-                            + " bytes=" + html.length() + " hits=" + hits);
-                    if (hits == 0) {
-                        synchronized (errs) {
-                            if (errs.length() < 100) errs.append("解析0部 ");
-                        }
-                    }
-                } catch (Exception pageErr) {
-                    LogUtil.w("NewsLive", "hongguo page fail: " + pageUrl + " " + pageErr);
-                    synchronized (errs) {
-                        if (errs.length() < 100) {
-                            errs.append(pageErr.getClass().getSimpleName()).append(" ");
-                        }
-                    }
-                } finally {
-                    latch.countDown();
-                }
-            }).start();
-        }
-        try {
-            latch.await(45, java.util.concurrent.TimeUnit.SECONDS);
-        } catch (Exception ignore) { }
-        java.util.List<String[]> result = new java.util.ArrayList<>(out);
-        if (result.isEmpty()) {
-            // 网络解析失败:回退到内置清单,保证短剧功能始终可用
-            result = loadHongguoFallbackList();
-            LogUtil.i("NewsLive", "hongguo fetch empty, use built-in list: " + result.size());
-            if (result.isEmpty()) {
-                hongguoLastError = errs.length() == 0 ? "网络无响应" : errs.toString().trim();
-            }
-        } else {
-            hongguoLastError = errs.toString().trim();
-        }
-        LogUtil.i("NewsLive", "hongguo fetch done, total=" + result.size()
-                + " err=" + hongguoLastError);
-        return result;
-    }
 
     /** 播放红果短剧:网页模式加载详情页,自动点"播放正片",嗅探接管后自动连播全剧 */
     /** 读取 assets 内置红果剧清单(网络解析失败时的兜底,保证功能可用) */
-    private java.util.List<String[]> loadHongguoFallbackList() {
-        java.util.List<String[]> list = new java.util.ArrayList<>();
-        try {
-            java.io.InputStream is = getAssets().open("hongguo_drama_list.txt");
-            java.io.BufferedReader br = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(is, "UTF-8"));
-            String line;
-            while ((line = br.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty() || line.startsWith("#")) continue;
-                int p = line.indexOf('|');
-                if (p <= 0) continue;
-                String id = line.substring(0, p).trim();
-                String name = line.substring(p + 1).trim();
-                if (!id.isEmpty() && !name.isEmpty()) list.add(new String[]{id, name});
-            }
-            br.close();
-        } catch (Exception e) {
-            LogUtil.w("NewsLive", "hongguo fallback assets load fail: " + e);
-        }
-        if (list.isEmpty()) {
-            list = DramaCatalog.list(); // assets 不可用时用编译进 dex 的内置清单
-        }
-        return list;
-    }
 
     /** 失败原因短文本(直接显示在菜单状态行里,便于用户截图反馈) */
-    private String shortErr() {
-        String e = hongguoLastError == null ? "" : hongguoLastError.trim();
-        if (e.isEmpty()) return "点此重试";
-        e = e.replace("java.net.", "").replace("Exception", "E").replace("SSL", "SSL");
-        return e.length() > 34 ? e.substring(0, 34) + "…" : e;
-    }
 
-    private void playHongguoDrama(String seriesId, String dramaName) {
-        dramaMode = true;
-        Toast.makeText(this, "🎬 短剧模式:" + dramaName + "(自动连播)", Toast.LENGTH_SHORT).show();
-        webSourceUrl = "https://hongguoduanju.com/detail?series_id=" + seriesId;
-        // switchToWebSite(-1) 只确保网页模式与 WebView 就绪,不改站点索引
-        switchToWebSite(-1);
-    }
 
     /** 退出应用（沉浸式下返回键难找时的兜底入口） */
     private void confirmExit() {
@@ -5725,10 +5287,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadStreamFromConfig(int index) {
-        // 切回直播源:退出短剧模式(此前 dramaMode 从不清零,导致 WebView 永不休眠/按键与菜单残留)
-        dramaMode = false;
-        dramaEpisodes = null;
-        dramaCurEp = 0;
         // 兼容节目单混合模式:从网页模式直接点播放器源时,先收起网页并初始化播放器
         // (此前该路径下 player==null 会导致 NPE 崩溃)
         if (useWebMode) {
@@ -5740,14 +5298,9 @@ public class MainActivity extends AppCompatActivity {
             silentRefreshPending = false;
             fullscreenRetryCount = 0;
             if (webView != null) {
-                if (dramaMode) {
-                    // 短剧连播:WebView 保持运行(GONE 但 JS/请求继续),用于自动播放下一集
-                    webView.setVisibility(View.GONE);
-                } else {
-                    webView.pauseTimers();
-                    webView.onPause();
-                    webView.setVisibility(View.GONE);
-                }
+                webView.pauseTimers();
+                webView.onPause();
+                webView.setVisibility(View.GONE);
             }
             playerContainer.setVisibility(View.VISIBLE);
             hideSwitchOverlay();
