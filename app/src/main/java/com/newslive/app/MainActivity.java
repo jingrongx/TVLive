@@ -179,6 +179,8 @@ public class MainActivity extends AppCompatActivity {
     private final java.util.List<Integer> streamSpeeds = new java.util.ArrayList<>();
     /** 节目单里网页频道的编码基数: idx>=此值表示网页频道(实际网页索引=idx-此值) */
     private static final int WEB_ENTRY_MARK = 100000;
+    private long lastFitAppliedAt = 0; // 横幅字号上次应用时间(3秒冷却防振荡)
+    private volatile String lastConfigError = ""; // 最近一次配置解析失败的具体原因
     private boolean isPlaying = false;
     private boolean isControlVisible = true;
     private Runnable hideControlRunnable;
@@ -1518,8 +1520,12 @@ public class MainActivity extends AppCompatActivity {
             }
             if (!measurable) return;
             allowed = Math.max(0.35f, Math.min(BANNER_MAX_SCALE, allowed));
-            // 接近目标(±0.5%)则保持稳定，避免每秒微调抖动
-            if (Math.abs(allowed - bannerFitScale) >= 0.005f) {
+            // 接近目标(±0.5%)则保持稳定，避免每秒微调抖动;
+            // 另加 3 秒冷却:时钟/天气等周期性文字变化会使宽度在临界点来回摆,
+            // 强阻尼让字号最多 3 秒变一次,消除"一跳一跳"
+            if (Math.abs(allowed - bannerFitScale) >= 0.005f
+                    && SystemClock.elapsedRealtime() - lastFitAppliedAt > 3000) {
+                lastFitAppliedAt = SystemClock.elapsedRealtime();
                 bannerFitScale = allowed;
                 applyBannerFontSizes();
                 // 硬校验：线性近似若有偏差导致任一行仍溢出，整体再缩一档
@@ -1887,6 +1893,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         final String loc = newLoc;
+        try {
         executorService.execute(() -> {
             double[] coord = geocodeManualLocation(loc);
             if (coord != null) {
@@ -1906,6 +1913,10 @@ public class MainActivity extends AppCompatActivity {
                     "地区无法识别（查不到对应天气），未保存: " + loc, Toast.LENGTH_LONG).show());
             }
         });
+        } catch (Exception reject) {
+            // 线程池已关闭等极端情况:不再向保存链路抛异常,避免配置保存被误判失败
+            LogUtil.w("NewsLive", "manual location task rejected: " + reject);
+        }
     }
 
     // IP定位：通过公网IP获取位置（电视无GPS）
@@ -5526,9 +5537,12 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    public boolean updateConfig(String jsonConfig) {
+    public synchronized boolean updateConfig(String jsonConfig) {
         try {
-            JSONObject config = new JSONObject(jsonConfig);
+            if (jsonConfig == null) throw new IllegalArgumentException("空配置");
+            String body = jsonConfig.trim();
+            if (body.startsWith("﻿")) body = body.substring(1); // 去 BOM
+            JSONObject config = new JSONObject(body);
             
             if (config.has("remoteUrl")) {
                 remoteConfigUrl = config.optString("remoteUrl", "");
@@ -5622,6 +5636,7 @@ public class MainActivity extends AppCompatActivity {
             return true;
         } catch (Exception e) {
             e.printStackTrace();
+            lastConfigError = e.getClass().getSimpleName() + ": " + e.getMessage();
             runOnUiThread(() -> 
                 Toast.makeText(this, "配置格式错误: " + e.getMessage(), Toast.LENGTH_LONG).show()
             );
@@ -5996,7 +6011,7 @@ public class MainActivity extends AppCompatActivity {
                     boolean ok = updateConfig(configBody);
 
                     String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
-                            + (ok ? "{\"status\":\"ok\"}" : "{\"status\":\"error\",\"error\":\"配置格式错误，请重试\"}");
+                            + (ok ? "{\"status\":\"ok\"}" : "{\"status\":\"error\",\"error\":\"格式错误:" + jsonEsc(lastConfigError == null ? "" : lastConfigError) + "\"}");
                     client.getOutputStream().write(response.getBytes());
                 } else if (request != null && request.startsWith("GET") && request.contains("/proxy?url=")) {
                     String proxyUrl = java.net.URLDecoder.decode(request.split("url=")[1].split(" ")[0], "UTF-8");
