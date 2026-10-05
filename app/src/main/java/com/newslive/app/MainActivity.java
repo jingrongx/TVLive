@@ -5116,6 +5116,8 @@ public class MainActivity extends AppCompatActivity {
                         View v = super.getView(position, convertView, parent);
                         android.widget.TextView tv = v.findViewById(android.R.id.text1);
                         tv.setTextSize(14);
+                        tv.setSingleLine(true);
+                        tv.setEllipsize(android.text.TextUtils.TruncateAt.END);
                         if (groups.get(position).equals(selGroup[0])) {
                             tv.setTextColor(0xFF4FC3F7);
                             tv.setTypeface(null, android.graphics.Typeface.BOLD);
@@ -5166,19 +5168,36 @@ public class MainActivity extends AppCompatActivity {
                     sp = Math.max(sp, streamSpeeds.get(k));
                 }
                 String name = streamNames.get(start);
-                boolean cur = currentUrlIndex >= start && currentUrlIndex <= end;
+                if (name.length() > 16) name = name.substring(0, 16) + "…";
+                boolean cur = !useWebMode && currentUrlIndex >= start && currentUrlIndex <= end;
                 String mark = cur ? "▶ " : "";
-                String base = mark + name + (lines > 1 ? " (" + lines + "条线路)" : "")
-                        + ChannelStats.get(MainActivity.this).badge(streamUrls.get(start));
+                String base = mark + name + (lines > 1 ? "(" + lines + "线)" : "");
+                // 速度:当前播放频道显示实时值,其余显示优选测速值;格式紧凑(2.5M/800K)防换行
                 String speedTxt;
                 int speedColor;
-                if (sp >= 500) { speedTxt = "   ⚡ " + sp + "KB/s"; speedColor = 0xFF8BC34A; }        // 快:绿
-                else if (sp >= 200) { speedTxt = "   " + sp + "KB/s"; speedColor = 0xFFFFD54F; }      // 中:黄
-                else if (sp > 0) { speedTxt = "   " + sp + "KB/s"; speedColor = 0xFFFFAB91; }         // 慢:橙
-                else { speedTxt = "   —"; speedColor = 0xFF78909C; }                                   // 无数据:灰
-                android.text.SpannableString ss = new android.text.SpannableString(base + speedTxt);
+                if (cur && ChannelStats.get(MainActivity.this).liveKbps() > 0) {
+                    float kbps = ChannelStats.get(MainActivity.this).liveKbps();
+                    speedTxt = " ⚡" + (kbps >= 1000
+                            ? String.format("%.1fM", kbps / 1000f)
+                            : Math.round(kbps) + "K") + " 实时";
+                    speedColor = 0xFF8BC34A;
+                } else if (sp >= 500) { speedTxt = " ⚡" + (sp >= 1000 ? String.format("%.1fM", sp / 1000f) : sp + "K"); speedColor = 0xFF8BC34A; }
+                else if (sp >= 200) { speedTxt = " " + (sp >= 1000 ? String.format("%.1fM", sp / 1000f) : sp + "K"); speedColor = 0xFFFFD54F; }
+                else if (sp > 0) { speedTxt = " " + sp + "K"; speedColor = 0xFFFFAB91; }
+                else { speedTxt = " —"; speedColor = 0xFF78909C; }
+                // 稳定性徽章(有累积数据才显示)
+                String badge = ChannelStats.get(MainActivity.this).badge(streamUrls.get(start));
+                String tail = speedTxt + badge;
+                android.text.SpannableString ss = new android.text.SpannableString(base + tail);
                 ss.setSpan(new android.text.style.ForegroundColorSpan(speedColor),
-                        base.length(), ss.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        base.length(), ss.length() - badge.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                if (!badge.isEmpty()) {
+                    int bs = badge.trim().startsWith("▲") ? 0xFF8BC34A
+                            : (badge.trim().startsWith("△") ? 0xFFFFD54F : 0xFFFF8A80);
+                    ss.setSpan(new android.text.style.ForegroundColorSpan(bs),
+                            base.length() + speedTxt.length(), ss.length(),
+                            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                }
                 rows.add(ss);
                 idxHolder.add(start); // 点击播该频道最快线路
             }
@@ -5190,6 +5209,8 @@ public class MainActivity extends AppCompatActivity {
                             View v = super.getView(position, convertView, parent);
                             android.widget.TextView tv = v.findViewById(android.R.id.text1);
                             tv.setTextSize(14);
+                            tv.setSingleLine(true);
+                            tv.setEllipsize(android.text.TextUtils.TruncateAt.END);
                             int code = idxHolder.get(position);
                             boolean cur = code >= WEB_ENTRY_MARK
                                     ? (useWebMode && code - WEB_ENTRY_MARK == currentSiteIndex)
