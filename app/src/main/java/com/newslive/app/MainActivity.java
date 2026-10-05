@@ -479,6 +479,27 @@ public class MainActivity extends AppCompatActivity {
                 (v, l, t, r, b, ol, ot, or2, ob) -> scheduleBannerAutoFit());
         }
         startHttpServer();
+        // 实时速度显示:每 5 秒刷新频道信息栏(速度+稳定性分)
+        Runnable speedTicker = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    ChannelStats cs = ChannelStats.get(MainActivity.this);
+                    float kbps = cs.liveKbps();
+                    if (kbps > 0 && tvSourceInfo != null && player != null
+                            && playerContainer != null && playerContainer.getVisibility() == View.VISIBLE) {
+                        String base = tvSourceInfo.getText().toString();
+                        int p = base.indexOf(" · ");
+                        if (p > 0) base = base.substring(0, p);
+                        long k = Math.round(kbps);
+                        String speedTxt = k >= 1000 ? String.format("%.1fMb/s", kbps / 1000f) : k + "Kb/s";
+                        tvSourceInfo.setText(base + " · " + speedTxt);
+                    }
+                } catch (Exception ignore) { }
+                handler.postDelayed(this, 5000);
+            }
+        };
+        handler.postDelayed(speedTicker, 5000);
         updatePlayerModeButtons();
 
         // 默认进入网页模式
@@ -3788,6 +3809,7 @@ public class MainActivity extends AppCompatActivity {
 
         LogUtil.i("NewsLive", "playVideoUrl: " + url + " retry=" + retryCount + " refreshed=" + isRefreshed + " silent=" + silent);
 
+        ChannelStats.get(this).begin(url);
         tvSourceInfo.setText(name + (isRefreshed ? " (已刷新)" : ""));
         if (!silent) {
             progressBar.setVisibility(View.VISIBLE);
@@ -3842,6 +3864,7 @@ public class MainActivity extends AppCompatActivity {
                             progressBar.setVisibility(View.VISIBLE);
                             rebufCount[0]++; // 仅统计,不触发换源(偶发缓冲是直播常态,误换会陷入换台循环)
                         }
+                        if (!finalSilent) ChannelStats.get(MainActivity.this).bufferStart();
                         bufferingTime[0] = 0;
                         handler.postDelayed(new Runnable() {
                             @Override
@@ -3902,6 +3925,7 @@ public class MainActivity extends AppCompatActivity {
                     case Player.STATE_READY:
                         progressBar.setVisibility(View.GONE);
                         isPlaying = true;
+                        ChannelStats.get(MainActivity.this).bufferEnd();
                         // 稳定播放30秒后清零短卡计数
                         if (stableClear[0] != null) handler.removeCallbacks(stableClear[0]);
                         stableClear[0] = () -> { if (player != null && player.isPlaying()) rebufCount[0] = 0; };
@@ -3938,6 +3962,7 @@ public class MainActivity extends AppCompatActivity {
             public void onPlayerError(PlaybackException error) {
                 progressBar.setVisibility(View.GONE);
                 hasError[0] = true;
+                ChannelStats.get(MainActivity.this).error();
 
                 LogUtil.e("NewsLive", "onPlayerError: " + error.getMessage() + " errorCode=" + error.errorCode + " cause=" + (error.getCause() != null ? error.getCause().getMessage() : "null"), error);
 
@@ -4038,6 +4063,12 @@ public class MainActivity extends AppCompatActivity {
             }
         };
         player.addListener(currentPlayerListener);
+        player.addAnalyticsListener(new androidx.media3.exoplayer.analytics.AnalyticsListener() {
+            public void onBandwidthEstimate(androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime eventTime,
+                                            int totalLoadTimeMs, int totalBytesLoaded, long bitrate) {
+                ChannelStats.get(MainActivity.this).bandwidth(totalBytesLoaded, totalLoadTimeMs);
+            }
+        });
     }
     
     private void updateVideoLayout(int videoWidth, int videoHeight) {
@@ -5126,7 +5157,8 @@ public class MainActivity extends AppCompatActivity {
                 String name = streamNames.get(start);
                 boolean cur = currentUrlIndex >= start && currentUrlIndex <= end;
                 String mark = cur ? "▶ " : "";
-                String base = mark + name + (lines > 1 ? " (" + lines + "条线路)" : "");
+                String base = mark + name + (lines > 1 ? " (" + lines + "条线路)" : "")
+                        + ChannelStats.get(MainActivity.this).badge(streamUrls.get(start));
                 String speedTxt;
                 int speedColor;
                 if (sp >= 500) { speedTxt = "   ⚡ " + sp + "KB/s"; speedColor = 0xFF8BC34A; }        // 快:绿
@@ -5794,6 +5826,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        try { ChannelStats.get(this).flush(); } catch (Exception ignore) { }
         cancelWebViewTimeoutTimer();
 
         // 停止时钟
