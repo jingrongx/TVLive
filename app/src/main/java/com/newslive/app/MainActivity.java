@@ -211,10 +211,12 @@ public class MainActivity extends AppCompatActivity {
     private boolean isStreamListEnabled = true;
     // 后台播放开关：false=切后台/息屏自动暂停（默认），true=后台/息屏继续播放
     private boolean backgroundPlay = false;
-    // 后台硬停止：切后台2.5秒后仍在后台则卸载页面(about:blank)——部分站点用
-    // AudioContext/WebWorker等非video通道恢复音频，JS封印拦不住，页面销毁才绝对可靠
-    private Runnable webBackgroundBlankRunnable;
+    // 后台硬停止：onPause立即卸载页面(about:blank)——部分站点用AudioContext/WebWorker
+    // 等非video通道恢复音频，JS封印拦不住，页面销毁才绝对可靠
     private boolean webBackgroundBlanked = false; // 页面是否已在后台被卸载（切回需重载）
+    // App是否在前台（onPause置false，onResume置true）。后台播放开关开启时切后台仍视为
+    // "前台"——网络恢复等事件需要正常触发播放
+    private volatile boolean isAppInForeground = true;
     // 顶部信息横幅设置
     private android.view.View infoOverlay;
     private boolean bannerVisible = true;
@@ -902,7 +904,16 @@ public class MainActivity extends AppCompatActivity {
     
     private void onNetworkRestored() {
         Toast.makeText(this, "网络已恢复", Toast.LENGTH_SHORT).show();
-        
+
+        // 后台时严禁网络恢复触发任何播放/加载：
+        // ① webView.resumeTimers会复活已被onPause挂起的WebView（页面已卸载成about:blank），
+        //    loadWebSource会在后台重新加载页面并自动播放→后台复播
+        // ② player.setPlayWhenReady(true)直接在后台重新开播ExoPlayer
+        // 切回前台时onResume的重载逻辑（卸载标志/断网标志/超10秒）已覆盖恢复需求
+        if (!isAppInForeground) {
+            LogUtil.i("NewsLive", "onNetworkRestored skipped: app in background");
+            return;
+        }
         if (useWebMode) {
             if (webView != null) {
                 webView.resumeTimers();
@@ -3882,6 +3893,13 @@ public class MainActivity extends AppCompatActivity {
             }
             player.setMediaItem(mediaItem);
             player.prepare();
+            // 后台禁止开播：切后台瞬间已入队的重试任务（播放错误重试/403恢复/预载超时
+            // 回退等）可能在此刻执行，无条件开播会在后台复播音频。仅prepare预缓冲，
+            // 不setPlayWhenReady(true)；切回前台由onStart/onResume重载逻辑恢复播放
+            if (!isAppInForeground && !backgroundPlay) {
+                LogUtil.i("NewsLive", "playVideoUrl: app in background, prepare only (no start)");
+                return;
+            }
             player.setPlayWhenReady(true);
             LogUtil.i("NewsLive", "prepare() called successfully");
         } catch (Exception e) {
@@ -4106,6 +4124,10 @@ public class MainActivity extends AppCompatActivity {
                     pauseRetryCount[0]++;
                     if (pauseRetryCount[0] <= 5) {
                         handler.postDelayed(() -> {
+                            // 后台禁止自动恢复：onPause暂停ExoPlayer本身就会触发本监听
+                            // （isPlaying=false），2秒后的恢复任务会直接在后台重新开播
+                            // ——切后台约3秒后音频复播的主通道
+                            if (!isAppInForeground && !backgroundPlay) return;
                             if (player != null && !player.isPlaying() && player.getPlaybackState() == Player.STATE_READY && !hasError[0]) {
                                 player.setPlayWhenReady(true);
                             }
@@ -5895,12 +5917,8 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        isAppInForeground = true;
         hideSystemUI();
-        // 取消后台卸载页面的定时器（只要回到前台就不卸载）
-        if (webBackgroundBlankRunnable != null) {
-            handler.removeCallbacks(webBackgroundBlankRunnable);
-            webBackgroundBlankRunnable = null;
-        }
         if (useWebMode && webView != null) {
             webView.resumeTimers();
             webView.onResume();
@@ -5986,55 +6004,51 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onPause() {
         super.onPause();
+        // 前台标志：后台播放开关开启时切后台仍视为前台（网络恢复事件需要正常触发播放）
+        isAppInForeground = backgroundPlay;
         pausedAt = System.currentTimeMillis();
         // 后台时暂停天气定时刷新，避免无效网络请求
         if (weatherRefreshHandler != null && weatherRefreshRunnable != null) {
             weatherRefreshHandler.removeCallbacks(weatherRefreshRunnable);
         }
         if (backgroundPlay) {
-            // 设置已开启后台播放：切后台/息屏保持播放，卡顿检测继续跑（JS未挂起，无误判问题）
+            // 设置已开启后台播放：切后台/息屏保持播放
             return;
         }
-        // 默认：切后台/息屏自动暂停
-        // ① 先停掉WebView卡顿检测：后台JS被pauseTimers挂起后evaluateJavascript无响应，
-        //    检测器15秒后误判"渲染进程挂起"而在后台recreateWebView，切回前台页面卡死
+        // 默认：切后台/息屏自动停止，且必须"绝对安静"——四轮实测经验：
+        // JS暂停会被站点反暂停逻辑绕过（AudioContext/WebWorker旁路），
+        // 延迟卸载在WebView挂起状态下可能不执行，无缝预载播放器后台就绪会开播。
+        // 因此全上硬手段：
+        // ① 取消一切后台到期能触发播放/加载的定时器
         stopWebVideoStallDetector();
         cancelWebRefreshFallback();
-        if (useWebMode && webView != null) {
-            // ② WebView的onPause对MSE/H5视频无效（切后台声音仍在播），注入JS暂停video；
-            //    并封印play事件拦截站点的自动恢复播放逻辑（3秒后音频复播的根因）。
-            //    回调返回后再挂起WebView，保证封印脚本已执行；回调异常时600ms兜底挂起
-            final WebView wv = webView;
-            final boolean[] suspended = {false};
-            final Runnable suspendNow = () -> {
-                if (suspended[0]) return;
-                suspended[0] = true;
-                try {
-                    wv.pauseTimers();
-                    wv.onPause();
-                } catch (Exception ignore) { }
-            };
-            wv.evaluateJavascript(buildPauseSealJs(), result -> suspendNow.run());
-            handler.postDelayed(suspendNow, 600);
-            // ③ 硬兜底：2.5秒后仍在后台则直接卸载页面(about:blank)。实测部分站点用
-            //    AudioContext/WebWorker等非video通道恢复音频，JS封印拦不住——页面销毁
-            //    后video/AudioContext/Worker全部终止，是唯一绝对可靠的停止手段。
-            //    切回前台onResume会自动重载页面续播
-            if (webBackgroundBlankRunnable != null) {
-                handler.removeCallbacks(webBackgroundBlankRunnable);
-            }
-            webBackgroundBlankRunnable = () -> {
-                webBackgroundBlankRunnable = null;
-                try {
-                    LogUtil.i("NewsLive", "Background 2.5s: unload page (about:blank) to hard-stop audio");
-                    webBackgroundBlanked = true;
-                    wv.loadUrl("about:blank");
-                } catch (Exception ignore) { }
-            };
-            handler.postDelayed(webBackgroundBlankRunnable, 2500);
-        }
+        cancelWebViewTimeoutTimer();
+        cancelStreamRotation();
+        cancelGiveUpRecovery();
+        // ② 释放无缝预载播放器：预载播放器未挂音频静音，后台就绪后原子换入会开播
+        //    （切后台约3秒后音频复播的元凶之一）；切回前台后轮换链路会重新预载
+        releasePendingPlayer();
+        // ③ 主播放器暂停
         if (player != null) {
             player.setPlayWhenReady(false);
+        }
+        // ④ WebView页面立即卸载（about:blank）：文档销毁后video/AudioContext/Worker
+        //    全部终止，不依赖封印脚本是否执行、不依赖挂起状态下的延迟导航。
+        //    切回前台onResume检测到webBackgroundBlanked自动重载续播
+        if (useWebMode && webView != null) {
+            final WebView wv = webView;
+            try {
+                // 封印脚本尽力注入（防卸载提交前最后几百毫秒站点重试出声）
+                wv.evaluateJavascript(buildPauseSealJs(), null);
+                wv.stopLoading();
+                webBackgroundBlanked = true;
+                LogUtil.i("NewsLive", "onPause: unload page (about:blank) to hard-stop audio");
+                wv.loadUrl("about:blank");
+            } catch (Exception ignore) { }
+            try {
+                wv.pauseTimers();
+                wv.onPause();
+            } catch (Exception ignore) { }
         }
     }
 
@@ -6057,11 +6071,6 @@ public class MainActivity extends AppCompatActivity {
         stopWebVideoStallDetector();
         // 取消刷新兜底定时器
         cancelWebRefreshFallback();
-        // 取消后台卸载页面定时器
-        if (webBackgroundBlankRunnable != null) {
-            handler.removeCallbacks(webBackgroundBlankRunnable);
-            webBackgroundBlankRunnable = null;
-        }
         cancelStreamRotation();
         // 取消深度恢复守护与换台遮罩兜底
         cancelGiveUpRecovery();
