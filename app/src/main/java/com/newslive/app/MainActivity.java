@@ -3574,8 +3574,9 @@ public class MainActivity extends AppCompatActivity {
         autoClickPlayButtonWithRetry(0);
     }
 
-    /** 自动点击播放按钮：执行后3秒探测视频是否真正播起来，未播则重试（页面播放器
-     *  初始化晚于onPageFinished时，单次执行会扑空导致"刷新后不自动播放"） */
+    /** 点击播放按钮/直接起播。执行后3秒探测，视频仍未播则只重试video.play()（幂等），
+     *  绝不重复点按钮——播放按钮多为toggle语义，起播窗口内重复点击会把刚起来的
+     *  视频又暂停掉（首次打开进度条转半天不播的回归根因） */
     private void autoClickPlayButtonWithRetry(int attempt) {
         final int maxAttempts = 3;
         String js = "(function() {" +
@@ -3585,13 +3586,13 @@ public class MainActivity extends AppCompatActivity {
             "  var el = document.querySelector(sel);" +
             "  if (el) el.style.display = 'none';" +
             "});" +
-            // 尝试点击各种播放按钮
+            // 尝试点击各种播放按钮：点中即返回（恢复原版语义，不打断站点起播流程）
             "var btns = ['.custom-play-btn','.vjs-big-play-button','.video-play-btn','.player-play-btn','.bilibili-player-video-btn-start','.bpx-player-video-btn-start','[class*=play-btn]','[class*=playButton]','[class*=big-play]'];" +
             "for (var i = 0; i < btns.length; i++) {" +
             "  var btn = document.querySelector(btns[i]);" +
-            "  if (btn) { btn.click(); break; }" +
+            "  if (btn) { btn.click(); return 'clicked: ' + btns[i]; }" +
             "}" +
-            // 尝试直接播放video（主文档+同源iframe递归查找，央视新闻的video在iframe里）
+            // 没有点到任何按钮：直接对video调play（主文档+同源iframe递归，央视新闻的video在iframe里）
             "function findVideo(doc){try{var v=doc.querySelector('video');if(v)return v;}catch(e){}" +
             "  try{var fs=doc.querySelectorAll('iframe');for(var i=0;i<fs.length;i++){var d=fs[i].contentDocument;if(d){v=findVideo(d);if(v)return v;}}}catch(e){}" +
             "  return null;}" +
@@ -3632,9 +3633,18 @@ public class MainActivity extends AppCompatActivity {
             "return 'no play method found';" +
             "})();";
         webView.evaluateJavascript(js, result -> {
-            // 3秒后确认：视频真正播起来（非暂停/无video）才算成功，否则重试
+            // 3秒后确认：视频仍在暂停且数据就绪（起播失败）时，仅用video.play()重试
+            // （幂等，对已播视频无副作用；不点按钮避免toggle把视频暂停）
             handler.postDelayed(() -> {
                 if (webView == null || !useWebMode) return;
+                if (attempt >= maxAttempts) return;
+                String playJs = "(function(){try{" +
+                    "function findVideo(doc){try{var v=doc.querySelector('video');if(v)return v;}catch(e){}" +
+                    "  try{var fs=doc.querySelectorAll('iframe');for(var i=0;i<fs.length;i++){var d=fs[i].contentDocument;if(d){v=findVideo(d);if(v)return v;}}}catch(e){}" +
+                    "  return null;}" +
+                    "var v=findVideo(document);" +
+                    "if(v&&v.paused){try{if(v.muted)v.muted=false;}catch(e){}var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
+                    "})()";
                 String checkJs = "(function(){try{" +
                     "function findVideo(doc){try{var v=doc.querySelector('video');if(v)return v;}catch(e){}" +
                     "  try{var fs=doc.querySelectorAll('iframe');for(var i=0;i<fs.length;i++){var d=fs[i].contentDocument;if(d){v=findVideo(d);if(v)return v;}}}catch(e){}" +
@@ -3644,8 +3654,8 @@ public class MainActivity extends AppCompatActivity {
                     "return (v.paused&&v.readyState>=2)?'paused-stalled':'playing';}catch(e){return 'err';}})();";
                 webView.evaluateJavascript(checkJs, r -> {
                     if (r != null && r.contains("paused-stalled")) {
-                        // 视频存在但处于暂停：再点一次播放
-                        if (attempt < maxAttempts) autoClickPlayButtonWithRetry(attempt + 1);
+                        webView.evaluateJavascript(playJs, p2 ->
+                            autoClickPlayButtonWithRetry(attempt + 1));
                     }
                 });
             }, 3000);
