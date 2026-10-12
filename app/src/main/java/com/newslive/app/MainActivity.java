@@ -3439,12 +3439,16 @@ public class MainActivity extends AppCompatActivity {
         final int maxRetries = 5;
         
         handler.postDelayed(() -> {
+            // 央视新闻等站点的video在iframe里，必须递归查找主文档+同源iframe
             String js = "(function() {" +
                 "try {" +
+                "  function findVideo(doc){try{var v=doc.querySelector('video');if(v)return v;}catch(e){}" +
+                "    try{var fs=doc.querySelectorAll('iframe');for(var i=0;i<fs.length;i++){var d=fs[i].contentDocument;if(d){v=findVideo(d);if(v)return v;}}}catch(e){}" +
+                "    return null;}" +
                 "  if (window.__playerConfig__ && window.__playerConfig__.source) {" +
                 "    return JSON.stringify({success: true, url: window.__playerConfig__.source});" +
                 "  }" +
-                "  var video = document.querySelector('video');" +
+                "  var video = findVideo(document);" +
                 "  if (video && video.src && video.src.indexOf('blob:') === -1) {" +
                 "    return JSON.stringify({success: true, url: video.src});" +
                 "  }" +
@@ -3563,6 +3567,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void autoClickPlayButton() {
+        autoClickPlayButtonWithRetry(0);
+    }
+
+    /** 自动点击播放按钮：执行后3秒探测视频是否真正播起来，未播则重试（页面播放器
+     *  初始化晚于onPageFinished时，单次执行会扑空导致"刷新后不自动播放"） */
+    private void autoClickPlayButtonWithRetry(int attempt) {
+        final int maxAttempts = 3;
         String js = "(function() {" +
             // 移除播放覆盖层
             "var covers = ['.prism-cover','.vjs-cover','.video-cover','.player-cover','.mask-layer','.bp-overlay','.bpx-player-cover','.bilibili-player-video-cover','.video-mask','.ad-mask'];" +
@@ -3574,12 +3585,15 @@ public class MainActivity extends AppCompatActivity {
             "var btns = ['.custom-play-btn','.vjs-big-play-button','.video-play-btn','.player-play-btn','.bilibili-player-video-btn-start','.bpx-player-video-btn-start','[class*=play-btn]','[class*=playButton]','[class*=big-play]'];" +
             "for (var i = 0; i < btns.length; i++) {" +
             "  var btn = document.querySelector(btns[i]);" +
-            "  if (btn) { btn.click(); return 'clicked: ' + btns[i]; }" +
+            "  if (btn) { btn.click(); break; }" +
             "}" +
-            // 尝试直接播放video（有声播放，不静音）
-            "var video = document.querySelector('video');" +
+            // 尝试直接播放video（主文档+同源iframe递归查找，央视新闻的video在iframe里）
+            "function findVideo(doc){try{var v=doc.querySelector('video');if(v)return v;}catch(e){}" +
+            "  try{var fs=doc.querySelectorAll('iframe');for(var i=0;i<fs.length;i++){var d=fs[i].contentDocument;if(d){v=findVideo(d);if(v)return v;}}}catch(e){}" +
+            "  return null;}" +
+            "var video = findVideo(document);" +
             "if (video) {" +
-            "  if (video.muted) video.muted = false;" +
+            "  try{video.muted = false;}catch(e){}" +
             "  var p = video.play();" +
             "  if (p && p.catch) p.catch(function(){" +
             "    try { video.muted = true; video.play().catch(function(){}); } catch(e) {}" +
@@ -3614,6 +3628,23 @@ public class MainActivity extends AppCompatActivity {
             "return 'no play method found';" +
             "})();";
         webView.evaluateJavascript(js, result -> {
+            // 3秒后确认：视频真正播起来（非暂停/无video）才算成功，否则重试
+            handler.postDelayed(() -> {
+                if (webView == null || !useWebMode) return;
+                String checkJs = "(function(){try{" +
+                    "function findVideo(doc){try{var v=doc.querySelector('video');if(v)return v;}catch(e){}" +
+                    "  try{var fs=doc.querySelectorAll('iframe');for(var i=0;i<fs.length;i++){var d=fs[i].contentDocument;if(d){v=findVideo(d);if(v)return v;}}}catch(e){}" +
+                    "  return null;}" +
+                    "var v=findVideo(document);" +
+                    "if(!v)return 'no-video';" +
+                    "return (v.paused&&v.readyState>=2)?'paused-stalled':'playing';}catch(e){return 'err';}})();";
+                webView.evaluateJavascript(checkJs, r -> {
+                    if (r != null && r.contains("paused-stalled")) {
+                        // 视频存在但处于暂停：再点一次播放
+                        if (attempt < maxAttempts) autoClickPlayButtonWithRetry(attempt + 1);
+                    }
+                });
+            }, 3000);
         });
     }
 
@@ -5864,11 +5895,10 @@ public class MainActivity extends AppCompatActivity {
                     loadWebSource();
                 } else if (isNetworkAvailable && pausedAt > 0 && System.currentTimeMillis() - pausedAt > 10000) {
                     loadWebSource();
-                }
-                // 短暂离开未刷新页面时，探测视频是否仍在播放；在播则重启卡顿检测（onPause已停掉）
-                if (isPlaying && playerContainer != null
-                        && playerContainer.getVisibility() != View.VISIBLE) {
-                    checkWebVideoPlayingAndFullscreen(0);
+                } else {
+                    // 短暂离开未刷新页面：解除play封印并恢复播放（后台被暂停的视频），
+                    // 随后探测重启卡顿检测（onPause已停掉）
+                    resumeWebVideoAfterBackground();
                 }
             }
         }
@@ -5883,6 +5913,51 @@ public class MainActivity extends AppCompatActivity {
             LogUtil.i("NewsLive", "onResume 立即刷新天气");
             fetchWeather(lastLatitude, lastLongitude);
         }
+    }
+
+    /** 暂停+封印脚本：暂停主文档与同源iframe的全部video，并捕获拦截后续play事件——
+     *  央视等站点有反暂停逻辑（监听pause后延时自动play），后台JS定时器未被pauseTimers
+     *  完全拦住，仅pause一次3秒后音频会自动恢复。封印后任何play尝试立即被拉回暂停 */
+    private String buildPauseSealJs() {
+        return "(function(){try{" +
+            "function seal(doc){try{" +
+            "  var vs=doc.querySelectorAll('video');" +
+            "  for(var i=0;i<vs.length;i++){try{vs[i].pause();}catch(e){}}" +
+            "  if(!doc.__nlSealed){doc.__nlSealed=true;" +
+            "    doc.addEventListener('play',function(ev){try{if(doc.__nlSealed)ev.target.pause();}catch(e){}},true);}" +
+            "}catch(e){}}" +
+            "seal(document);" +
+            "var fs=document.querySelectorAll('iframe');" +
+            "for(var j=0;j<fs.length;j++){try{if(fs[j].contentDocument)seal(fs[j].contentDocument);}catch(e){}}" +
+            "}catch(e){}})();";
+    }
+
+    /** 解封+恢复播放脚本：解除play拦截并恢复主文档与iframe内全部video播放（切回前台用） */
+    private String buildUnsealPlayJs() {
+        return "(function(){try{" +
+            "function kick(doc){try{" +
+            "  doc.__nlSealed=false;" +
+            "  var vs=doc.querySelectorAll('video');" +
+            "  for(var i=0;i<vs.length;i++){try{if(vs[i].muted)vs[i].muted=false;" +
+            "    var p=vs[i].play();if(p&&p.catch)p.catch(function(){});}catch(e){}}" +
+            "}catch(e){}}" +
+            "kick(document);" +
+            "var fs=document.querySelectorAll('iframe');" +
+            "for(var j=0;j<fs.length;j++){try{if(fs[j].contentDocument)kick(fs[j].contentDocument);}catch(e){}}" +
+            "}catch(e){}})();";
+    }
+
+    /** 短暂离开切回前台：解封并恢复网页视频播放，随后探测重启卡顿检测 */
+    private void resumeWebVideoAfterBackground() {
+        if (webView == null) return;
+        webView.evaluateJavascript(buildUnsealPlayJs(), null);
+        // 2秒后探测：视频播起来会走onWebVideoPlaying（重启卡顿检测+恢复全屏CSS）
+        handler.postDelayed(() -> {
+            if (useWebMode && isPlaying && webView != null
+                    && (playerContainer == null || playerContainer.getVisibility() != View.VISIBLE)) {
+                checkWebVideoPlayingAndFullscreen(0);
+            }
+        }, 2000);
     }
 
     @Override
@@ -5903,12 +5978,21 @@ public class MainActivity extends AppCompatActivity {
         stopWebVideoStallDetector();
         cancelWebRefreshFallback();
         if (useWebMode && webView != null) {
-            // ② WebView的onPause对MSE/H5视频无效（切后台声音仍在播），必须先注入JS暂停video元素
-            String pauseJs = "(function(){try{var vs=document.querySelectorAll('video');" +
-                "for(var i=0;i<vs.length;i++){try{vs[i].pause();}catch(e){}}}catch(e){}})();";
-            webView.evaluateJavascript(pauseJs, null);
-            webView.pauseTimers();
-            webView.onPause();
+            // ② WebView的onPause对MSE/H5视频无效（切后台声音仍在播），注入JS暂停video；
+            //    并封印play事件拦截站点的自动恢复播放逻辑（3秒后音频复播的根因）。
+            //    回调返回后再挂起WebView，保证封印脚本已执行；回调异常时600ms兜底挂起
+            final WebView wv = webView;
+            final boolean[] suspended = {false};
+            final Runnable suspendNow = () -> {
+                if (suspended[0]) return;
+                suspended[0] = true;
+                try {
+                    wv.pauseTimers();
+                    wv.onPause();
+                } catch (Exception ignore) { }
+            };
+            wv.evaluateJavascript(buildPauseSealJs(), result -> suspendNow.run());
+            handler.postDelayed(suspendNow, 600);
         }
         if (player != null) {
             player.setPlayWhenReady(false);
