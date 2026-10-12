@@ -99,6 +99,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_BANNER_FONT_SIZE = "banner_font_size";
     private static final String KEY_BANNER_HEIGHT = "banner_height";
     private static final String KEY_MANUAL_LOCATION = "manual_location"; // 手动配置地区（空=自动IP定位）
+    private static final String KEY_BACKGROUND_PLAY = "background_play"; // 切后台/息屏时继续播放（默认关闭=自动暂停）
     private static final int HTTP_PORT = 8765;
     
     private static final String DEFAULT_REMOTE_URL = "https://gitee.com/xujingrong/tv-live-config/releases/download/live/tv_live_config.json";
@@ -208,6 +209,8 @@ public class MainActivity extends AppCompatActivity {
 
     private boolean useWebMode = true;
     private boolean isStreamListEnabled = true;
+    // 后台播放开关：false=切后台/息屏自动暂停（默认），true=后台/息屏继续播放
+    private boolean backgroundPlay = false;
     // 顶部信息横幅设置
     private android.view.View infoOverlay;
     private boolean bannerVisible = true;
@@ -1254,6 +1257,7 @@ public class MainActivity extends AppCompatActivity {
         bannerAutoFit = prefs.getBoolean(KEY_BANNER_AUTO_FIT, true);
         webSourceUrl = prefs.getString(KEY_WEB_SOURCE_URL, DEFAULT_WEB_SOURCE_URL);
         isOrientationLocked = prefs.getBoolean(KEY_LOCK_ORIENTATION, false);
+        backgroundPlay = prefs.getBoolean(KEY_BACKGROUND_PLAY, false);
         currentSiteIndex = prefs.getInt(KEY_CURRENT_SITE_INDEX, 0);
 
         loadWebSites();
@@ -5616,6 +5620,10 @@ public class MainActivity extends AppCompatActivity {
                 isStreamListEnabled = config.optBoolean("playerModeEnabled", true);
                 prefs.edit().putBoolean(KEY_PLAYER_MODE_ENABLED, isStreamListEnabled).apply();
             }
+            if (config.has("backgroundPlay")) {
+                backgroundPlay = config.optBoolean("backgroundPlay", false);
+                prefs.edit().putBoolean(KEY_BACKGROUND_PLAY, backgroundPlay).apply();
+            }
             if (config.has("bannerVisible")) {
                 bannerVisible = config.optBoolean("bannerVisible", true);
                 prefs.edit().putBoolean(KEY_BANNER_VISIBLE, bannerVisible).apply();
@@ -5833,7 +5841,8 @@ public class MainActivity extends AppCompatActivity {
     protected void onStop() {
         super.onStop();
         cancelStreamRotation();
-        if (player != null) {
+        // 后台播放开启时保持播放；默认（关闭）切后台/息屏暂停
+        if (player != null && !backgroundPlay) {
             player.setPlayWhenReady(false);
         }
     }
@@ -5845,13 +5854,22 @@ public class MainActivity extends AppCompatActivity {
         if (useWebMode && webView != null) {
             webView.resumeTimers();
             webView.onResume();
-            // 后台/休眠唤醒后,直播流已失效,重新加载页面
-            // 条件:网络可用 且 (曾断网 或 离开时间超过30秒)
-            if (isNetworkAvailable && wasNetworkLostWhilePaused) {
-                wasNetworkLostWhilePaused = false;
-                loadWebSource();
-            } else if (isNetworkAvailable && pausedAt > 0 && System.currentTimeMillis() - pausedAt > 30000) {
-                loadWebSource();
+            if (backgroundPlay) {
+                // 后台播放模式：页面一直在播，回来无需任何恢复动作
+            } else {
+                // 默认后台不播放：直播流在后台/息屏期间已失效，切回直接重新加载页面
+                // （网页频道切回卡死的修复：10秒内的短离开不打扰，超过则强制刷新续播）
+                if (isNetworkAvailable && wasNetworkLostWhilePaused) {
+                    wasNetworkLostWhilePaused = false;
+                    loadWebSource();
+                } else if (isNetworkAvailable && pausedAt > 0 && System.currentTimeMillis() - pausedAt > 10000) {
+                    loadWebSource();
+                }
+                // 短暂离开未刷新页面时，探测视频是否仍在播放；在播则重启卡顿检测（onPause已停掉）
+                if (isPlaying && playerContainer != null
+                        && playerContainer.getVisibility() != View.VISIBLE) {
+                    checkWebVideoPlayingAndFullscreen(0);
+                }
             }
         }
         // ExoPlayer播放中恢复前台：重新启动主动轮换调度（onStop已取消）
@@ -5875,7 +5893,20 @@ public class MainActivity extends AppCompatActivity {
         if (weatherRefreshHandler != null && weatherRefreshRunnable != null) {
             weatherRefreshHandler.removeCallbacks(weatherRefreshRunnable);
         }
-        if (useWebMode) {
+        if (backgroundPlay) {
+            // 设置已开启后台播放：切后台/息屏保持播放，卡顿检测继续跑（JS未挂起，无误判问题）
+            return;
+        }
+        // 默认：切后台/息屏自动暂停
+        // ① 先停掉WebView卡顿检测：后台JS被pauseTimers挂起后evaluateJavascript无响应，
+        //    检测器15秒后误判"渲染进程挂起"而在后台recreateWebView，切回前台页面卡死
+        stopWebVideoStallDetector();
+        cancelWebRefreshFallback();
+        if (useWebMode && webView != null) {
+            // ② WebView的onPause对MSE/H5视频无效（切后台声音仍在播），必须先注入JS暂停video元素
+            String pauseJs = "(function(){try{var vs=document.querySelectorAll('video');" +
+                "for(var i=0;i<vs.length;i++){try{vs[i].pause();}catch(e){}}}catch(e){}})();";
+            webView.evaluateJavascript(pauseJs, null);
             webView.pauseTimers();
             webView.onPause();
         }
@@ -6244,6 +6275,11 @@ public class MainActivity extends AppCompatActivity {
                 "<div class='tip'>手动配置后不再自动定位，天气按此地区获取。支持省+市+区/县/乡镇（如：江西省抚州市临川区、上顿渡镇）。查询通过后点底部\"保存配置\"生效；清空保存则恢复自动定位。</div>" +
                 "</div>" +
                 "<div class='section'>" +
+                "<div class='section-title'>▶️ 后台播放</div>" +
+                "<label><input type='checkbox' id='backgroundPlay' " + (backgroundPlay ? "checked" : "") + "> 切后台/息屏时继续播放</label>" +
+                "<div class='tip'>默认关闭：切到后台或息屏时自动暂停，回到前台自动恢复（网页频道会自动刷新续播）。开启后切后台/息屏会继续播放声音和视频。</div>" +
+                "</div>" +
+                "<div class='section'>" +
                 "<div class='section-title'>⚙️ 远程配置</div>" +
                 "<input type='url' id='remoteUrl' placeholder='远程配置URL' value='" + remoteConfigUrl + "'>" +
                 "<label><input type='checkbox' id='autoUpdate' " + (autoUpdateConfig ? "checked" : "") + "> 启动时自动更新</label>" +
@@ -6348,7 +6384,7 @@ public class MainActivity extends AppCompatActivity {
                 "    });" +
                 "  }).catch(e=>{box.innerHTML='<span style=\"color:#C62828\">查询失败: '+e+'</span>';});" +
                 "}" +
-                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};var msg=document.getElementById('saveMsg');msg.textContent='⏳ 正在保存…';msg.style.color='#1565c0';fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){var e='❌ 保存失败: '+(x.error||'未知错误')+' (请截图此行反馈)';msg.textContent=e;msg.style.color='#c62828';alert(e);}else{msg.textContent='✅ 保存成功 '+new Date().toLocaleTimeString();msg.style.color='#2e7d32';}}).catch(e=>{var t='❌ 保存失败: '+e;msg.textContent=t;msg.style.color='#c62828';alert(t);});}" +
+                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,backgroundPlay:document.getElementById('backgroundPlay').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};var msg=document.getElementById('saveMsg');msg.textContent='⏳ 正在保存…';msg.style.color='#1565c0';fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){var e='❌ 保存失败: '+(x.error||'未知错误')+' (请截图此行反馈)';msg.textContent=e;msg.style.color='#c62828';alert(e);}else{msg.textContent='✅ 保存成功 '+new Date().toLocaleTimeString();msg.style.color='#2e7d32';}}).catch(e=>{var t='❌ 保存失败: '+e;msg.textContent=t;msg.style.color='#c62828';alert(t);});}" +
                 "renderSources();" +
                 "renderWebsites();" +
                 // 页面加载时自动恢复:若有优选任务在跑,继续显示进度(锁屏/刷新后不丢状态)
