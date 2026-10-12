@@ -211,6 +211,10 @@ public class MainActivity extends AppCompatActivity {
     private boolean isStreamListEnabled = true;
     // 后台播放开关：false=切后台/息屏自动暂停（默认），true=后台/息屏继续播放
     private boolean backgroundPlay = false;
+    // 后台硬停止：切后台2.5秒后仍在后台则卸载页面(about:blank)——部分站点用
+    // AudioContext/WebWorker等非video通道恢复音频，JS封印拦不住，页面销毁才绝对可靠
+    private Runnable webBackgroundBlankRunnable;
+    private boolean webBackgroundBlanked = false; // 页面是否已在后台被卸载（切回需重载）
     // 顶部信息横幅设置
     private android.view.View infoOverlay;
     private boolean bannerVisible = true;
@@ -5882,20 +5886,29 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         hideSystemUI();
+        // 取消后台卸载页面的定时器（只要回到前台就不卸载）
+        if (webBackgroundBlankRunnable != null) {
+            handler.removeCallbacks(webBackgroundBlankRunnable);
+            webBackgroundBlankRunnable = null;
+        }
         if (useWebMode && webView != null) {
             webView.resumeTimers();
             webView.onResume();
             if (backgroundPlay) {
                 // 后台播放模式：页面一直在播，回来无需任何恢复动作
+                webBackgroundBlanked = false;
             } else {
                 // 默认后台不播放：直播流在后台/息屏期间已失效，切回直接重新加载页面
-                // （网页频道切回卡死的修复：10秒内的短离开不打扰，超过则强制刷新续播）
-                if (isNetworkAvailable && wasNetworkLostWhilePaused) {
-                    wasNetworkLostWhilePaused = false;
+                boolean needReload = webBackgroundBlanked
+                    || (isNetworkAvailable && wasNetworkLostWhilePaused)
+                    || (isNetworkAvailable && pausedAt > 0
+                        && System.currentTimeMillis() - pausedAt > 10000);
+                webBackgroundBlanked = false;
+                wasNetworkLostWhilePaused = false;
+                if (needReload && isNetworkAvailable) {
+                    // 页面已在后台被卸载/断过网/离开超10秒：重新加载并走自动播放链路
                     loadWebSource();
-                } else if (isNetworkAvailable && pausedAt > 0 && System.currentTimeMillis() - pausedAt > 10000) {
-                    loadWebSource();
-                } else {
+                } else if (!needReload) {
                     // 短暂离开未刷新页面：解除play封印并恢复播放（后台被暂停的视频），
                     // 随后探测重启卡顿检测（onPause已停掉）
                     resumeWebVideoAfterBackground();
@@ -5993,6 +6006,22 @@ public class MainActivity extends AppCompatActivity {
             };
             wv.evaluateJavascript(buildPauseSealJs(), result -> suspendNow.run());
             handler.postDelayed(suspendNow, 600);
+            // ③ 硬兜底：2.5秒后仍在后台则直接卸载页面(about:blank)。实测部分站点用
+            //    AudioContext/WebWorker等非video通道恢复音频，JS封印拦不住——页面销毁
+            //    后video/AudioContext/Worker全部终止，是唯一绝对可靠的停止手段。
+            //    切回前台onResume会自动重载页面续播
+            if (webBackgroundBlankRunnable != null) {
+                handler.removeCallbacks(webBackgroundBlankRunnable);
+            }
+            webBackgroundBlankRunnable = () -> {
+                webBackgroundBlankRunnable = null;
+                try {
+                    LogUtil.i("NewsLive", "Background 2.5s: unload page (about:blank) to hard-stop audio");
+                    webBackgroundBlanked = true;
+                    wv.loadUrl("about:blank");
+                } catch (Exception ignore) { }
+            };
+            handler.postDelayed(webBackgroundBlankRunnable, 2500);
         }
         if (player != null) {
             player.setPlayWhenReady(false);
@@ -6018,6 +6047,11 @@ public class MainActivity extends AppCompatActivity {
         stopWebVideoStallDetector();
         // 取消刷新兜底定时器
         cancelWebRefreshFallback();
+        // 取消后台卸载页面定时器
+        if (webBackgroundBlankRunnable != null) {
+            handler.removeCallbacks(webBackgroundBlankRunnable);
+            webBackgroundBlankRunnable = null;
+        }
         cancelStreamRotation();
         // 取消深度恢复守护与换台遮罩兜底
         cancelGiveUpRecovery();
