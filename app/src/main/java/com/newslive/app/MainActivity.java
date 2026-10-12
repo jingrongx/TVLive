@@ -1435,6 +1435,8 @@ public class MainActivity extends AppCompatActivity {
     // 应用顶部信息横幅样式：可见性、字号、高度
     private void applyBannerStyle() {
         LogUtil.i("NewsLive", "applyBannerStyle: visible=" + bannerVisible + " fontSize=" + bannerFontSize + " height=" + bannerHeight);
+        // 内容/布局环境大变化（配置保存、横竖屏切换）：解除字号上限记忆，重新自适应
+        bannerFitCeiling = BANNER_MAX_SCALE;
         if (infoOverlay == null) return;
         infoOverlay.setVisibility(bannerVisible ? android.view.View.VISIBLE : android.view.View.GONE);
         if (!bannerVisible) return;
@@ -1485,6 +1487,8 @@ public class MainActivity extends AppCompatActivity {
 
     // ==================== 横幅字号自适应（单行不换行） ====================
     private float bannerFitScale = 1f;       // 当前自适应缩放比例（0.35~1.5）
+    private float bannerFitCeiling = BANNER_MAX_SCALE; // 字号上限记忆：硬校验收缩后锁定，
+    // 禁止冷却到期后再放大回去——否则"放大→硬校验砍→3秒后放大→又砍"持续锯齿跳动
     private boolean bannerFitScheduled = false;
     private boolean bannerAutoFit = true;    // 自动调节字号（尽量放大不截断），默认开启
     private static final float BANNER_MAX_SCALE = 1.5f; // 自动放大上限（16sp基准→24sp封顶）
@@ -1522,7 +1526,7 @@ public class MainActivity extends AppCompatActivity {
         }
         if (bannerAutoFit) {
             // 第一轮：求各行在当前scale下的"允许scale"，取最小作为公共scale
-            float allowed = BANNER_MAX_SCALE;
+            float allowed = Math.min(BANNER_MAX_SCALE, bannerFitCeiling);
             boolean measurable = false;
             for (ViewGroup row : rows) {
                 int avail = row.getWidth() - row.getPaddingStart() - row.getPaddingEnd();
@@ -1535,27 +1539,33 @@ public class MainActivity extends AppCompatActivity {
                 int total = measureBannerTotal(texts) + sumBannerExtras(row);
                 if (total <= 0) continue;
                 measurable = true;
-                allowed = Math.min(allowed, bannerFitScale * ((float) avail / total) * 0.97f);
+                // 0.95保守系数：emoji等fallback字体实际渲染宽度大于测量值，放大余量
+                // 给足可大幅降低硬校验触发率（硬校验砍刀是"一跳一跳"锯齿的源头）
+                allowed = Math.min(allowed, bannerFitScale * ((float) avail / total) * 0.95f);
             }
             if (!measurable) return;
             allowed = Math.max(0.35f, Math.min(BANNER_MAX_SCALE, allowed));
-            // 接近目标(±0.5%)则保持稳定，避免每秒微调抖动;
+            // 接近目标(±1%)则保持稳定，避免周期性文字变化微调抖动;
             // 另加 3 秒冷却:时钟/天气等周期性文字变化会使宽度在临界点来回摆,
             // 强阻尼让字号最多 3 秒变一次,消除"一跳一跳"
-            if (Math.abs(allowed - bannerFitScale) >= 0.005f
+            if (Math.abs(allowed - bannerFitScale) >= 0.01f
                     && SystemClock.elapsedRealtime() - lastFitAppliedAt > 3000) {
                 lastFitAppliedAt = SystemClock.elapsedRealtime();
                 bannerFitScale = allowed;
                 applyBannerFontSizes();
-                // 硬校验：线性近似若有偏差导致任一行仍溢出，整体再缩一档
+                // 硬校验：线性近似若有偏差导致任一行仍溢出，整体再缩一档；
+                // 同时把砍后的scale记为上限(ceiling)——冷却到期后不得再放大回去，
+                // 否则"放大→砍→再放大→再砍"每3秒跳两下（锯齿振荡）
                 for (ViewGroup row : rows) {
                     int avail = row.getWidth() - row.getPaddingStart() - row.getPaddingEnd();
                     List<TextView> texts = new ArrayList<>();
                     collectBannerTextViews(row, texts);
                     int total = measureBannerTotal(texts) + sumBannerExtras(row);
                     if (total > avail) {
-                        bannerFitScale = Math.max(0.35f,
-                            bannerFitScale * ((float) avail / total) * 0.97f);
+                        float shrunk = Math.max(0.35f,
+                            bannerFitScale * ((float) avail / total) * 0.95f);
+                        bannerFitCeiling = Math.min(bannerFitCeiling, shrunk);
+                        bannerFitScale = shrunk;
                         applyBannerFontSizes();
                     }
                 }
@@ -1713,6 +1723,8 @@ public class MainActivity extends AppCompatActivity {
         int day = cal.get(java.util.Calendar.DAY_OF_MONTH);
 
         LogUtil.i("NewsLive", "updateDateInfo: " + year + "-" + month + "-" + day);
+        // 日期/农历文本跨天变化：解除字号上限记忆，允许重新自适应放大
+        bannerFitCeiling = BANNER_MAX_SCALE;
 
         if (tvLunar != null) {
             try {
