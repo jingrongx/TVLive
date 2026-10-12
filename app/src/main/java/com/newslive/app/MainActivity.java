@@ -5706,7 +5706,10 @@ public class MainActivity extends AppCompatActivity {
             if (config.has("bannerAutoFit")) {
                 bannerAutoFit = config.optBoolean("bannerAutoFit", true);
                 prefs.edit().putBoolean(KEY_BANNER_AUTO_FIT, bannerAutoFit).apply();
-                applyBannerStyle(); // 重新收敛字号（自动=尽量放大 / 手动=固定基准）
+                // applyBannerStyle直接操作View，而updateConfig在HTTP服务器线程执行——
+                // 必须切主线程，否则横幅布局参数有变化时requestLayout触发
+                // CalledFromWrongThreadException导致整个保存报"格式错误"失败
+                runOnUiThread(() -> applyBannerStyle());
             }
             if (config.has("manualLocation")) {
                 // 手动地区：先验证（查得到天气坐标才生效），通过后保存并立即刷新定位与天气
