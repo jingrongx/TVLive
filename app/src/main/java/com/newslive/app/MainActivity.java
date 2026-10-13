@@ -5379,16 +5379,12 @@ public class MainActivity extends AppCompatActivity {
         WebView wv = new WebView(this);
         wv.getSettings().setJavaScriptEnabled(true);
         wv.getSettings().setDomStorageEnabled(true);
-        // WebView在Dialog中的键盘修复：Dialog窗口默认焦点/IME行为下，点击页内<input>
-        // 可能不弹软键盘——显式声明可编辑焦点并触摸时抢占焦点
+        // WebView在Dialog中的键盘修复：显式声明可编辑焦点（键盘能力由窗口IME flag +
+        // show后的一次性requestFocus保障）。注意绝不能在触摸事件里requestFocusFromTouch——
+        // 滚动手势也从ACTION_DOWN开始，会把DOM焦点重置到页面第一个可聚焦元素
+        // （"启用网页模式"复选框）并触发WebView滚动定位，页面会跳回顶部
         wv.setFocusable(true);
         wv.setFocusableInTouchMode(true);
-        wv.setOnTouchListener((v, ev) -> {
-            if (ev.getAction() == android.view.MotionEvent.ACTION_DOWN) {
-                v.requestFocusFromTouch();
-            }
-            return false;
-        });
         LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT);
         root.addView(bar);
