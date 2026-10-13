@@ -6340,7 +6340,7 @@ public class MainActivity extends AppCompatActivity {
                 "<style>" +
                 "body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f5f5f5}" +
                 "h1{color:#333;text-align:center;margin-bottom:10px}" +
-                ".tip{color:#666;font-size:12px;text-align:center;margin-bottom:15px}" +
+                ".tip{color:#666;font-size:12px;text-align:left;margin-bottom:15px}" +
                 ".section{background:#fff;padding:15px;margin:10px 0;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}" +
                 ".section-title{font-weight:bold;color:#333;margin-bottom:10px;padding-bottom:5px;border-bottom:1px solid #eee}" +
                 ".source-item{background:#f9f9f9;padding:15px;margin:10px 0;border-radius:8px;border:1px solid #e0e0e0;position:relative}" +
