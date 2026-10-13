@@ -5379,6 +5379,16 @@ public class MainActivity extends AppCompatActivity {
         WebView wv = new WebView(this);
         wv.getSettings().setJavaScriptEnabled(true);
         wv.getSettings().setDomStorageEnabled(true);
+        // WebView在Dialog中的键盘修复：Dialog窗口默认焦点/IME行为下，点击页内<input>
+        // 可能不弹软键盘——显式声明可编辑焦点并触摸时抢占焦点
+        wv.setFocusable(true);
+        wv.setFocusableInTouchMode(true);
+        wv.setOnTouchListener((v, ev) -> {
+            if (ev.getAction() == android.view.MotionEvent.ACTION_DOWN) {
+                v.requestFocusFromTouch();
+            }
+            return false;
+        });
         LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT);
         root.addView(bar);
@@ -5395,6 +5405,12 @@ public class MainActivity extends AppCompatActivity {
                 w.setLayout(android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                         (int) (getResources().getDisplayMetrics().heightPixels * 0.92f));
                 w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0xFFFFFFFF));
+                // 键盘修复：配置页输入框(远程URL/手动地区/直播源)需要弹软键盘——
+                // ① 声明窗口可调整尺寸(键盘弹出时压缩内容可见输入框)
+                // ② 清除可能拦截IME的flag(NOT_FOCUSABLE/ALT_FOCUSABLE_IM)
+                w.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+                w.clearFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | android.view.WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
             }
         });
         wv.setWebChromeClient(new android.webkit.WebChromeClient() {
@@ -5415,6 +5431,7 @@ public class MainActivity extends AppCompatActivity {
             wv.destroy();
         });
         dialog.show();
+        wv.requestFocus(); // WebView持有窗口焦点：页内<input>点击才能获得焦点弹软键盘
         wv.loadUrl("http://127.0.0.1:" + HTTP_PORT);
     }
 
