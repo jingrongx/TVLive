@@ -6441,8 +6441,8 @@ public class MainActivity extends AppCompatActivity {
                 "<div class='section'>" +
                 "<div class='section-title'>⏱️ 缓冲设置 (毫秒)</div>" +
                 "<div class='buffer-inputs'>" +
-                "<input type='number' id='bufferMin' placeholder='最小缓冲(默认10000)' value='" + bufferMinMs + "'>" +
-                "<input type='number' id='bufferMax' placeholder='最大缓冲(默认60000)' value='" + bufferMaxMs + "'>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>最小缓冲 ms (默认10000)</label><input type='number' id='bufferMin' placeholder='最小缓冲(默认10000)' value='" + bufferMinMs + "'></div>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>最大缓冲 ms (默认60000)</label><input type='number' id='bufferMax' placeholder='最大缓冲(默认60000)' value='" + bufferMaxMs + "'></div>" +
                 "</div>" +
                 "<div class='buffer-inputs' style='margin-top:6px'>" +
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>起播缓冲 ms (默认8000)</label><input type='number' id='startBuffer' value='" + startBufferMs + "'></div>" +
