@@ -86,6 +86,8 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_AUTO_UPDATE = "auto_update_config";
     private static final String KEY_BUFFER_MIN = "buffer_min";
     private static final String KEY_BUFFER_MAX = "buffer_max";
+    private static final String KEY_MAX_BITRATE = "max_video_bitrate";
+    private static final String KEY_START_BUFFER = "start_buffer";
     private static final String KEY_USE_WEB_MODE = "use_web_mode";
     private static final String KEY_WEB_SOURCE_URL = "web_source_url";
     private static final String KEY_WEB_SITES = "web_sites";
@@ -149,6 +151,12 @@ public class MainActivity extends AppCompatActivity {
     private int currentUrlIndex = 0;
     private int bufferMinMs = 10000;
     private int bufferMaxMs = 60000;
+    // ABR最高视频码率(bps)：默认1Mbps。原2Mbps上限在1.6~3.2Mbps波动带宽下吃不满，
+    // 波动到下限时2Mbps档必卡；先降1.5Mbps仍偶卡，再降到1Mbps保证弱网不断流
+    // （KHAN-230的540p解码上限不变，分辨率上限不受此值影响）
+    private int maxVideoBitrateBps = 1_000_000;
+    // 起播缓冲(ms)：原5000ms，弱网下起播后很快遇到波动就小卡，提到8000ms抗抖动
+    private int startBufferMs = 8000;
     
     private ExoPlayer player;
     private PlayerView playerView;
@@ -1264,6 +1272,8 @@ public class MainActivity extends AppCompatActivity {
         autoUpdateConfig = prefs.getBoolean(KEY_AUTO_UPDATE, false);
         bufferMinMs = prefs.getInt(KEY_BUFFER_MIN, 10000);
         bufferMaxMs = prefs.getInt(KEY_BUFFER_MAX, 60000);
+        maxVideoBitrateBps = prefs.getInt(KEY_MAX_BITRATE, 1_000_000);
+        startBufferMs = prefs.getInt(KEY_START_BUFFER, 8000);
         useWebMode = prefs.getBoolean(KEY_USE_WEB_MODE, true);
         isStreamListEnabled = prefs.getBoolean(KEY_PLAYER_MODE_ENABLED, true);
         bannerVisible = prefs.getBoolean(KEY_BANNER_VISIBLE, true);
@@ -2688,6 +2698,8 @@ public class MainActivity extends AppCompatActivity {
             }
             bufferMinMs = config.optInt("bufferMin", 10000);
             bufferMaxMs = config.optInt("bufferMax", 60000);
+            maxVideoBitrateBps = config.optInt("maxVideoBitrate", 1_000_000);
+            startBufferMs = config.optInt("startBuffer", 8000);
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -2710,6 +2722,8 @@ public class MainActivity extends AppCompatActivity {
                 .putString("saved_sources", config.toString())
                 .putInt(KEY_BUFFER_MIN, bufferMinMs)
                 .putInt(KEY_BUFFER_MAX, bufferMaxMs)
+                .putInt(KEY_MAX_BITRATE, maxVideoBitrateBps)
+                .putInt(KEY_START_BUFFER, startBufferMs)
                 .apply();
         } catch (Exception e) {
             e.printStackTrace();
@@ -4941,11 +4955,12 @@ public class MainActivity extends AppCompatActivity {
 
         int minBuffer = Math.max(bufferMinMs, 10000);
         int maxBuffer = Math.max(bufferMaxMs, 60000);
+        int startBuffer = Math.max(startBufferMs, 5000);
 
         DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
-            // 初始起播缓冲5000ms（旧值1000ms会导致冷启动时缓冲太薄，
-            // 播放几秒后遇网络抖动必小卡一次再补满——每次进入App都会复现）
-            .setBufferDurationsMs(minBuffer, maxBuffer, 5000, minBuffer)
+            // 起播缓冲默认8000ms（旧值5000ms在弱网下起播后遇波动必小卡一次），
+            // 重缓冲后再缓冲到minBuffer才恢复
+            .setBufferDurationsMs(minBuffer, maxBuffer, startBuffer, minBuffer)
             .setPrioritizeTimeOverSizeThresholds(true)
             .setBackBuffer(maxBuffer, true)
             .setTargetBufferBytes(-1)
@@ -4964,11 +4979,11 @@ public class MainActivity extends AppCompatActivity {
         DefaultMediaSourceFactory mediaSourceFactory = new DefaultMediaSourceFactory(this)
             .setDataSourceFactory(wrappedFactory);
 
-        // 带宽估计器初始值设为2Mbps（与下方码率上限一致）：
+        // 带宽估计器初始值与下方码率上限一致：
         // 冷启动时估计为空，ABR会保守地从低码率变体开始播，几秒后测得带宽充足再升档，
         // 解码器重建造成"第一次启动播放5秒左右必卡一下"；给定初始值后首次即选中正确变体
         DefaultBandwidthMeter bandwidthMeter = new DefaultBandwidthMeter.Builder(this)
-            .setInitialBitrateEstimate(2_000_000)
+            .setInitialBitrateEstimate(maxVideoBitrateBps)
             .build();
 
         ExoPlayer p = new ExoPlayer.Builder(this, renderersFactory)
@@ -4977,12 +4992,13 @@ public class MainActivity extends AppCompatActivity {
             .setBandwidthMeter(bandwidthMeter)
             .build();
 
-        // 限制最高分辨率540p、码率2Mbps：KHAN-230盒子硬解器对1080p会初始化失败(ENOMEM)，
-        // 限制后ExoPlayer自动选择低分辨率变体，避免解码失败导致黑屏/断流
+        // 限制最高分辨率540p、码率默认1Mbps(可配maxVideoBitrate)：
+        // 540p上限=KHAN-230盒子硬解器对1080p会初始化失败(ENOMEM)，避免解码失败黑屏/断流；
+        // 码率上限=弱网(200~400KB/s≈1.6~3.2Mbps)下2Mbps档吃不满必卡，降到1Mbps保连续
         androidx.media3.common.TrackSelectionParameters trackParams = p.getTrackSelectionParameters()
             .buildUpon()
             .setMaxVideoSize(960, 540)
-            .setMaxVideoBitrate(2000000)
+            .setMaxVideoBitrate(Math.max(maxVideoBitrateBps, 300_000))
             .build();
         p.setTrackSelectionParameters(trackParams);
 
@@ -5704,6 +5720,14 @@ public class MainActivity extends AppCompatActivity {
             if (config.has("bufferMax")) {
                 bufferMaxMs = config.optInt("bufferMax", 30000);
             }
+            if (config.has("maxVideoBitrate")) {
+                maxVideoBitrateBps = Math.max(config.optInt("maxVideoBitrate", 1_000_000), 300_000);
+                prefs.edit().putInt(KEY_MAX_BITRATE, maxVideoBitrateBps).apply();
+            }
+            if (config.has("startBuffer")) {
+                startBufferMs = Math.max(config.optInt("startBuffer", 8000), 5000);
+                prefs.edit().putInt(KEY_START_BUFFER, startBufferMs).apply();
+            }
             if (config.has("useWebMode")) {
                 useWebMode = config.optBoolean("useWebMode", true);
                 prefs.edit().putBoolean(KEY_USE_WEB_MODE, useWebMode).apply();
@@ -6420,7 +6444,11 @@ public class MainActivity extends AppCompatActivity {
                 "<input type='number' id='bufferMin' placeholder='最小缓冲(默认10000)' value='" + bufferMinMs + "'>" +
                 "<input type='number' id='bufferMax' placeholder='最大缓冲(默认60000)' value='" + bufferMaxMs + "'>" +
                 "</div>" +
-                "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上</div>" +
+                "<div class='buffer-inputs' style='margin-top:6px'>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>起播缓冲 ms (默认8000)</label><input type='number' id='startBuffer' value='" + startBufferMs + "'></div>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>最高码率 Kbps (默认1000)</label><input type='number' id='maxBitrate' value='" + (maxVideoBitrateBps / 1000) + "'></div>" +
+                "</div>" +
+                "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上。弱网(200~400KB/s)建议码率1000左右，起播缓冲8000~10000；码率会自动限制多码率频道的最高画质，网络差时自动降档。</div>" +
                 "</div>" +
                 "<div class='section'>" +
                 "<div class='section-title'>📊 顶部信息横幅</div>" +
@@ -6549,7 +6577,7 @@ public class MainActivity extends AppCompatActivity {
                 "    });" +
                 "  }).catch(e=>{box.innerHTML='<span style=\"color:#C62828\">查询失败: '+e+'</span>';});" +
                 "}" +
-                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,backgroundPlay:document.getElementById('backgroundPlay').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};var msg=document.getElementById('saveMsg');msg.textContent='⏳ 正在保存…';msg.style.color='#1565c0';fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){var e='❌ 保存失败: '+(x.error||'未知错误')+' (请截图此行反馈)';msg.textContent=e;msg.style.color='#c62828';alert(e);}else{msg.textContent='✅ 保存成功 '+new Date().toLocaleTimeString();msg.style.color='#2e7d32';}}).catch(e=>{var t='❌ 保存失败: '+e;msg.textContent=t;msg.style.color='#c62828';alert(t);});}" +
+                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,startBuffer:parseInt(document.getElementById('startBuffer').value)||8000,maxVideoBitrate:(parseInt(document.getElementById('maxBitrate').value)||1000)*1000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,backgroundPlay:document.getElementById('backgroundPlay').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};var msg=document.getElementById('saveMsg');msg.textContent='⏳ 正在保存…';msg.style.color='#1565c0';fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){var e='❌ 保存失败: '+(x.error||'未知错误')+' (请截图此行反馈)';msg.textContent=e;msg.style.color='#c62828';alert(e);}else{msg.textContent='✅ 保存成功 '+new Date().toLocaleTimeString();msg.style.color='#2e7d32';}}).catch(e=>{var t='❌ 保存失败: '+e;msg.textContent=t;msg.style.color='#c62828';alert(t);});}" +
                 "renderSources();" +
                 "renderWebsites();" +
                 // 页面加载时自动恢复:若有优选任务在跑,继续显示进度(锁屏/刷新后不丢状态)
