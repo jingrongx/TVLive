@@ -191,6 +191,10 @@ public class MainActivity extends AppCompatActivity {
     private long cachePreloadStartAt = 0;
     private int cacheRetainMin = 0;
     private long cacheFreeMb = 0;
+    private double emaRecordRatio = 1.0;
+    private int etaTick = 0;
+    private String etaText = null;
+    private boolean relayFinalized = false;
     private Runnable cacheTicker;
     private Runnable relayPosTicker;
     private View cacheOverlay;
@@ -4172,6 +4176,10 @@ public class MainActivity extends AppCompatActivity {
         cachePendingSilent = silent;
         cachePreloadTargetMs = preloadMin * 60_000L;
         cachePreloadStartAt = System.currentTimeMillis();
+        emaRecordRatio = 1.0;
+        etaTick = 0;
+        etaText = null;
+        relayFinalized = false;
         showCacheOverlay(name);
         startCacheTicker(relay, session);
     }
@@ -4552,9 +4560,12 @@ public class MainActivity extends AppCompatActivity {
     /** 录制按钮状态（只在变化时改，避免每秒重设图标） */
     private void updateRecordButton() {
         if (btnRecord == null) return;
-        boolean recording = activeRelay != null || (screenRecorder != null && screenRecorder.isRecording());
+        boolean srRec = screenRecorder != null && screenRecorder.isRecording();
+        boolean recording = activeRelay != null || srRec;
+        // 录制定格后（正在看录像）不再显示停止浮标——切台即回直播
+        boolean showChip = srRec || (activeRelay != null && !relayFinalized);
         if (tvStopRecord != null) {
-            tvStopRecord.setVisibility(recording ? View.VISIBLE : View.GONE);
+            tvStopRecord.setVisibility(showChip ? View.VISIBLE : View.GONE);
         }
         if (recording == recordBtnRecording) return;
         recordBtnRecording = recording;
@@ -4565,10 +4576,10 @@ public class MainActivity extends AppCompatActivity {
 
     /**
      * 常驻「停止录制」入口：手机面板会自动隐藏，必须保证任何时候都有地方按停止。
-     * 按状态给不同动作：
+     * 语义统一为「停止录制 = 定格录像并从头观看」：
      *  - 录屏中        → 结束录屏并自动回放
-     *  - 攒缓存中      → 直接从录制起点开看（否则停下来等于白录）
-     *  - 正在看录制    → 停止录制回到直播
+     *  - 流式录制中    → 中继停录、写 ENDLIST，从录制起点播放已录内容
+     *  - 已在看录像    → 回到直播（切台也可以）
      */
     private void onStopRecordClicked() {
         if (screenRecorder != null) {
@@ -4576,14 +4587,30 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         if (activeRelay != null) {
-            if (relayPlaybackActive) {
+            if (relayFinalized) {
                 stopRecordingBackToLive();
             } else {
-                skipCachePreload();
+                finalizeRecordingAndWatch();
             }
             return;
         }
         updateRecordButton();
+    }
+
+    /** 定格录像：中继停止录制、写 ENDLIST，从头播放已录内容（文件保留，切台才丢弃） */
+    private void finalizeRecordingAndWatch() {
+        final HlsRelay r = activeRelay;
+        if (r == null) return;
+        stopCacheTicker();
+        hideCacheOverlay();
+        r.finalizeRecording();
+        relayFinalized = true;
+        relayPlaybackActive = true;
+        relayStartSeekPending = true;
+        startRelayPositionTicker(r, relaySession);
+        playVideoUrlNow(r.getLocalPlaylistUrl(), cachePendingName, 0, false, false);
+        updateRecordButton();
+        Toast.makeText(this, "录制完成，从头播放录像（切台即回直播）", Toast.LENGTH_SHORT).show();
     }
 
     /** 中继模式下在已录制范围内回看/前进（行车记录仪式回放） */
@@ -4630,14 +4657,21 @@ public class MainActivity extends AppCompatActivity {
         long target = Math.max(1000, cachePreloadTargetMs);
         long left = Math.max(0, target - cachedMs);
         double recordRatio = wallMs >= 8000 ? (double) cachedMs / wallMs : 1.0;
-        long eta = recordRatio > 0.2 ? (long) (left / recordRatio) : left;
+        // 录制比做 EMA 平滑，预计等待每 5 秒才刷一次——不然开局分片突发会让数字乱跳
+        if (wallMs >= 10000) emaRecordRatio = emaRecordRatio * 0.75 + recordRatio * 0.25;
+        etaTick++;
+        if (etaTick % 10 == 0 || etaText == null) {
+            double rate = Math.max(0.15, emaRecordRatio);
+            etaText = "预计还需 ~" + fmtHms((long) (left / rate));
+        }
         int pct = (int) Math.min(100, cachedMs * 100 / target);
         int speedKB = wallMs > 0 ? (int) (relay.getDiskBytes() / Math.max(1, wallMs / 1000) / 1024) : 0;
 
         if (tvCacheChannel != null && cachePendingName != null) tvCacheChannel.setText(cachePendingName);
-        if (tvCacheCountdown != null) tvCacheCountdown.setText(fmtMmSs(eta));
+        // 大字固定显示已录时长（单调递增），不再显示会来回跳的预计等待
+        if (tvCacheCountdown != null) tvCacheCountdown.setText(fmtHms(cachedMs));
         if (tvCacheProgress != null) {
-            tvCacheProgress.setText("已录 " + fmtHms(cachedMs) + " / " + fmtHms(target) + " · " + pct + "%");
+            tvCacheProgress.setText("目标 " + fmtHms(target) + " · " + pct + "% · " + (etaText == null ? "" : etaText));
         }
         if (pbCache != null) pbCache.setProgress(pct * 10);
         if (tvCacheDetail != null) {
@@ -4656,7 +4690,7 @@ public class MainActivity extends AppCompatActivity {
             boolean starving = wallMs > 12000 && recordRatio < 0.92;
             tvCacheHint.setText(starving
                     ? "⚠ 源码率超过网速（" + WEAK_NET_KBPS + "KB/s 底线），录制无法持续，建议换低码率线路"
-                    : "按 OK 从录制起点开始看 · 右下角可停止录制");
+                    : "按 OK 从录制起点开始看 · 右下角停止=定格录像");
         }
     }
 
@@ -4682,9 +4716,9 @@ public class MainActivity extends AppCompatActivity {
         cacheOverlay.setVisibility(View.VISIBLE);
         if (progressBar != null) progressBar.setVisibility(View.GONE);
         if (tvCacheChannel != null) tvCacheChannel.setText(name == null ? "" : name);
-        if (tvCacheCountdown != null) tvCacheCountdown.setText(fmtMmSs(cachePreloadTargetMs));
+        if (tvCacheCountdown != null) tvCacheCountdown.setText(fmtHms(0));
         if (tvCacheProgress != null) {
-            tvCacheProgress.setText("已录 00:00 / " + fmtHms(cachePreloadTargetMs) + " · 0%");
+            tvCacheProgress.setText("目标 " + fmtHms(cachePreloadTargetMs) + " · 0%");
         }
         if (pbCache != null) pbCache.setProgress(0);
         if (tvCacheDetail != null) {
@@ -4710,6 +4744,7 @@ public class MainActivity extends AppCompatActivity {
         stopCacheTicker();
         stopRelayPositionTicker();
         hideCacheOverlay();
+        relayFinalized = false;
         HlsRelay r = activeRelay;
         activeRelay = null;
         relayPlaybackActive = false;
@@ -4832,11 +4867,11 @@ public class MainActivity extends AppCompatActivity {
                                         LogUtil.w("NewsLive", "Buffering " + bufferingTime[0] + "s, pos=" + player.getCurrentPosition() + " buffered=" + player.getBufferedPosition());
                                     }
                                     if (bufferingTime[0] > 8) {
-                                        if (relayPlaybackActive && bufferingTime[0] <= 45) {
+                                        if (relayPlaybackActive && !relayFinalized && bufferingTime[0] <= 45) {
                                             // 读本地池子时"缓冲"=池子见底，中继还在按退避重试源。
                                             // 此刻重连/重prepare会把画面打回池子起点，必须等它自己续上
                                             handler.postDelayed(this, 1000);
-                                        } else if (relayPlaybackActive) {
+                                        } else if (relayPlaybackActive && !relayFinalized) {
                                             // 45 秒仍无新分片：这条线基本废了，换同频道备用线路（重新攒缓存）
                                             bufferingTime[0] = 0;
                                             seekRetryCount[0] = 0;

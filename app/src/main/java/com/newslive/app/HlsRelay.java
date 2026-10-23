@@ -193,12 +193,29 @@ public class HlsRelay {
         } catch (Exception ignore) { }
     }
 
+    private volatile boolean ended = false;
+
+    /**
+     * 定格录像：停止继续录制，播放列表写 #EXT-X-ENDLIST 变成 VOD。
+     * 与 stop() 的区别：不删文件，已录内容继续可播——「停止录制=观看录像」就靠它。
+     */
+    public void finalizeRecording() {
+        if (ended) return;
+        ended = true;
+        synchronized (lock) {
+            try { rebuildPlaylistLocked(); } catch (Exception ignore) { }
+        }
+        LogUtil.i(TAG, "recording finalized: " + getStatsLine());
+    }
+
+    public boolean isEnded() { return ended; }
+
     // ---------------------------------------------------------------- 主循环
 
     private void loop() {
         int failures = 0;
         long lastStats = 0;
-        while (running) {
+        while (running && !ended) {
             try {
                 String text = fetchText(playlistUrl);
                 boolean master = mergePlaylist(text);
@@ -558,6 +575,8 @@ public class HlsRelay {
             sb.append("#EXTINF:").append(String.format(Locale.US, "%.3f", s.durSec)).append(",\n");
             sb.append(baseUrl).append(s.fileName).append('\n');
         }
+        // 定格录像：写 ENDLIST，播放器把它当 VOD，时间线停止增长
+        if (ended) sb.append("#EXT-X-ENDLIST\n");
         playlistText = sb.toString();
     }
 
