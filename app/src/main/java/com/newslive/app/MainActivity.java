@@ -4135,6 +4135,24 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /** 中继模式下在已录制范围内回看/前进（行车记录仪式回放） */
+    private void seekRelayBy(long deltaMs) {
+        HlsRelay r = activeRelay;
+        if (r == null || player == null) return;
+        try {
+            long total = r.getReadyMs();
+            if (total <= 3000) return;
+            long pos = player.getCurrentPosition() + deltaMs;
+            pos = Math.max(0, Math.min(total - 2000, pos));
+            player.seekTo(pos);
+            long lag = Math.max(0, total - pos);
+            Toast.makeText(this,
+                    (deltaMs < 0 ? "◀ 回看 " : "▶ 前进 ") + (Math.abs(deltaMs) / 1000) + "秒 · 落后直播 "
+                            + fmtMmSs(lag) + "（按 ▶ 追回直播）",
+                    Toast.LENGTH_SHORT).show();
+        } catch (Exception ignore) { }
+    }
+
     /** 每 3 秒把播放位置同步给中继：中继据此只淘汰"早就播过"的分片 */
     private void startRelayPositionTicker(final HlsRelay relay, final int session) {
         stopRelayPositionTicker();
@@ -6186,6 +6204,17 @@ public class MainActivity extends AppCompatActivity {
                     case KeyEvent.KEYCODE_DPAD_DOWN:
                         switchToNextSource();
                         return true;
+                }
+            }
+            // 本地中继模式：左右键 = 回看/前进 30 秒（滚动录制范围内），长按连续快退/快进
+            if (relayPlaybackActive) {
+                if (event.getKeyCode() == KeyEvent.KEYCODE_DPAD_LEFT) {
+                    seekRelayBy(-30000);
+                    return true;
+                }
+                if (event.getKeyCode() == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                    seekRelayBy(30000);
+                    return true;
                 }
             }
             switch (event.getKeyCode()) {

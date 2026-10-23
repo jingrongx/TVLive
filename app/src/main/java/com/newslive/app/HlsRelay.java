@@ -574,11 +574,15 @@ public class HlsRelay {
 
         boolean playing = playerPosMs > 0;
         long playerAbs = evictedMs + playerPosMs;
+        // 硬上限：用户长时间回看时，播放保护会让淘汰卡住，磁盘会无限长。
+        // 超过保留时长 25% 就强制覆盖，宁可跳一下也不要把盒子写满。
+        long hardCap = retainMs + Math.max(300_000L, retainMs / 4);
+        boolean overCap = total > hardCap;
         Iterator<Map.Entry<Long, Seg>> it = segs.entrySet().iterator();
         while (it.hasNext() && total > retainMs) {
             Seg s = it.next().getValue();
             long segEnd = evictedMs + (long) (s.durSec * 1000);
-            if (playing && segEnd > playerAbs - 90_000L) break;
+            if (playing && !overCap && segEnd > playerAbs - 90_000L) break;
             if (!s.ready) break;
             File f = s.fileName != null ? new File(dir, s.fileName) : null;
             if (f != null) f.delete();
