@@ -1728,7 +1728,9 @@ public class MainActivity extends AppCompatActivity {
     private void updatePlaybackBadge() {
         if (tvPlaybackBadge == null) return;
         updateRecordButton();
-        if (useWebMode || player == null || player.getPlaybackState() != Player.STATE_READY) {
+        // 网页模式下由网页自己播时长没有录播概念；但网页模式里走本地中继播放时必须显示标志
+        if (player == null || player.getPlaybackState() != Player.STATE_READY
+                || (useWebMode && !relayPlaybackActive)) {
             tvPlaybackBadge.setVisibility(View.GONE);
             return;
         }
@@ -2649,6 +2651,7 @@ public class MainActivity extends AppCompatActivity {
     }
     
     private void stopAllPlayback() {
+        stopRelaySession();
         stopWebVideoStallDetector();
         cancelWebRefreshFallback();
         cancelStreamRotation();
@@ -3799,6 +3802,15 @@ public class MainActivity extends AppCompatActivity {
      *  播放器正在播放时走双播放器无缝接管（新流预载就绪后瞬时换入，画面不冻结不跳变）；
      *  否则回退到同播放器重prepare（keepContentOnPlayerReset保最后一帧，非黑屏） */
     private void playVideoUrlSilent(String url, String name) {
+        // 正在本地录制：静默刷新只用于 harvest 新 key，绝不能把播放切回远端
+        // （切走会 stopRelaySession，几小时录制直接清零）
+        if (relayPlaybackActive && activeRelay != null) {
+            LogUtil.i("NewsLive", "relay active, skip silent switch to " + url);
+            // 静默刷新的唯一价值是给中继续 key；这里把巡检重新挂上，
+            // 否则 refreshVideoFromWeb 开头 cancelStreamRotation() 之后就再没人续了
+            scheduleStreamRotation();
+            return;
+        }
         // 幂等保护：嗅探与JS桥双路径可能同时拿到同一新地址，已在播/已在切则忽略
         if (url != null && url.equals(currentVideoUrl)
                 && (pendingPlayer != null
@@ -4187,34 +4199,63 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /** 底部控制条：开始 / 停止录制（手动模式） */
+    /** 底部控制条：开始 / 停止录制（播放器模式与网页模式都支持） */
     private void toggleRecording() {
-        if (useWebMode) {
-            Toast.makeText(this, "网页模式下不支持本地录制，请按 M 切到播放器模式", Toast.LENGTH_SHORT).show();
-            return;
-        }
         if (activeRelay != null) {
             stopRecordingBackToLive();
             return;
         }
-        if (streamUrls.isEmpty()) {
-            Toast.makeText(this, "没有可录制的直播源", Toast.LENGTH_SHORT).show();
+        String url = recordingSourceUrl();
+        String name = recordingSourceName();
+        if (url == null || url.isEmpty()) {
+            Toast.makeText(this, useWebMode
+                    ? "还没拿到网页视频地址，等网页画面出来后再点录制"
+                    : "没有可录制的直播源", Toast.LENGTH_SHORT).show();
             return;
         }
-        int idx = Math.min(Math.max(currentUrlIndex, 0), streamUrls.size() - 1);
-        Toast.makeText(this, "开始录制：" + streamNames.get(idx), Toast.LENGTH_SHORT).show();
-        startRelayPreload(streamUrls.get(idx), streamNames.get(idx), 0, false, false);
+        if (!isHlsUrl(url) || isDrmStream(url)) {
+            Toast.makeText(this, "当前是 DRM/加密流，只能在网页内播放，无法本地录制", Toast.LENGTH_LONG).show();
+            return;
+        }
+        Toast.makeText(this, "开始录制：" + name, Toast.LENGTH_SHORT).show();
+        startRelayPreload(url, name, 0, false, false);
         updateRecordButton();
+    }
+
+    /**
+     * 当前可录制的源：播放器模式取当前频道；网页模式取已经交给 ExoPlayer 的嗅探直链
+     * （网页自带播放器/DRM 流没有直链，press 录时会明确提示）
+     */
+    private String recordingSourceUrl() {
+        if (useWebMode) {
+            if (currentVideoUrl != null && !currentVideoUrl.isEmpty()) return currentVideoUrl;
+            return lastDetectedVideoUrl == null ? "" : lastDetectedVideoUrl;
+        }
+        if (streamUrls.isEmpty()) return "";
+        return streamUrls.get(Math.min(Math.max(currentUrlIndex, 0), streamUrls.size() - 1));
+    }
+
+    private String recordingSourceName() {
+        if (useWebMode) {
+            if (currentVideoName != null && !currentVideoName.isEmpty()) return currentVideoName;
+            if (currentSiteIndex >= 0 && currentSiteIndex < webSiteNames.size()) {
+                return webSiteNames.get(currentSiteIndex);
+            }
+            return "网页频道";
+        }
+        if (streamNames.isEmpty()) return "直播";
+        return streamNames.get(Math.min(Math.max(currentUrlIndex, 0), streamNames.size() - 1));
     }
 
     /** 停止录制并回到直播（磁盘缓存一起释放） */
     private void stopRecordingBackToLive() {
+        String url = recordingSourceUrl();
+        String name = recordingSourceName();
         stopRelaySession();
         updateRecordButton();
-        if (streamUrls.isEmpty()) return;
-        int idx = Math.min(Math.max(currentUrlIndex, 0), streamUrls.size() - 1);
+        if (url == null || url.isEmpty()) return;
         Toast.makeText(this, "已停止录制，回到直播", Toast.LENGTH_SHORT).show();
-        playVideoUrlNow(streamUrls.get(idx), streamNames.get(idx), 0, false, false);
+        playVideoUrlNow(url, name, 0, false, false);
     }
 
     /** 录制按钮状态（只在变化时改，避免每秒重设图标） */
@@ -5547,6 +5588,8 @@ public class MainActivity extends AppCompatActivity {
 
         if (useWebMode) {
             cancelStreamRotation();
+            // 切到网页模式：本地录制没有意义（网页自己播），释放中继与磁盘
+            stopRelaySession();
             if (player != null) {
                 player.stop();
                 player.setPlayWhenReady(false);
