@@ -2,6 +2,7 @@ package com.newslive.app;
 
 import android.annotation.SuppressLint;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
@@ -197,6 +198,12 @@ public class MainActivity extends AppCompatActivity {
     private ProgressBar pbCache;
     /** 常驻播放状态标志：直播 / 录播（落后直播多久） */
     private TextView tvPlaybackBadge;
+
+    // ==================== 录屏（DRM 流的唯一可录路径） ====================
+    private static final int REQ_SCREEN_CAPTURE = 1001;
+    private ScreenRecorder screenRecorder;
+    private android.media.projection.MediaProjectionManager projectionManager;
+    private long screenRecStartAt = 0;
 
     private ExoPlayer player;
     private PlayerView playerView;
@@ -1730,6 +1737,15 @@ public class MainActivity extends AppCompatActivity {
     private void updatePlaybackBadge() {
         if (tvPlaybackBadge == null) return;
         updateRecordButton();
+        // 录屏中：单独显示，且不要盖住录制内容
+        ScreenRecorder sr = screenRecorder;
+        if (sr != null && sr.isRecording()) {
+            long sec = Math.max(0, (System.currentTimeMillis() - screenRecStartAt) / 1000);
+            tvPlaybackBadge.setText("● 录屏中 " + fmtHms(sec * 1000));
+            tvPlaybackBadge.setTextColor(0xFFFF5252);
+            tvPlaybackBadge.setVisibility(View.VISIBLE);
+            return;
+        }
         // 网页模式下由网页自己播时长没有录播概念；但网页模式里走本地中继播放时必须显示标志
         if (player == null || player.getPlaybackState() != Player.STATE_READY
                 || (useWebMode && !relayPlaybackActive)) {
@@ -4203,20 +4219,19 @@ public class MainActivity extends AppCompatActivity {
 
     /** 底部控制条：开始 / 停止录制（播放器模式与网页模式都支持） */
     private void toggleRecording() {
+        if (screenRecorder != null) {
+            stopScreenRecordingAndPlay();
+            return;
+        }
         if (activeRelay != null) {
             stopRecordingBackToLive();
             return;
         }
         String url = recordingSourceUrl();
         String name = recordingSourceName();
-        if (url == null || url.isEmpty()) {
-            Toast.makeText(this, useWebMode
-                    ? "还没拿到网页视频地址，等网页画面出来后再点录制"
-                    : "没有可录制的直播源", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        if (!isHlsUrl(url)) {
-            Toast.makeText(this, "当前是 mp4/flv 直链，暂不支持长时录制", Toast.LENGTH_SHORT).show();
+        // 没有可流录的地址（例如网页自带播放器）→ 直接录屏，一个按钮都能录
+        if (url == null || url.isEmpty() || !isHlsUrl(url)) {
+            startScreenRecording();
             return;
         }
         // URL 名字里带 cdrm/kcdnvip 不等于真 DRM（可能是普通 HLS 被误判）。
@@ -4226,6 +4241,136 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         startRecordingNow(url, name);
+    }
+
+    // ---------------------------------------------------------------- 录屏
+
+    /** 申请系统录屏授权；授权后音视频一起录（Android 10+ 带声音） */
+    private void startScreenRecording() {
+        try {
+            if (projectionManager == null) {
+                projectionManager = (android.media.projection.MediaProjectionManager)
+                        getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+            }
+            if (projectionManager == null) {
+                Toast.makeText(this, "本机系统不支持录屏", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            Toast.makeText(this, "请在系统弹窗中允许录屏（录制加密流画面用）", Toast.LENGTH_LONG).show();
+            startActivityForResult(projectionManager.createScreenCaptureIntent(), REQ_SCREEN_CAPTURE);
+        } catch (Exception e) {
+            LogUtil.e("NewsLive", "screen capture intent failed", e);
+            Toast.makeText(this, "录屏启动失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_SCREEN_CAPTURE) return;
+        if (resultCode != RESULT_OK || data == null) {
+            Toast.makeText(this, "未授权录屏，已取消", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            android.media.projection.MediaProjection mp =
+                    projectionManager.getMediaProjection(resultCode, data);
+            File base = getExternalFilesDir("screenrec");
+            if (base == null) base = new File(getCacheDir(), "screenrec");
+            if (!base.exists()) base.mkdirs();
+            java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US);
+            File out = new File(base, "rec_" + fmt.format(new java.util.Date()) + ".mp4");
+            android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+            // 录屏编码上限 1080p：4K 屏直接按原分辨率编码，低端盒子编不动会掉帧/失败
+            int rw = dm.widthPixels, rh = dm.heightPixels;
+            if (rw > 1920) {
+                rh = Math.max(2, rh * 1920 / rw);
+                rw = 1920;
+            }
+            screenRecorder = new ScreenRecorder(mp, out, rw, rh,
+                    dm.densityDpi, true, new ScreenRecorder.Listener() {
+                @Override public void onStarted(ScreenRecorder r) {
+                    runOnUiThread(new Runnable() {
+                        @Override public void run() {
+                            screenRecStartAt = System.currentTimeMillis();
+                            hideControlPanel();
+                            updateRecordButton();
+                            Toast.makeText(MainActivity.this, "录屏中，停止后自动播放录制内容",
+                                    Toast.LENGTH_SHORT).show();
+                        }
+                    });
+                }
+
+                @Override public void onStopped(ScreenRecorder r, final File file, final long size,
+                                                final boolean hadAudio) {
+                    runOnUiThread(new Runnable() {
+                        @Override public void run() {
+                            screenRecorder = null;
+                            updateRecordButton();
+                            if (file == null || !file.exists() || size < 1024) {
+                                Toast.makeText(MainActivity.this, "录制失败：文件为空", Toast.LENGTH_LONG).show();
+                                return;
+                            }
+                            Toast.makeText(MainActivity.this,
+                                    "录制完成 " + (size / 1024 / 1024) + "MB"
+                                            + (hadAudio ? "（含声音）" : "（本机不支持内录，无声）"),
+                                    Toast.LENGTH_LONG).show();
+                            playScreenRecording(file);
+                        }
+                    });
+                }
+
+                @Override public void onError(ScreenRecorder r, final String msg) {
+                    runOnUiThread(new Runnable() {
+                        @Override public void run() {
+                            screenRecorder = null;
+                            updateRecordButton();
+                            Toast.makeText(MainActivity.this, "录屏失败：" + msg, Toast.LENGTH_LONG).show();
+                        }
+                    });
+                }
+            });
+            screenRecorder.start();
+        } catch (Exception e) {
+            LogUtil.e("NewsLive", "screen recorder start failed", e);
+            screenRecorder = null;
+            Toast.makeText(this, "录屏启动失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /** 停止录屏（stop 要 join 编码线程，放后台做，避免卡 UI） */
+    private void stopScreenRecordingAndPlay() {
+        final ScreenRecorder r = screenRecorder;
+        if (r == null) return;
+        Toast.makeText(this, "正在结束录制…", Toast.LENGTH_SHORT).show();
+        new Thread(new Runnable() {
+            @Override public void run() { r.stop(); }
+        }, "rec-stop").start();
+    }
+
+    /** 用 127.0.0.1 服务把录好的 MP4 交给 ExoPlayer（数据源只认 HTTP） */
+    private void playScreenRecording(File file) {
+        try {
+            // 回放走播放器：网页模式必须切出来，否则播放器在 GONE 的容器里"有声无画"
+            if (useWebMode) {
+                useWebMode = false;
+                prefs.edit().putBoolean(KEY_USE_WEB_MODE, false).apply();
+            }
+            if (webView != null) {
+                webView.onPause();
+                webView.pauseTimers();
+                webView.setVisibility(View.GONE);
+            }
+            playerContainer.setVisibility(View.VISIBLE);
+            hideSwitchOverlay();
+
+            if (relayHttpServer == null) relayHttpServer = new RelayServer();
+            String token = "rec" + System.currentTimeMillis();
+            relayHttpServer.registerFile(token, file);
+            playVideoUrlNow(relayHttpServer.fileUrlFor(token), "录屏回放", 0, false, false);
+        } catch (Exception e) {
+            Toast.makeText(this, "回放失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
     }
 
     private void startRecordingNow(String url, String name) {
@@ -4249,7 +4394,9 @@ public class MainActivity extends AppCompatActivity {
                             startRecordingNow(url, name);
                         } else {
                             Toast.makeText(MainActivity.this,
-                                    "检测结果：" + result + "\n" + audioCaptureHint(), Toast.LENGTH_LONG).show();
+                                    "检测结果：" + result + "\n该流无法按流录制，改为录屏（" + audioCaptureHint() + "）",
+                                    Toast.LENGTH_LONG).show();
+                            startScreenRecording();
                         }
                     }
                 });
@@ -4360,7 +4507,7 @@ public class MainActivity extends AppCompatActivity {
     /** 录制按钮状态（只在变化时改，避免每秒重设图标） */
     private void updateRecordButton() {
         if (btnRecord == null) return;
-        boolean recording = activeRelay != null;
+        boolean recording = activeRelay != null || (screenRecorder != null && screenRecorder.isRecording());
         if (recording == recordBtnRecording) return;
         recordBtnRecording = recording;
         btnRecord.setImageResource(recording ? R.drawable.ic_record_stop : R.drawable.ic_record);
@@ -6754,6 +6901,11 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         try { stopRelaySession(); } catch (Exception ignore) { }
+        try {
+            ScreenRecorder sr = screenRecorder;
+            screenRecorder = null;
+            if (sr != null) sr.stop();
+        } catch (Exception ignore) { }
         try { if (relayHttpServer != null) relayHttpServer.shutdown(); } catch (Exception ignore) { }
         relayHttpServer = null;
         try { ChannelStats.get(this).flush(); } catch (Exception ignore) { }

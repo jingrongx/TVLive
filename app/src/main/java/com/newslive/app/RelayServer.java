@@ -25,6 +25,7 @@ public class RelayServer {
     private final ServerSocket serverSocket;
     private final Thread acceptThread;
     private final Map<String, HlsRelay> relays = new ConcurrentHashMap<>();
+    private final Map<String, File> files = new ConcurrentHashMap<>();
     private volatile boolean running = true;
 
     public RelayServer() throws IOException {
@@ -49,6 +50,15 @@ public class RelayServer {
 
     public void unregister(String token) {
         if (token != null) relays.remove(token);
+    }
+
+    /** 暴露一个本地文件（录屏 MP4 回放用），走同一个 127.0.0.1 服务 */
+    public void registerFile(String token, File file) {
+        if (token != null && file != null) files.put(token, file);
+    }
+
+    public String fileUrlFor(String token) {
+        return "http://127.0.0.1:" + getPort() + "/file/" + token;
     }
 
     public void shutdown() {
@@ -93,6 +103,21 @@ public class RelayServer {
             String path = parts[1];
             int q = path.indexOf('?');
             if (q >= 0) path = path.substring(0, q);
+
+            if (path.startsWith("/file/")) {
+                String ftoken = path.substring("/file/".length());
+                File f = files.get(ftoken);
+                if (f == null || !f.exists()) {
+                    writeText(client.getOutputStream(), 404, "text/plain", "no file".getBytes("UTF-8"));
+                    return;
+                }
+                String range = null;
+                for (String hl : lines) {
+                    if (hl.toLowerCase().startsWith("range:")) { range = hl.substring(6).trim(); break; }
+                }
+                serveFile(client.getOutputStream(), f, range, true);
+                return;
+            }
 
             if (!path.startsWith("/relay/")) {
                 writeText(client.getOutputStream(), 404, "text/plain", "not found".getBytes("UTF-8"));
