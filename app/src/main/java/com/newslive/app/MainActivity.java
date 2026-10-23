@@ -192,7 +192,6 @@ public class MainActivity extends AppCompatActivity {
     private int cacheRetainMin = 0;
     private long cacheFreeMb = 0;
     private double emaRecordRatio = 1.0;
-    private int etaTick = 0;
     private String etaText = null;
     private boolean relayFinalized = false;
     /** 开录 15 秒后用实测码率/网速自动校准要录多久 */
@@ -4198,7 +4197,6 @@ public class MainActivity extends AppCompatActivity {
         cachePreloadTargetMs = preloadMin * 60_000L;
         cachePreloadStartAt = System.currentTimeMillis();
         emaRecordRatio = 1.0;
-        etaTick = 0;
         etaText = null;
         relayFinalized = false;
         calibDone = cachePreloadTargetMs <= 0;
@@ -4227,7 +4225,7 @@ public class MainActivity extends AppCompatActivity {
                         int newMin = cachePreloadMin;
                         String v;
                         if (ratio >= 1.10) {
-                            v = "网速富余 " + Math.round((ratio - 1) * 100) + "%，即将开始连续播放（后台持续录制，像缓存一样）";
+                            v = "网速富余 " + Math.round((ratio - 1) * 100) + "%，录满安全深度后自动开播（后台持续录制）";
                             // 检测到富余：把目标缩到安全深度，尽快开播；之后落后量恒定，可全天观看
                             if (cachePreloadMin > 0) {
                                 int p = Math.min(cachePreloadMin, 3);
@@ -4490,6 +4488,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startRecordingNow(String url, String name) {
+        // 网速富余时缓存毫无意义：内容只能 1x 到达，还得干等——直接如实告知并保持直播
+        if (emaBitrateKB > 40 && emaNetKB > emaBitrateKB * 1.10) {
+            Toast.makeText(this, "网速富余 " + Math.round((emaNetKB / emaBitrateKB - 1) * 100)
+                    + "%（" + Math.round(emaNetKB) + "KB/s / 码率 " + Math.round(emaBitrateKB)
+                    + "KB/s），无需缓存，直接观看即可", Toast.LENGTH_LONG).show();
+            return;
+        }
         Toast.makeText(this, "开始录制：" + name, Toast.LENGTH_SHORT).show();
         startRelayPreload(url, name, 0, false, false, 0);
         updateRecordButton();
@@ -4770,13 +4775,8 @@ public class MainActivity extends AppCompatActivity {
         long target = Math.max(1000, cachePreloadTargetMs);
         long left = Math.max(0, target - cachedMs);
         double recordRatio = wallMs >= 8000 ? (double) cachedMs / wallMs : 1.0;
-        // 录制比做 EMA 平滑，预计等待每 5 秒才刷一次——不然开局分片突发会让数字乱跳
-        if (wallMs >= 10000) emaRecordRatio = emaRecordRatio * 0.75 + recordRatio * 0.25;
-        etaTick++;
-        if (etaTick % 10 == 0 || etaText == null) {
-            double rate = Math.max(0.15, emaRecordRatio);
-            etaText = "预计还需 ~" + fmtHms((long) (left / rate));
-        }
+        // 内容以 1x 到达：剩余等待就是 目标−已录，直接减，不估速率（估了开局必乱跳）
+        etaText = "预计还需 ~" + fmtHms(left);
         int pct = (int) Math.min(100, cachedMs * 100 / target);
         int speedKB = wallMs > 0 ? (int) (relay.getDiskBytes() / Math.max(1, wallMs / 1000) / 1024) : 0;
 
