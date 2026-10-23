@@ -64,8 +64,10 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.Inet4Address;
@@ -4213,13 +4215,101 @@ public class MainActivity extends AppCompatActivity {
                     : "没有可录制的直播源", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (!isHlsUrl(url) || isDrmStream(url)) {
-            Toast.makeText(this, "当前是 DRM/加密流，只能在网页内播放，无法本地录制", Toast.LENGTH_LONG).show();
+        if (!isHlsUrl(url)) {
+            Toast.makeText(this, "当前是 mp4/flv 直链，暂不支持长时录制", Toast.LENGTH_SHORT).show();
             return;
         }
+        // URL 名字里带 cdrm/kcdnvip 不等于真 DRM（可能是普通 HLS 被误判）。
+        // 先把播放列表拉下来看 EXT-X-KEY，用实际加密方式决定能不能录。
+        if (isDrmStream(url)) {
+            probeDrmThenRecord(url, name);
+            return;
+        }
+        startRecordingNow(url, name);
+    }
+
+    private void startRecordingNow(String url, String name) {
         Toast.makeText(this, "开始录制：" + name, Toast.LENGTH_SHORT).show();
         startRelayPreload(url, name, 0, false, false);
         updateRecordButton();
+    }
+
+    /** 实测播放列表的加密方式：无 KEY/AES-128 可录；SAMPLE-AES(DRM) 只能在画面层录 */
+    private void probeDrmThenRecord(final String url, final String name) {
+        Toast.makeText(this, "正在检测该流的加密方式…", Toast.LENGTH_SHORT).show();
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final String result = probeStreamEncryption(url);
+                handler.post(new Runnable() {
+                    @Override public void run() {
+                        boolean recordable = result.startsWith("未加密") || result.startsWith("AES-128");
+                        if (recordable) {
+                            Toast.makeText(MainActivity.this, "检测结果：" + result + "，可以录制",
+                                    Toast.LENGTH_SHORT).show();
+                            startRecordingNow(url, name);
+                        } else {
+                            Toast.makeText(MainActivity.this,
+                                    "检测结果：" + result + "\n这类流的分片在 App 内无法解密，"
+                                            + "只能按屏幕画面录（录屏）", Toast.LENGTH_LONG).show();
+                        }
+                    }
+                });
+            }
+        }, "drm-probe").start();
+    }
+
+    /** 拉一次播放列表判断加密方式（master 会跟进一层变体） */
+    private String probeStreamEncryption(String url) {
+        HttpURLConnection conn = null;
+        try {
+            String target = url;
+            for (int hop = 0; hop < 2; hop++) {
+                conn = (HttpURLConnection) new URL(target).openConnection();
+                conn.setConnectTimeout(8000);
+                conn.setReadTimeout(8000);
+                conn.setInstanceFollowRedirects(true);
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+                conn.setRequestProperty("Referer", "https://tv.cctv.com/");
+                int code = conn.getResponseCode();
+                if (code != 200) return "HTTP " + code + "（地址可能已过期）";
+                InputStream in = conn.getInputStream();
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) != -1) bos.write(buf, 0, n);
+                in.close();
+                String text = bos.toString("UTF-8");
+                String lower = text.toLowerCase();
+
+                if (lower.contains("#ext-x-stream-inf")) {
+                    String[] lines = text.split("\n");
+                    boolean nextIsVariant = false;
+                    String variant = null;
+                    for (String raw : lines) {
+                        String line = raw.trim();
+                        if (line.startsWith("#EXT-X-STREAM-INF")) { nextIsVariant = true; continue; }
+                        if (nextIsVariant && !line.isEmpty() && !line.startsWith("#")) { variant = line; break; }
+                    }
+                    if (variant == null) return "master 列表无变体";
+                    target = new URL(new URL(target), variant).toString();
+                    continue;
+                }
+
+                int idx = lower.indexOf("#ext-x-key");
+                if (idx < 0) return "未加密（CLEAR）";
+                int end = lower.indexOf('\n', idx);
+                String key = text.substring(idx, end < 0 ? text.length() : end).trim();
+                String kl = key.toLowerCase();
+                if (kl.contains("sample-aes")) return "SAMPLE-AES / DRM 加密";
+                if (kl.contains("method=aes-128")) return "AES-128（可解密切片）";
+                return "未知加密：" + key;
+            }
+            return "无法判定";
+        } catch (Exception e) {
+            return "探测失败：" + e.getMessage();
+        } finally {
+            try { if (conn != null) conn.disconnect(); } catch (Exception ignore) { }
+        }
     }
 
     /**
