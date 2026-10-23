@@ -194,10 +194,6 @@ public class MainActivity extends AppCompatActivity {
     private double emaRecordRatio = 1.0;
     private String etaText = null;
     private boolean relayFinalized = false;
-    /** 开录 15 秒后用实测码率/网速自动校准要录多久 */
-    private boolean calibDone = false;
-    private boolean calibAnnounced = false;
-
     // ==================== 直播网速/码率自动监测（无感缓存触发） ====================
     private androidx.media3.exoplayer.upstream.DefaultBandwidthMeter netMeter;
     private long monTotalBytes = 0, monContentMs = 0;
@@ -206,6 +202,11 @@ public class MainActivity extends AppCompatActivity {
     private int monSamples = 0;
     private int insufficientStreak = 0;
     private boolean autoCachePrompted = false;
+    /** 卡顿频率统计：5 分钟窗口内 ≥3 次即判网络不稳定 */
+    private final java.util.LinkedList<Long> liveStallTimes = new java.util.LinkedList<>();
+    private boolean liveEverReady = false;
+    /** 缓存池耗尽后的自动接播次数（防 15 秒循环） */
+    private int relayEndedResume = 0;
     private Runnable cacheTicker;
     private Runnable relayPosTicker;
     private View cacheOverlay;
@@ -1784,8 +1785,8 @@ public class MainActivity extends AppCompatActivity {
             lag = Math.max(0, total - pos);
         }
         if (lag > 5000) {
-            // 紧凑角标：只留状态和落后量，别占画面
-            tvPlaybackBadge.setText("● 录播 " + fmtHms(lag));
+            // 紧凑角标：数字 = 当前缓存深度（播放点距直播头的量）
+            tvPlaybackBadge.setText("● 缓存 " + fmtHms(lag));
             tvPlaybackBadge.setTextColor(0xCCFFD54F);
             tvPlaybackBadge.setVisibility(View.VISIBLE);
         } else {
@@ -2695,6 +2696,7 @@ public class MainActivity extends AppCompatActivity {
     
     private void stopAllPlayback() {
         stopRelaySession();
+        autoCachePrompted = false;   // 网页换台：自动缓存重新武装
         stopWebVideoStallDetector();
         cancelWebRefreshFallback();
         cancelStreamRotation();
@@ -4207,8 +4209,7 @@ public class MainActivity extends AppCompatActivity {
         emaRecordRatio = 1.0;
         etaText = null;
         relayFinalized = false;
-        calibDone = cachePreloadTargetMs <= 0;
-        calibAnnounced = false;
+        relayEndedResume = 0;
         showCacheOverlay(name);
         startCacheTicker(relay, session);
     }
@@ -4221,37 +4222,6 @@ public class MainActivity extends AppCompatActivity {
                 if (session != relaySession || relay != activeRelay) return;
                 long cached = relay.getReadyMs();
                 long wall = Math.max(1, System.currentTimeMillis() - cachePreloadStartAt);
-
-                // 开录 15 秒后用实测码率/网速校准本次要录多久：
-                // 网速富余 → 按用户设定的落后时长（可全天流畅）；网速不够 → 按"约可连续看30分钟"缩时长并明确告知
-                if (!calibDone && wall >= 15000 && cached >= 8000) {
-                    calibDone = true;
-                    double src = relay.getSourceBitrateKBps();
-                    double net = relay.getDiskBytes() / Math.max(1, wall / 1000.0) / 1024.0;
-                    if (src > 5 && net > 0) {
-                        double ratio = net / src;
-                        String v;
-                        if (ratio >= 1.10) {
-                            v = "网速富余 " + Math.round((ratio - 1) * 100) + "%，录满安全深度后自动开播（后台持续录制）";
-                            // 检测到富余：目标缩到安全深度（≤60 秒），尽快开播；之后落后量恒定，可全天观看
-                            cachePreloadTargetMs = Math.max(30_000L, Math.min(cachePreloadTargetMs, 60_000L));
-                        } else if (ratio >= 1.0) {
-                            v = "网速勉强够（富余<10%），波动时可能缓冲";
-                        } else {
-                            int newSec = (int) Math.max(30, Math.min(3600, Math.round(1800 * (1 - ratio))));
-                            cachePreloadTargetMs = newSec * 1000L;
-                            v = "网速只有码率的 " + Math.round(ratio * 100) + "%，本次自动录 " + fmtDepth(newSec)
-                                    + "（按当前网速约可连续看 30 分钟），建议换低码率线路";
-                        }
-                        final String msg = "码率 " + Math.round(src) + "KB/s · 网速 " + Math.round(net) + "KB/s：" + v;
-                        LogUtil.i("NewsLive", "auto-calib: " + msg);
-                        handler.post(new Runnable() {
-                            @Override public void run() {
-                                Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
-                            }
-                        });
-                    }
-                }
 
                 updateCacheOverlay(relay, cached, wall);
 
@@ -4495,8 +4465,15 @@ public class MainActivity extends AppCompatActivity {
                     + "KB/s），无需缓存，直接观看即可", Toast.LENGTH_LONG).show();
             return;
         }
-        Toast.makeText(this, "开始录制：" + name, Toast.LENGTH_SHORT).show();
-        startRelayPreload(url, name, 0, false, false, 0);
+        // 有监测数据：深度按缺口自动算（约可连续看 30 分钟）；没数据则用设定值，15 秒校准兜底
+        int depthSec = 0;
+        if (emaBitrateKB > 40 && emaNetKB > 0) {
+            double deficit = Math.max(0, 1 - emaNetKB / emaBitrateKB);
+            depthSec = (int) Math.max(30, Math.min(3600, Math.ceil(1800 * deficit)));
+        }
+        Toast.makeText(this, "开始缓存" + (depthSec > 0 ? fmtDepth(depthSec) : "") + "：" + name,
+                Toast.LENGTH_SHORT).show();
+        startRelayPreload(url, name, 0, false, false, depthSec);
         updateRecordButton();
     }
 
@@ -4636,7 +4613,7 @@ public class MainActivity extends AppCompatActivity {
             boolean show = recording;
             String label;
             if (srRec) label = "⏹ 停止录屏";
-            else if (relayPlaybackActive) label = "⏹ 退出录播";
+            else if (relayPlaybackActive) label = "返回直播";
             else label = "⏹ 取消录制";
             tvStopRecord.setText(label);
             tvStopRecord.setVisibility(show ? View.VISIBLE : View.GONE);
@@ -4716,24 +4693,46 @@ public class MainActivity extends AppCompatActivity {
         if (emaBitrateKB < 40 || emaNetKB <= 0) return;
         if (emaNetKB >= emaBitrateKB * 0.95) return;   // 够流畅，不打扰
         double deficit = 1 - emaNetKB / emaBitrateKB;  // 每分钟内容缺多少
-        autoCachePrompted = true;
         if (deficit > 0.85) {
+            autoCachePrompted = true;
             Toast.makeText(this, "当前网速远低于该频道码率，缓存也无法流畅观看，建议换低码率线路",
                     Toast.LENGTH_LONG).show();
             return;
         }
+        int depthSec = (int) Math.max(30, Math.min(3600, Math.ceil(1800 * deficit)));
+        beginAutoCache(depthSec, "当前网速较慢（" + Math.round(emaNetKB) + "KB/s，频道码率 "
+                + Math.round(emaBitrateKB) + "KB/s）");
+    }
+
+    /** 卡顿频率统计：5 分钟窗口内 ≥3 次即判定网络不稳定，触发自动缓存 */
+    private void recordStall() {
+        if (activeRelay != null || screenRecorder != null || autoCachePrompted) return;
+        long now = System.currentTimeMillis();
+        liveStallTimes.addLast(now);
+        while (!liveStallTimes.isEmpty() && now - liveStallTimes.peekFirst() > 300_000) {
+            liveStallTimes.removeFirst();
+        }
+        if (liveStallTimes.size() < 3) return;
+        liveStallTimes.clear();
+        double deficit = (emaBitrateKB > 40 && emaNetKB > 0)
+                ? Math.max(0.02, 1 - emaNetKB / emaBitrateKB) : 0.05;
+        int depthSec = (int) Math.max(30, Math.min(3600, Math.ceil(1800 * deficit)));
+        beginAutoCache(depthSec, "该频道 5 分钟内卡顿 3 次以上，网络不稳定");
+    }
+
+    /** 统一进入自动缓存：提示 → 深度覆盖 → 中继起录（等待期无画面无声音） */
+    private void beginAutoCache(int depthSec, String reason) {
+        if (autoCachePrompted || activeRelay != null || screenRecorder != null) return;
+        if (!relayEnabled) return;
+        autoCachePrompted = true;
         String url = recordingSourceUrl();
         if (url == null || url.isEmpty() || !isHlsUrl(url) || isDrmStream(url)) {
-            Toast.makeText(this, "当前网速较慢，但该频道无法自动缓存（无可流录直链）", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "网速不稳定，但该频道无法自动缓存（无可流录直链）",
+                    Toast.LENGTH_LONG).show();
             return;
         }
-        int watchSec = 1800;                                   // 期望连续观看时长（预留量给足）
-        int depthSec = (int) Math.ceil(watchSec * deficit);    // 需要的落后深度（秒）= 等待时长
-        depthSec = Math.max(30, Math.min(3600, depthSec));
-        Toast.makeText(this, "当前网速较慢（" + Math.round(emaNetKB) + "KB/s，频道码率 "
-                + Math.round(emaBitrateKB) + "KB/s）：已自动开始缓存 " + fmtDepth(depthSec)
-                + "，完成后自动从缓存点流畅播放（按当前网速约可连续观看 30 分钟，期间无画面无声音）",
-                Toast.LENGTH_LONG).show();
+        Toast.makeText(this, reason + "：已自动开始缓存 " + fmtDepth(depthSec)
+                + "，完成后自动从缓存点流畅播放（期间无画面无声音）", Toast.LENGTH_LONG).show();
         startRelayPreload(url, recordingSourceName(), 0, false, false, depthSec);
     }
 
@@ -4908,12 +4907,15 @@ public class MainActivity extends AppCompatActivity {
         releasePendingPlayer();
         cancelStreamRotation();
         updateKeyRewriteCapable();
-        // 重置网速/码率监测基线：每个频道独立测量，自动缓存按频道重新武装
+        // 重置网速/码率监测基线：每次起播独立测量。
+        // 注意 autoCachePrompted 不在这里重置——重试/静默刷新都会走到这，
+        // 在这里重置会让"网络差→重连→又触发缓存"死循环；它只在真正换台时重新武装
         monTotalBytes = 0; monContentMs = 0;
         monMarkBytes = 0; monMarkContentMs = 0; monMarkWall = 0;
         monSamples = 0;
         insufficientStreak = 0;
-        autoCachePrompted = false;
+        liveEverReady = false;
+        liveStallTimes.clear();
 
         LogUtil.i("NewsLive", "playVideoUrl: " + url + " retry=" + retryCount + " refreshed=" + isRefreshed + " silent=" + silent);
 
@@ -4981,6 +4983,8 @@ public class MainActivity extends AppCompatActivity {
                 LogUtil.i("NewsLive", "onPlaybackStateChanged: " + playbackState + " url=" + url);
                 switch (playbackState) {
                     case Player.STATE_BUFFERING:
+                        // 统计卡顿频率：5 分钟内 ≥3 次也算不稳定，自动进缓存
+                        if (liveEverReady) recordStall();
                         // 无缝预载进行中时不弹转圈：旧画面还在播，短暂缓冲不该打扰观看
                         if (!finalSilent && pendingPlayer == null) {
                             progressBar.setVisibility(View.VISIBLE);
@@ -5062,6 +5066,8 @@ public class MainActivity extends AppCompatActivity {
                     case Player.STATE_READY:
                         progressBar.setVisibility(View.GONE);
                         isPlaying = true;
+                        relayEndedResume = 0;   // 播上了就清掉接播计数
+                        liveEverReady = true;   // 起播成功后，后续 BUFFERING 才算"卡顿"
                         // 本地中继：把起播位置钉在录制起点。直播语义下播放器默认会跳到列表尾部
                         if (relayPlaybackActive && relayStartSeekPending) {
                             relayStartSeekPending = false;
@@ -5103,6 +5109,21 @@ public class MainActivity extends AppCompatActivity {
                                     stopRecordingBackToLive();
                                 }
                             });
+                        } else if (relayPlaybackActive && activeRelay != null) {
+                            // 缓存池耗尽（多半是网络中断）：等中继补货后接着播，
+                            // 最多自动接播 3 次，仍不行再交给既有兜底（换线/深度恢复）
+                            relayEndedResume++;
+                            if (relayEndedResume <= 3) {
+                                final HlsRelay r = activeRelay;
+                                handler.postDelayed(new Runnable() {
+                                    @Override public void run() {
+                                        if (activeRelay != null && activeRelay == r && relayPlaybackActive) {
+                                            playVideoUrlNow(r.getLocalPlaylistUrl(), cachePendingName,
+                                                    0, false, true);
+                                        }
+                                    }
+                                }, 2500);
+                            }
                         }
                         break;
                     case Player.STATE_IDLE:
@@ -6541,6 +6562,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void loadStreamFromConfig(int index) {
+        // 换台：自动缓存重新武装（上一个频道的"不再触发"标记清掉）
+        autoCachePrompted = false;
         // 兼容节目单混合模式:从网页模式直接点播放器源时,先收起网页并初始化播放器
         // (此前该路径下 player==null 会导致 NPE 崩溃)
         if (useWebMode) {
