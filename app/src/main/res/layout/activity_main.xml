@@ -515,6 +515,27 @@
         android:textStyle="bold"
         android:visibility="gone" />
 
+    <!-- 录制中的常驻停止入口：面板会自动隐藏，手机/电视都得有地方按停止 -->
+    <TextView
+        android:id="@+id/tv_stop_record"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_marginEnd="18dp"
+        android:layout_marginBottom="18dp"
+        android:background="@drawable/bg_playback_badge"
+        android:paddingLeft="18dp"
+        android:paddingTop="8dp"
+        android:paddingRight="18dp"
+        android:paddingBottom="8dp"
+        android:text="⏹ 停止录制"
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:visibility="gone"
+        android:focusable="true"
+        android:focusableInTouchMode="true" />
+
     <!-- 顶部信息横幅：竖屏两行（第1行农历+日期，第2行定位+天气），横屏单行（定位天气在行尾，第2行隐藏） -->
     <LinearLayout
         android:id="@+id/info_overlay"

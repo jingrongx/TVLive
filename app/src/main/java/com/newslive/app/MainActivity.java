@@ -198,6 +198,8 @@ public class MainActivity extends AppCompatActivity {
     private ProgressBar pbCache;
     /** 常驻播放状态标志：直播 / 录播（落后直播多久） */
     private TextView tvPlaybackBadge;
+    /** 录制中的常驻停止入口（面板自动隐藏后手机也得能停） */
+    private TextView tvStopRecord;
 
     // ==================== 录屏（DRM 流的唯一可录路径） ====================
     private static final int REQ_SCREEN_CAPTURE = 1001;
@@ -460,6 +462,11 @@ public class MainActivity extends AppCompatActivity {
         tvCacheHint = findViewById(R.id.tv_cache_hint);
         pbCache = findViewById(R.id.pb_cache);
         tvPlaybackBadge = findViewById(R.id.tv_playback_badge);
+        tvStopRecord = findViewById(R.id.tv_stop_record);
+        if (tvStopRecord != null) {
+            tvStopRecord.setOnClickListener(v -> onStopRecordClicked());
+            tvStopRecord.setFocusableInTouchMode(!isTelevisionDevice());
+        }
         portraitPlayOverlay = findViewById(R.id.portrait_play_overlay);
         btnFullscreenPlay = findViewById(R.id.btn_fullscreen_play);
         controlButtonsRow = findViewById(R.id.control_buttons_row);
@@ -1763,11 +1770,11 @@ public class MainActivity extends AppCompatActivity {
         if (lag > 5000) {
             tvPlaybackBadge.setText("● 录播 · 落后直播 " + fmtHms(lag));
             tvPlaybackBadge.setTextColor(0xFFFFD54F);
+            tvPlaybackBadge.setVisibility(View.VISIBLE);
         } else {
-            tvPlaybackBadge.setText("● 直播");
-            tvPlaybackBadge.setTextColor(0xFFFF5252);
+            // 看直播时不挂角标（用户要求：只有看录制内容才提示）
+            tvPlaybackBadge.setVisibility(View.GONE);
         }
-        tvPlaybackBadge.setVisibility(View.VISIBLE);
     }
 
     // ==================== 天气定时刷新（每30分钟）====================
@@ -3812,6 +3819,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void playVideoUrl(String url, String name) {
+        // 正在本地录制：网页重嗅探不能把播放切走（切走即 stopRelaySession，录制清零）
+        if (relayPlaybackActive && activeRelay != null) {
+            LogUtil.i("NewsLive", "relay active, skip playVideoUrl: " + url);
+            return;
+        }
         currentVideoUrl = url;
         currentVideoName = name;
         playVideoUrlWithRetry(url, name, 0, false, false);
@@ -4541,11 +4553,37 @@ public class MainActivity extends AppCompatActivity {
     private void updateRecordButton() {
         if (btnRecord == null) return;
         boolean recording = activeRelay != null || (screenRecorder != null && screenRecorder.isRecording());
+        if (tvStopRecord != null) {
+            tvStopRecord.setVisibility(recording ? View.VISIBLE : View.GONE);
+        }
         if (recording == recordBtnRecording) return;
         recordBtnRecording = recording;
         btnRecord.setImageResource(recording ? R.drawable.ic_record_stop : R.drawable.ic_record);
         btnRecord.setContentDescription(recording ? "停止录制" : "开始录制");
         if (tvRecordLabel != null) tvRecordLabel.setText(recording ? "停止录制" : "录制");
+    }
+
+    /**
+     * 常驻「停止录制」入口：手机面板会自动隐藏，必须保证任何时候都有地方按停止。
+     * 按状态给不同动作：
+     *  - 录屏中        → 结束录屏并自动回放
+     *  - 攒缓存中      → 直接从录制起点开看（否则停下来等于白录）
+     *  - 正在看录制    → 停止录制回到直播
+     */
+    private void onStopRecordClicked() {
+        if (screenRecorder != null) {
+            stopScreenRecordingAndPlay();
+            return;
+        }
+        if (activeRelay != null) {
+            if (relayPlaybackActive) {
+                stopRecordingBackToLive();
+            } else {
+                skipCachePreload();
+            }
+            return;
+        }
+        updateRecordButton();
     }
 
     /** 中继模式下在已录制范围内回看/前进（行车记录仪式回放） */
@@ -4618,7 +4656,7 @@ public class MainActivity extends AppCompatActivity {
             boolean starving = wallMs > 12000 && recordRatio < 0.92;
             tvCacheHint.setText(starving
                     ? "⚠ 源码率超过网速（" + WEAK_NET_KBPS + "KB/s 底线），录制无法持续，建议换低码率线路"
-                    : "按 OK 从录制起点开始看（落后直播 " + fmtHms(cachedMs) + "）");
+                    : "按 OK 从录制起点开始看 · 右下角可停止录制");
         }
     }
 
@@ -4685,15 +4723,23 @@ public class MainActivity extends AppCompatActivity {
     /** OK/返回：不等了，用已经攒到的部分立即开播 */
     private void skipCachePreload() {
         HlsRelay r = activeRelay;
+        if (r == null) {
+            stopCacheTicker();
+            hideCacheOverlay();
+            return;
+        }
+        if (!r.hasFirstSegment()) {
+            // 还没拿到第一个分片：不能停定时器，否则之后永远没人负责开播
+            Toast.makeText(this, "还没取到数据，稍等几秒再按", Toast.LENGTH_SHORT).show();
+            return;
+        }
         stopCacheTicker();
         hideCacheOverlay();
-        if (r != null && r.hasFirstSegment()) {
-            relayPlaybackActive = true;
-            relayStartSeekPending = true;
-            startRelayPositionTicker(r, relaySession);
-            playVideoUrlNow(r.getLocalPlaylistUrl(), cachePendingName,
-                    cachePendingRetry, cachePendingRefreshed, cachePendingSilent);
-        }
+        relayPlaybackActive = true;
+        relayStartSeekPending = true;
+        startRelayPositionTicker(r, relaySession);
+        playVideoUrlNow(r.getLocalPlaylistUrl(), cachePendingName,
+                cachePendingRetry, cachePendingRefreshed, cachePendingSilent);
     }
 
     private void playVideoUrlNow(String url, String name, int retryCount, boolean isRefreshed, boolean silent) {
