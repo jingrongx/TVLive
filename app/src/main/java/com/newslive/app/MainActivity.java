@@ -204,6 +204,7 @@ public class MainActivity extends AppCompatActivity {
     private long monMarkBytes = 0, monMarkContentMs = 0, monMarkWall = 0;
     private double emaBitrateKB = 0, emaNetKB = 0;
     private int monSamples = 0;
+    private int insufficientStreak = 0;
     private boolean autoCachePrompted = false;
     private Runnable cacheTicker;
     private Runnable relayPosTicker;
@@ -1783,8 +1784,9 @@ public class MainActivity extends AppCompatActivity {
             lag = Math.max(0, total - pos);
         }
         if (lag > 5000) {
-            tvPlaybackBadge.setText("● 录播 · 落后直播 " + fmtHms(lag));
-            tvPlaybackBadge.setTextColor(0xFFFFD54F);
+            // 紧凑角标：只留状态和落后量，别占画面
+            tvPlaybackBadge.setText("● 录播 " + fmtHms(lag));
+            tvPlaybackBadge.setTextColor(0xCCFFD54F);
             tvPlaybackBadge.setVisibility(View.VISIBLE);
         } else {
             // 看直播时不挂角标（用户要求：只有看录制内容才提示）
@@ -4101,7 +4103,7 @@ public class MainActivity extends AppCompatActivity {
     /** 起中继 + 显示预缓存遮罩，攒够再开播 */
     private void startRelayPreload(final String url, final String name, final int retryCount,
                                    final boolean isRefreshed, final boolean silent,
-                                   final int targetMinOverride) {
+                                   final int targetSecOverride) {
         stopRelaySession();
         final int session = ++relaySession;
         try {
@@ -4126,9 +4128,16 @@ public class MainActivity extends AppCompatActivity {
         // 起播点 = 录制起点：录够 preloadMin 后从最旧的分片开始播，画面永远落后直播 preloadMin。
         // 必须给滚动淘汰留 5 分钟余量，否则一开播就会把正在播的那段淘汰掉。
         int preloadMin = Math.max(0, Math.min(1440, cachePreloadMin));
-        // 自动缓存触发时由校准结果给定深度，覆盖用户设定值
-        if (targetMinOverride > 0) preloadMin = Math.max(3, Math.min(1440, targetMinOverride));
-        if (preloadMin > recordMin - 5) preloadMin = Math.max(0, recordMin - 5);
+        // 自动缓存触发时由校准结果给定深度（秒），覆盖用户设定值；下限 30 秒
+        if (targetSecOverride > 0) {
+            int sec = Math.max(30, Math.min(1440 * 60, targetSecOverride));
+            int capMin = Math.max(1, recordMin - 5);
+            if (sec > capMin * 60) sec = capMin * 60;
+            cachePreloadTargetMs = sec * 1000L;
+        } else {
+            if (preloadMin > recordMin - 5) preloadMin = Math.max(0, recordMin - 5);
+            cachePreloadTargetMs = preloadMin * 60_000L;
+        }
 
         // 磁盘预检：按 60KB/s（80KB/s 环境下可持续播放的码率上限）保守估算，
         // 留 25% 余量给系统与碎片，装不下就自动缩短并明确告知，而不是录到一半写失败。
@@ -4194,7 +4203,6 @@ public class MainActivity extends AppCompatActivity {
         cachePendingRetry = retryCount;
         cachePendingRefreshed = isRefreshed;
         cachePendingSilent = silent;
-        cachePreloadTargetMs = preloadMin * 60_000L;
         cachePreloadStartAt = System.currentTimeMillis();
         emaRecordRatio = 1.0;
         etaText = null;
@@ -4222,26 +4230,18 @@ public class MainActivity extends AppCompatActivity {
                     double net = relay.getDiskBytes() / Math.max(1, wall / 1000.0) / 1024.0;
                     if (src > 5 && net > 0) {
                         double ratio = net / src;
-                        int newMin = cachePreloadMin;
                         String v;
                         if (ratio >= 1.10) {
                             v = "网速富余 " + Math.round((ratio - 1) * 100) + "%，录满安全深度后自动开播（后台持续录制）";
-                            // 检测到富余：把目标缩到安全深度，尽快开播；之后落后量恒定，可全天观看
-                            if (cachePreloadMin > 0) {
-                                int p = Math.min(cachePreloadMin, 3);
-                                if (p > cacheRetainMin - 5) p = Math.max(1, cacheRetainMin - 5);
-                                cachePreloadTargetMs = p * 60_000L;
-                            }
+                            // 检测到富余：目标缩到安全深度（≤60 秒），尽快开播；之后落后量恒定，可全天观看
+                            cachePreloadTargetMs = Math.max(30_000L, Math.min(cachePreloadTargetMs, 60_000L));
                         } else if (ratio >= 1.0) {
                             v = "网速勉强够（富余<10%），波动时可能缓冲";
                         } else {
-                            newMin = (int) Math.max(3, Math.min(45, Math.round(30 * (1 - ratio))));
-                            v = "网速只有码率的 " + Math.round(ratio * 100) + "%，本次自动录 " + newMin
-                                    + " 分钟（约可连续看 30 分钟），建议换低码率线路";
-                        }
-                        if (newMin != cachePreloadMin && cachePreloadMin > 0) {
-                            int p = Math.min(newMin, Math.max(1, cacheRetainMin - 5));
-                            cachePreloadTargetMs = p * 60_000L;
+                            int newSec = (int) Math.max(30, Math.min(3600, Math.round(1800 * (1 - ratio))));
+                            cachePreloadTargetMs = newSec * 1000L;
+                            v = "网速只有码率的 " + Math.round(ratio * 100) + "%，本次自动录 " + fmtDepth(newSec)
+                                    + "（按当前网速约可连续看 30 分钟），建议换低码率线路";
                         }
                         final String msg = "码率 " + Math.round(src) + "KB/s · 网速 " + Math.round(net) + "KB/s：" + v;
                         LogUtil.i("NewsLive", "auto-calib: " + msg);
@@ -4701,7 +4701,12 @@ public class MainActivity extends AppCompatActivity {
             emaBitrateKB = emaBitrateKB <= 0 ? bKB : emaBitrateKB * 0.6 + bKB * 0.4;
             emaNetKB = emaNetKB <= 0 ? nKB : emaNetKB * 0.6 + nKB * 0.4;
             monSamples++;
-            if (monSamples >= 6) maybeAutoCacheStart();
+            // 连续 2 个窗口（约 10 秒）都撑不住才触发：刚换台的头几秒不作数
+            if (emaNetKB < emaBitrateKB * 0.95) insufficientStreak++; else insufficientStreak = 0;
+            if (monSamples >= 2 && insufficientStreak >= 2) {
+                insufficientStreak = 0;
+                maybeAutoCacheStart();
+            }
         } catch (Exception ignore) { }
     }
 
@@ -4722,13 +4727,19 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "当前网速较慢，但该频道无法自动缓存（无可流录直链）", Toast.LENGTH_LONG).show();
             return;
         }
-        int watchMin = 120;                                    // 期望连续观看时长（预留量给足）
-        int depthMin = (int) Math.ceil(watchMin * deficit);    // 需要的落后深度（分钟）= 等待时长
-        depthMin = Math.max(3, Math.min(60, depthMin));
+        int watchSec = 1800;                                   // 期望连续观看时长（预留量给足）
+        int depthSec = (int) Math.ceil(watchSec * deficit);    // 需要的落后深度（秒）= 等待时长
+        depthSec = Math.max(30, Math.min(3600, depthSec));
         Toast.makeText(this, "当前网速较慢（" + Math.round(emaNetKB) + "KB/s，频道码率 "
-                + Math.round(emaBitrateKB) + "KB/s）：已自动开始缓存 " + depthMin
-                + " 分钟，完成后自动从缓存点流畅播放（期间无画面无声音）", Toast.LENGTH_LONG).show();
-        startRelayPreload(url, recordingSourceName(), 0, false, false, depthMin);
+                + Math.round(emaBitrateKB) + "KB/s）：已自动开始缓存 " + fmtDepth(depthSec)
+                + "，完成后自动从缓存点流畅播放（按当前网速约可连续观看 30 分钟，期间无画面无声音）",
+                Toast.LENGTH_LONG).show();
+        startRelayPreload(url, recordingSourceName(), 0, false, false, depthSec);
+    }
+
+    /** 深度文案：≥60 秒显示分钟，否则显示秒 */
+    private static String fmtDepth(int sec) {
+        return sec >= 60 ? (Math.round(sec / 60.0f)) + " 分钟" : sec + " 秒";
     }
 
     /** 中继模式下在已录制范围内回看/前进（行车记录仪式回放） */
@@ -4901,6 +4912,7 @@ public class MainActivity extends AppCompatActivity {
         monTotalBytes = 0; monContentMs = 0;
         monMarkBytes = 0; monMarkContentMs = 0; monMarkWall = 0;
         monSamples = 0;
+        insufficientStreak = 0;
         autoCachePrompted = false;
 
         LogUtil.i("NewsLive", "playVideoUrl: " + url + " retry=" + retryCount + " refreshed=" + isRefreshed + " silent=" + silent);
@@ -6860,8 +6872,11 @@ public class MainActivity extends AppCompatActivity {
                 switch (event.getKeyCode()) {
                     case KeyEvent.KEYCODE_DPAD_CENTER:
                     case KeyEvent.KEYCODE_ENTER:
-                    case KeyEvent.KEYCODE_BACK:
                         skipCachePreload();
+                        return true;
+                    case KeyEvent.KEYCODE_BACK:
+                        // 缓存等待期按返回 = 取消缓存回直播（OK 才是开播）
+                        if (activeRelay != null) stopRecordingBackToLive();
                         return true;
                     case KeyEvent.KEYCODE_DPAD_UP:
                         switchToPrevSource();
@@ -6957,6 +6972,15 @@ public class MainActivity extends AppCompatActivity {
                         if (webView != null) webView.setVisibility(View.VISIBLE);
                         if (infoOverlay != null) infoOverlay.setVisibility(View.VISIBLE);
                         lastBackPressTime = 0; // 退出全屏不计入双击退出
+                        return true;
+                    }
+                    // 1.5) 录制/缓存中：按返回退出录播模式回直播（遥控器不必去够右下角浮标）
+                    if (screenRecorder != null) {
+                        stopScreenRecordingAndPlay();
+                        return true;
+                    }
+                    if (activeRelay != null) {
+                        stopRecordingBackToLive();
                         return true;
                     }
                     // 2) 2秒内连按两次返回：退出应用（直播应用单次误触不应直接退出）
