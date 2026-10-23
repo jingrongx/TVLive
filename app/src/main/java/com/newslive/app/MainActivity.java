@@ -4213,7 +4213,13 @@ public class MainActivity extends AppCompatActivity {
                         int newMin = cachePreloadMin;
                         String v;
                         if (ratio >= 1.10) {
-                            v = "网速富余 " + Math.round((ratio - 1) * 100) + "%，可全天流畅";
+                            v = "网速富余 " + Math.round((ratio - 1) * 100) + "%，即将开始连续播放（后台持续录制，像缓存一样）";
+                            // 检测到富余：把目标缩到安全深度，尽快开播；之后落后量恒定，可全天观看
+                            if (cachePreloadMin > 0) {
+                                int p = Math.min(cachePreloadMin, 3);
+                                if (p > cacheRetainMin - 5) p = Math.max(1, cacheRetainMin - 5);
+                                cachePreloadTargetMs = p * 60_000L;
+                            }
                         } else if (ratio >= 1.0) {
                             v = "网速勉强够（富余<10%），波动时可能缓冲";
                         } else {
@@ -4605,10 +4611,15 @@ public class MainActivity extends AppCompatActivity {
         if (btnRecord == null) return;
         boolean srRec = screenRecorder != null && screenRecorder.isRecording();
         boolean recording = activeRelay != null || srRec;
-        // 录制定格后（正在看录像）不再显示停止浮标——切台即回直播
-        boolean showChip = srRec || (activeRelay != null && !relayFinalized);
+        // 浮标文案按阶段区分：攒缓存=取消录制；连续观看=退出录播；录屏=停止录屏
         if (tvStopRecord != null) {
-            tvStopRecord.setVisibility(showChip ? View.VISIBLE : View.GONE);
+            boolean show = recording;
+            String label;
+            if (srRec) label = "⏹ 停止录屏";
+            else if (relayPlaybackActive) label = "⏹ 退出录播";
+            else label = "⏹ 取消录制";
+            tvStopRecord.setText(label);
+            tvStopRecord.setVisibility(show ? View.VISIBLE : View.GONE);
         }
         if (recording == recordBtnRecording) return;
         recordBtnRecording = recording;
@@ -4618,11 +4629,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * 常驻「停止录制」入口：手机面板会自动隐藏，必须保证任何时候都有地方按停止。
-     * 语义统一为「停止录制 = 定格录像并从头观看」：
-     *  - 录屏中        → 结束录屏并自动回放
-     *  - 流式录制中    → 中继停录、写 ENDLIST，从录制起点播放已录内容
-     *  - 已在看录像    → 回到直播（切台也可以）
+     * 常驻浮标：只有一个动作——退出录播模式回直播。
+     * 看录播期间中继一直在录、一直在播（像缓存），点这里才是结束本次会话。
      */
     private void onStopRecordClicked() {
         if (screenRecorder != null) {
@@ -4630,30 +4638,10 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         if (activeRelay != null) {
-            if (relayFinalized) {
-                stopRecordingBackToLive();
-            } else {
-                finalizeRecordingAndWatch();
-            }
+            stopRecordingBackToLive();
             return;
         }
         updateRecordButton();
-    }
-
-    /** 定格录像：中继停止录制、写 ENDLIST，从头播放已录内容（文件保留，切台才丢弃） */
-    private void finalizeRecordingAndWatch() {
-        final HlsRelay r = activeRelay;
-        if (r == null) return;
-        stopCacheTicker();
-        hideCacheOverlay();
-        r.finalizeRecording();
-        relayFinalized = true;
-        relayPlaybackActive = true;
-        relayStartSeekPending = true;
-        startRelayPositionTicker(r, relaySession);
-        playVideoUrlNow(r.getLocalPlaylistUrl(), cachePendingName, 0, false, false);
-        updateRecordButton();
-        Toast.makeText(this, "录制完成，从头播放录像（切台即回直播）", Toast.LENGTH_SHORT).show();
     }
 
     /** 录制期间把网页视频静音：画面继续（供嗅探与 key 采集），声音不打扰观看 */
@@ -4743,7 +4731,7 @@ public class MainActivity extends AppCompatActivity {
             boolean starving = wallMs > 12000 && recordRatio < 0.92;
             tvCacheHint.setText(starving
                     ? "⚠ 源码率超过网速（" + WEAK_NET_KBPS + "KB/s 底线），录制无法持续，建议换低码率线路"
-                    : "按 OK 从录制起点开始看 · 右下角停止=定格录像");
+                    : "按 OK 立即开播 · 右下角退出录播");
         }
     }
 
