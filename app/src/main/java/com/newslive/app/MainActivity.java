@@ -4249,13 +4249,22 @@ public class MainActivity extends AppCompatActivity {
                             startRecordingNow(url, name);
                         } else {
                             Toast.makeText(MainActivity.this,
-                                    "检测结果：" + result + "\n这类流的分片在 App 内无法解密，"
-                                            + "只能按屏幕画面录（录屏）", Toast.LENGTH_LONG).show();
+                                    "检测结果：" + result + "\n" + audioCaptureHint(), Toast.LENGTH_LONG).show();
                         }
                     }
                 });
             }
         }, "drm-probe").start();
+    }
+
+    /** 本机的音频录制能力：决定 DRM 流走"应用内音频直采"还是"明文音轨合成" */
+    private String audioCaptureHint() {
+        String ver = Build.VERSION.RELEASE == null ? String.valueOf(Build.VERSION.SDK_INT) : Build.VERSION.RELEASE;
+        if (Build.VERSION.SDK_INT >= 29) {
+            return "本机 Android " + ver + "：支持应用内音频直采（AudioPlaybackCapture），录屏可带声音";
+        }
+        return "本机 Android " + ver + "：系统不支持应用内音频捕获，"
+                + "但这类流通常视频加密、音频明文，可从原流抽音轨与录屏画面合成";
     }
 
     /** 拉一次播放列表判断加密方式（master 会跟进一层变体） */
@@ -7099,6 +7108,7 @@ public class MainActivity extends AppCompatActivity {
                 "</div>" +
                 "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上。弱网(200~400KB/s)建议码率1000左右，起播缓冲8000~10000；码率会自动限制多码率频道的最高画质，网络差时自动降档。<br><b>先录后看</b>：切台后先录，录够「录多久后开始看」才开始播放，<b>并且从录制起点开始播</b>——画面永远落后直播这么多（屏幕左下角常驻「录播 · 落后直播 X」标志，追到直播边缘会变成「直播」）。录制期间按 OK 可随时从录制起点提前开看。<br><b>滚动录制</b>：像行车记录仪一样一直录，录满自动覆盖最旧的。占用按 <b>源码率 × 时长</b> 计算：60KB/s 约 211MB/小时，171KB/s（CCTV1）约 601MB/小时。空间不足会自动缩短并在遮罩上提示。</div>" +
                 "<label><input type='checkbox' id='recordManual' " + (recordManual ? "checked" : "") + "> 手动控制录制（勾选后切台不自动录，由底部控制条「录制」按钮开始）</label>" +
+                "<div class='tip'>" + audioCaptureHint() + "</div>" +
                 "</div>" +
                 "<div class='section'>" +
                 "<div class='section-title'>📊 顶部信息横幅</div>" +
