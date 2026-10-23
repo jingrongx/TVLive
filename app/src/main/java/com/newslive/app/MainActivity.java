@@ -198,6 +198,14 @@ public class MainActivity extends AppCompatActivity {
     /** 开录 15 秒后用实测码率/网速自动校准要录多久 */
     private boolean calibDone = false;
     private boolean calibAnnounced = false;
+
+    // ==================== 直播网速/码率自动监测（无感缓存触发） ====================
+    private androidx.media3.exoplayer.upstream.DefaultBandwidthMeter netMeter;
+    private long monTotalBytes = 0, monContentMs = 0;
+    private long monMarkBytes = 0, monMarkContentMs = 0, monMarkWall = 0;
+    private double emaBitrateKB = 0, emaNetKB = 0;
+    private int monSamples = 0;
+    private boolean autoCachePrompted = false;
     private Runnable cacheTicker;
     private Runnable relayPosTicker;
     private View cacheOverlay;
@@ -1739,6 +1747,7 @@ public class MainActivity extends AppCompatActivity {
             public void run() {
                 updateClock();
                 updatePlaybackBadge();
+                sampleLiveNet();
                 clockHandler.postDelayed(this, 1000);
             }
         };
@@ -4079,7 +4088,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        startRelayPreload(url, name, retryCount, isRefreshed, silent);
+        startRelayPreload(url, name, retryCount, isRefreshed, silent, 0);
     }
 
     private boolean isHlsUrl(String u) {
@@ -4092,7 +4101,8 @@ public class MainActivity extends AppCompatActivity {
 
     /** 起中继 + 显示预缓存遮罩，攒够再开播 */
     private void startRelayPreload(final String url, final String name, final int retryCount,
-                                   final boolean isRefreshed, final boolean silent) {
+                                   final boolean isRefreshed, final boolean silent,
+                                   final int targetMinOverride) {
         stopRelaySession();
         final int session = ++relaySession;
         try {
@@ -4117,6 +4127,8 @@ public class MainActivity extends AppCompatActivity {
         // 起播点 = 录制起点：录够 preloadMin 后从最旧的分片开始播，画面永远落后直播 preloadMin。
         // 必须给滚动淘汰留 5 分钟余量，否则一开播就会把正在播的那段淘汰掉。
         int preloadMin = Math.max(0, Math.min(1440, cachePreloadMin));
+        // 自动缓存触发时由校准结果给定深度，覆盖用户设定值
+        if (targetMinOverride > 0) preloadMin = Math.max(3, Math.min(1440, targetMinOverride));
         if (preloadMin > recordMin - 5) preloadMin = Math.max(0, recordMin - 5);
 
         // 磁盘预检：按 60KB/s（80KB/s 环境下可持续播放的码率上限）保守估算，
@@ -4176,6 +4188,8 @@ public class MainActivity extends AppCompatActivity {
         relay.start();
         // 网页模式：录像走 ExoPlayer 本地列表后，网页自己的声音就是干扰，静音
         muteWebVideoQuiet();
+        // 缓存等待期不播画面不出声：播放器直接停掉，攒够再从缓存点起播
+        try { if (player != null) player.stop(); } catch (Exception ignore) { }
 
         cachePendingName = name;
         cachePendingRetry = retryCount;
@@ -4477,7 +4491,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void startRecordingNow(String url, String name) {
         Toast.makeText(this, "开始录制：" + name, Toast.LENGTH_SHORT).show();
-        startRelayPreload(url, name, 0, false, false);
+        startRelayPreload(url, name, 0, false, false, 0);
         updateRecordButton();
     }
 
@@ -4595,15 +4609,16 @@ public class MainActivity extends AppCompatActivity {
         return streamNames.get(Math.min(Math.max(currentUrlIndex, 0), streamNames.size() - 1));
     }
 
-    /** 停止录制并回到直播（磁盘缓存一起释放） */
+    /** 停止录制并回到直播（磁盘缓存一起释放）；本次频道不再自动重新进入缓存，切台才重新武装 */
     private void stopRecordingBackToLive() {
         String url = recordingSourceUrl();
         String name = recordingSourceName();
         stopRelaySession();
         updateRecordButton();
         if (url == null || url.isEmpty()) return;
-        Toast.makeText(this, "已停止录制，回到直播", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "已退出录播，回到直播", Toast.LENGTH_SHORT).show();
         playVideoUrlNow(url, name, 0, false, false);
+        autoCachePrompted = true;   // 手动退出后别立刻又自动进缓存，切台才重新武装
     }
 
     /** 录制按钮状态（只在变化时改，避免每秒重设图标） */
@@ -4652,6 +4667,63 @@ public class MainActivity extends AppCompatActivity {
                     "(function(){try{var vs=document.querySelectorAll('video');"
                             + "for(var i=0;i<vs.length;i++){vs[i].muted=true;}}catch(e){}})();", null);
         } catch (Exception ignore) { }
+    }
+
+    // ---------------------------------------------------------------- 无感自动缓存
+
+    /** 播放直播时每秒采样一次（内部 5 秒一窗）：网速 < 码率 且持续，就自动进入缓存模式 */
+    private void sampleLiveNet() {
+        try {
+            if (player == null || activeRelay != null || screenRecorder != null) return;
+            if (!relayEnabled) return;
+            if (player.getPlaybackState() != Player.STATE_READY || !player.isPlaying()) return;
+            long now = System.currentTimeMillis();
+            if (monMarkWall == 0) {
+                monMarkWall = now; monMarkBytes = monTotalBytes; monMarkContentMs = monContentMs;
+                return;
+            }
+            long wallDelta = now - monMarkWall;
+            if (wallDelta < 5000) return;
+            long bytesDelta = monTotalBytes - monMarkBytes;
+            long contentDelta = monContentMs - monMarkContentMs;
+            monMarkWall = now; monMarkBytes = monTotalBytes; monMarkContentMs = monContentMs;
+            if (contentDelta < 3000 || bytesDelta < 40 * 1024) return;
+
+            double bKB = bytesDelta / 1024.0 / (contentDelta / 1000.0);
+            double nKB = netMeter != null && netMeter.getBitrateEstimate() > 0
+                    ? netMeter.getBitrateEstimate() / 8.0 / 1024.0
+                    : bytesDelta / 1024.0 / (wallDelta / 1000.0);
+            emaBitrateKB = emaBitrateKB <= 0 ? bKB : emaBitrateKB * 0.6 + bKB * 0.4;
+            emaNetKB = emaNetKB <= 0 ? nKB : emaNetKB * 0.6 + nKB * 0.4;
+            monSamples++;
+            if (monSamples >= 6) maybeAutoCacheStart();
+        } catch (Exception ignore) { }
+    }
+
+    /** 网速撑不住当前频道码率 → 弹提示并自动进入缓存（等待期无画面无声音，攒够自动开播） */
+    private void maybeAutoCacheStart() {
+        if (autoCachePrompted || activeRelay != null || screenRecorder != null) return;
+        if (emaBitrateKB < 40 || emaNetKB <= 0) return;
+        if (emaNetKB >= emaBitrateKB * 0.95) return;   // 够流畅，不打扰
+        double deficit = 1 - emaNetKB / emaBitrateKB;  // 每分钟内容缺多少
+        autoCachePrompted = true;
+        if (deficit > 0.85) {
+            Toast.makeText(this, "当前网速远低于该频道码率，缓存也无法流畅观看，建议换低码率线路",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        String url = recordingSourceUrl();
+        if (url == null || url.isEmpty() || !isHlsUrl(url) || isDrmStream(url)) {
+            Toast.makeText(this, "当前网速较慢，但该频道无法自动缓存（无可流录直链）", Toast.LENGTH_LONG).show();
+            return;
+        }
+        int watchMin = 120;                                    // 期望连续观看时长（预留量给足）
+        int depthMin = (int) Math.ceil(watchMin * deficit);    // 需要的落后深度（分钟）= 等待时长
+        depthMin = Math.max(3, Math.min(60, depthMin));
+        Toast.makeText(this, "当前网速较慢（" + Math.round(emaNetKB) + "KB/s，频道码率 "
+                + Math.round(emaBitrateKB) + "KB/s）：已自动开始缓存 " + depthMin
+                + " 分钟，完成后自动从缓存点流畅播放（期间无画面无声音）", Toast.LENGTH_LONG).show();
+        startRelayPreload(url, recordingSourceName(), 0, false, false, depthMin);
     }
 
     /** 中继模式下在已录制范围内回看/前进（行车记录仪式回放） */
@@ -4825,6 +4897,11 @@ public class MainActivity extends AppCompatActivity {
         releasePendingPlayer();
         cancelStreamRotation();
         updateKeyRewriteCapable();
+        // 重置网速/码率监测基线：每个频道独立测量，自动缓存按频道重新武装
+        monTotalBytes = 0; monContentMs = 0;
+        monMarkBytes = 0; monMarkContentMs = 0; monMarkWall = 0;
+        monSamples = 0;
+        autoCachePrompted = false;
 
         LogUtil.i("NewsLive", "playVideoUrl: " + url + " retry=" + retryCount + " refreshed=" + isRefreshed + " silent=" + silent);
 
@@ -5970,6 +6047,19 @@ public class MainActivity extends AppCompatActivity {
             .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
             .build();
         p.setAudioAttributes(audioAttributes, false);
+
+        // 直播网速/码率监测：累计媒体分片字节与内容时长（不受卡顿影响，比按墙钟准）
+        p.addAnalyticsListener(new androidx.media3.exoplayer.analytics.AnalyticsListener() {
+            @Override public void onLoadCompleted(
+                    androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime eventTime,
+                    androidx.media3.exoplayer.source.LoadEventInfo loadEventInfo,
+                    androidx.media3.exoplayer.source.MediaLoadData mediaLoadData) {
+                if (mediaLoadData.dataType != C.DATA_TYPE_MEDIA) return;
+                monTotalBytes += loadEventInfo.bytesLoaded;
+                long d = mediaLoadData.mediaEndTimeMs - mediaLoadData.mediaStartTimeMs;
+                if (d > 0) monContentMs += d;
+            }
+        });
         return p;
     }
 
