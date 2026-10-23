@@ -169,7 +169,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_RELAY_ENABLED = "relay_enabled";
     private boolean relayEnabled = true;
     /** 起播前预缓存分钟数，0=关闭（直接播，退回原来的短缓冲行为） */
-    private int cachePreloadMin = 10;
+    private int cachePreloadMin = 60;
     /** 滚动录制时长（分钟），行车记录仪式：录满覆盖最旧。0=仅按预缓存时长 */
     private int relayRecordMin = 360;
     private volatile HlsRelay activeRelay;
@@ -177,6 +177,8 @@ public class MainActivity extends AppCompatActivity {
     private int relaySession = 0;
     /** 当前播放的是本地中继地址：卡顿不再重连换源，改为等本地池子 */
     private volatile boolean relayPlaybackActive = false;
+    /** 中继起播后需要把位置钉到 0（本地列表起点 = 录制起点），否则 ExoPlayer 会从"直播边缘"起播 */
+    private volatile boolean relayStartSeekPending = false;
     private volatile boolean cacheOverlayVisible = false;
     private long cachePreloadTargetMs = 0;
     private long cachePreloadStartAt = 0;
@@ -187,6 +189,8 @@ public class MainActivity extends AppCompatActivity {
     private View cacheOverlay;
     private TextView tvCacheChannel, tvCacheCountdown, tvCacheProgress, tvCacheDetail, tvCacheHint;
     private ProgressBar pbCache;
+    /** 常驻播放状态标志：直播 / 录播（落后直播多久） */
+    private TextView tvPlaybackBadge;
 
     private ExoPlayer player;
     private PlayerView playerView;
@@ -437,6 +441,7 @@ public class MainActivity extends AppCompatActivity {
         tvCacheDetail = findViewById(R.id.tv_cache_detail);
         tvCacheHint = findViewById(R.id.tv_cache_hint);
         pbCache = findViewById(R.id.pb_cache);
+        tvPlaybackBadge = findViewById(R.id.tv_playback_badge);
         portraitPlayOverlay = findViewById(R.id.portrait_play_overlay);
         btnFullscreenPlay = findViewById(R.id.btn_fullscreen_play);
         controlButtonsRow = findViewById(R.id.control_buttons_row);
@@ -1311,7 +1316,7 @@ public class MainActivity extends AppCompatActivity {
         bufferMaxMs = prefs.getInt(KEY_BUFFER_MAX, 60000);
         maxVideoBitrateBps = prefs.getInt(KEY_MAX_BITRATE, 1_000_000);
         startBufferMs = prefs.getInt(KEY_START_BUFFER, 8000);
-        cachePreloadMin = prefs.getInt(KEY_CACHE_PRELOAD_MIN, 10);
+        cachePreloadMin = prefs.getInt(KEY_CACHE_PRELOAD_MIN, 60);
         relayRecordMin = prefs.getInt(KEY_RELAY_RECORD_MIN, 360);
         relayEnabled = prefs.getBoolean(KEY_RELAY_ENABLED, true);
         useWebMode = prefs.getBoolean(KEY_USE_WEB_MODE, true);
@@ -1699,10 +1704,38 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void run() {
                 updateClock();
+                updatePlaybackBadge();
                 clockHandler.postDelayed(this, 1000);
             }
         };
         clockHandler.post(clockRunnable);
+    }
+
+    /**
+     * 常驻播放标志：录播（从录制起点播放，落后直播 N 小时）/ 直播。
+     * 落后量 = 已录制总长 − 当前播放位置；切回直播边缘（或按 ▶ 追平）后自动切成「直播」。
+     */
+    private void updatePlaybackBadge() {
+        if (tvPlaybackBadge == null) return;
+        if (useWebMode || player == null || player.getPlaybackState() != Player.STATE_READY) {
+            tvPlaybackBadge.setVisibility(View.GONE);
+            return;
+        }
+        long lag = 0;
+        HlsRelay r = activeRelay;
+        if (relayPlaybackActive && r != null) {
+            long total = r.getReadyMs();
+            long pos = Math.max(0, player.getCurrentPosition());
+            lag = Math.max(0, total - pos);
+        }
+        if (lag > 5000) {
+            tvPlaybackBadge.setText("● 录播 · 落后直播 " + fmtHms(lag));
+            tvPlaybackBadge.setTextColor(0xFFFFD54F);
+        } else {
+            tvPlaybackBadge.setText("● 直播");
+            tvPlaybackBadge.setTextColor(0xFFFF5252);
+        }
+        tvPlaybackBadge.setVisibility(View.VISIBLE);
     }
 
     // ==================== 天气定时刷新（每30分钟）====================
@@ -4016,6 +4049,10 @@ public class MainActivity extends AppCompatActivity {
         // relayRecordMin=0 时退化为"只保留预缓存时长"。
         int recordMin = relayRecordMin > 0 ? relayRecordMin : Math.max(cachePreloadMin, 5);
         recordMin = Math.max(5, Math.min(1440, recordMin));
+        // 起播点 = 录制起点：录够 preloadMin 后从最旧的分片开始播，画面永远落后直播 preloadMin。
+        // 必须给滚动淘汰留 5 分钟余量，否则一开播就会把正在播的那段淘汰掉。
+        int preloadMin = Math.max(0, Math.min(1440, cachePreloadMin));
+        if (preloadMin > recordMin - 5) preloadMin = Math.max(0, recordMin - 5);
 
         // 磁盘预检：按 60KB/s（80KB/s 环境下可持续播放的码率上限）保守估算，
         // 留 25% 余量给系统与碎片，装不下就自动缩短并明确告知，而不是录到一半写失败。
@@ -4076,7 +4113,7 @@ public class MainActivity extends AppCompatActivity {
         cachePendingRetry = retryCount;
         cachePendingRefreshed = isRefreshed;
         cachePendingSilent = silent;
-        cachePreloadTargetMs = Math.min(cachePreloadMin, recordMin) * 60_000L;
+        cachePreloadTargetMs = preloadMin * 60_000L;
         cachePreloadStartAt = System.currentTimeMillis();
         showCacheOverlay(name);
         startCacheTicker(relay, session);
@@ -4112,6 +4149,7 @@ public class MainActivity extends AppCompatActivity {
                     }
                     hideCacheOverlay();
                     relayPlaybackActive = true;
+                    relayStartSeekPending = true;
                     // 起播后持续把播放位置喂给中继，滚动淘汰才不会删到正在播的部分
                     startRelayPositionTicker(relay, session);
                     playVideoUrlNow(relay.getLocalPlaylistUrl(), cachePendingName,
@@ -4186,7 +4224,7 @@ public class MainActivity extends AppCompatActivity {
         if (tvCacheChannel != null && cachePendingName != null) tvCacheChannel.setText(cachePendingName);
         if (tvCacheCountdown != null) tvCacheCountdown.setText(fmtMmSs(eta));
         if (tvCacheProgress != null) {
-            tvCacheProgress.setText("已缓存 " + fmtMmSs(cachedMs) + " / " + fmtMmSs(target) + " · " + pct + "%");
+            tvCacheProgress.setText("已录 " + fmtHms(cachedMs) + " / " + fmtHms(target) + " · " + pct + "%");
         }
         if (pbCache != null) pbCache.setProgress(pct * 10);
         if (tvCacheDetail != null) {
@@ -4204,15 +4242,24 @@ public class MainActivity extends AppCompatActivity {
         if (tvCacheHint != null) {
             boolean starving = wallMs > 12000 && recordRatio < 0.92;
             tvCacheHint.setText(starving
-                    ? "⚠ 源码率超过网速（" + WEAK_NET_KBPS + "KB/s 底线），缓存无法维持，建议换低码率线路"
-                    : "按 OK 立即开始（当前可播 " + fmtMmSs(cachedMs) + "）");
+                    ? "⚠ 源码率超过网速（" + WEAK_NET_KBPS + "KB/s 底线），录制无法持续，建议换低码率线路"
+                    : "按 OK 从录制起点开始看（落后直播 " + fmtHms(cachedMs) + "）");
         }
     }
 
     private static String fmtMmSs(long ms) {
-        if (ms < 0) ms = 0;
-        long total = ms / 1000;
-        return String.format(Locale.US, "%02d:%02d", total / 60, total % 60);
+        return fmtHms(ms);
+    }
+
+    /** HH:MM:SS（不足 1 小时显示 MM:SS） */
+    private static String fmtHms(long ms) {
+        long s = Math.max(0, ms) / 1000;
+        long h = s / 3600;
+        long m = (s % 3600) / 60;
+        long sec = s % 60;
+        return h > 0
+                ? String.format(Locale.US, "%d:%02d:%02d", h, m, sec)
+                : String.format(Locale.US, "%02d:%02d", m, sec);
     }
 
     private void showCacheOverlay(String name) {
@@ -4224,7 +4271,7 @@ public class MainActivity extends AppCompatActivity {
         if (tvCacheChannel != null) tvCacheChannel.setText(name == null ? "" : name);
         if (tvCacheCountdown != null) tvCacheCountdown.setText(fmtMmSs(cachePreloadTargetMs));
         if (tvCacheProgress != null) {
-            tvCacheProgress.setText("已缓存 00:00 / " + fmtMmSs(cachePreloadTargetMs) + " · 0%");
+            tvCacheProgress.setText("已录 00:00 / " + fmtHms(cachePreloadTargetMs) + " · 0%");
         }
         if (pbCache != null) pbCache.setProgress(0);
         if (tvCacheDetail != null) {
@@ -4266,6 +4313,7 @@ public class MainActivity extends AppCompatActivity {
         hideCacheOverlay();
         if (r != null && r.hasFirstSegment()) {
             relayPlaybackActive = true;
+            relayStartSeekPending = true;
             startRelayPositionTicker(r, relaySession);
             playVideoUrlNow(r.getLocalPlaylistUrl(), cachePendingName,
                     cachePendingRetry, cachePendingRefreshed, cachePendingSilent);
@@ -4293,7 +4341,14 @@ public class MainActivity extends AppCompatActivity {
             if (!silent) {
                 player.stop();
             }
-            player.setMediaItem(mediaItem);
+            if (relayPlaybackActive && relayStartSeekPending) {
+                // 首次起播：本地列表起点 = 录制起点，必须显式给 0，
+                // 否则直播语义会让播放器直接跳到列表尾部（变成看直播）
+                player.setMediaItem(mediaItem, 0L);
+            } else {
+                // 重试/重连：保留当前进度，不能打回录制起点
+                player.setMediaItem(mediaItem);
+            }
             player.prepare();
             // 后台禁止开播：切后台瞬间已入队的重试任务（播放错误重试/403恢复/预载超时
             // 回退等）可能在此刻执行，无条件开播会在后台复播音频。仅prepare预缓冲，
@@ -4420,6 +4475,13 @@ public class MainActivity extends AppCompatActivity {
                     case Player.STATE_READY:
                         progressBar.setVisibility(View.GONE);
                         isPlaying = true;
+                        // 本地中继：把起播位置钉在录制起点。直播语义下播放器默认会跳到列表尾部
+                        if (relayPlaybackActive && relayStartSeekPending) {
+                            relayStartSeekPending = false;
+                            try {
+                                if (player != null && player.getCurrentPosition() > 8000) player.seekTo(0);
+                            } catch (Exception ignore) { }
+                        }
                         ChannelStats.get(MainActivity.this).bufferEnd();
                         // 稳定播放30秒后清零短卡计数
                         if (stableClear[0] != null) handler.removeCallbacks(stableClear[0]);
@@ -6071,7 +6133,7 @@ public class MainActivity extends AppCompatActivity {
             }
             if (config.has("cachePreloadMin")) {
                 // 0=关闭预缓存；起播等待上限 60 分钟（再长就不如直接看回放了）
-                cachePreloadMin = Math.max(0, Math.min(60, config.optInt("cachePreloadMin", 10)));
+                cachePreloadMin = Math.max(0, Math.min(1440, config.optInt("cachePreloadMin", 60)));
                 prefs.edit().putInt(KEY_CACHE_PRELOAD_MIN, cachePreloadMin).apply();
             }
             if (config.has("relayRecordMin")) {
@@ -6206,14 +6268,15 @@ public class MainActivity extends AppCompatActivity {
                         return true;
                 }
             }
-            // 本地中继模式：左右键 = 回看/前进 30 秒（滚动录制范围内），长按连续快退/快进
+            // 本地中继模式：左右键 = 回看/前进（长按步进加大，方便在几小时录制里快速定位）
             if (relayPlaybackActive) {
+                long step = event.getRepeatCount() > 0 ? 120_000L : 30_000L;
                 if (event.getKeyCode() == KeyEvent.KEYCODE_DPAD_LEFT) {
-                    seekRelayBy(-30000);
+                    seekRelayBy(-step);
                     return true;
                 }
                 if (event.getKeyCode() == KeyEvent.KEYCODE_DPAD_RIGHT) {
-                    seekRelayBy(30000);
+                    seekRelayBy(step);
                     return true;
                 }
             }
@@ -6834,14 +6897,14 @@ public class MainActivity extends AppCompatActivity {
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>最高码率 Kbps (默认1000)</label><input type='number' id='maxBitrate' value='" + (maxVideoBitrateBps / 1000) + "'></div>" +
                 "</div>" +
                 "<div class='buffer-inputs' style='margin-top:6px'>" +
-                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>起播预缓存（分钟，0=不等直接播）</label><input type='number' id='cachePreloadMin' min='0' max='60' value='" + cachePreloadMin + "'></div>" +
-                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>滚动录制时长（分钟，0=跟预缓存一致，最大1440）</label><input type='number' id='relayRecordMin' min='0' max='1440' value='" + relayRecordMin + "' oninput='calcDisk()'></div>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>录多久后开始看（分钟，0=立即看当前直播）</label><input type='number' id='cachePreloadMin' min='0' max='1440' value='" + cachePreloadMin + "'></div>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>滚动录制总时长（分钟，需比上面大，最大1440）</label><input type='number' id='relayRecordMin' min='0' max='1440' value='" + relayRecordMin + "' oninput='calcDisk()'></div>" +
                 "</div>" +
                 "<div class='buffer-inputs' style='margin-top:6px'>" +
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>预计占用（按 60KB/s 估算）</label><input type='text' id='relayDiskEst' disabled></div>" +
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>磁盘剩余</label><input type='text' value='" + relayFreeMb() + " MB' disabled></div>" +
                 "</div>" +
-                "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上。弱网(200~400KB/s)建议码率1000左右，起播缓冲8000~10000；码率会自动限制多码率频道的最高画质，网络差时自动降档。<br><b>预缓存</b>：切台后先把直播录到本地磁盘，攒够设定分钟数再开画面（屏幕显示倒计时/缓存量/实测网速与源码率），期间按 OK 可提前开播。<br><b>滚动录制</b>：像行车记录仪一样一直录，录满自动覆盖最旧的（内存只放索引，不占播放器内存）。占用按 <b>源码率 × 时长</b> 计算：60KB/s 约 211MB/小时，171KB/s（CCTV1）约 601MB/小时。空间不足时会自动缩短录制时长并在起播遮罩上提示。</div>" +
+                "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上。弱网(200~400KB/s)建议码率1000左右，起播缓冲8000~10000；码率会自动限制多码率频道的最高画质，网络差时自动降档。<br><b>先录后看</b>：切台后先录，录够「录多久后开始看」才开始播放，<b>并且从录制起点开始播</b>——画面永远落后直播这么多（屏幕左下角常驻「录播 · 落后直播 X」标志，追到直播边缘会变成「直播」）。录制期间按 OK 可随时从录制起点提前开看。<br><b>滚动录制</b>：像行车记录仪一样一直录，录满自动覆盖最旧的。占用按 <b>源码率 × 时长</b> 计算：60KB/s 约 211MB/小时，171KB/s（CCTV1）约 601MB/小时。空间不足会自动缩短并在遮罩上提示。</div>" +
                 "</div>" +
                 "<div class='section'>" +
                 "<div class='section-title'>📊 顶部信息横幅</div>" +

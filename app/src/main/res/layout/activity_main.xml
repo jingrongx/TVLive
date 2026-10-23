@@ -410,7 +410,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="18dp"
-                android:text="正在预缓存"
+                android:text="正在录制 · 录够后从录制起点开始播"
                 android:textColor="#80DEEA"
                 android:textSize="20sp" />
 
@@ -466,6 +466,25 @@
         </LinearLayout>
 
     </FrameLayout>
+
+    <!-- 播放状态标志：区分「直播」与「录播（从录制起点看，落后直播 N 小时）」 -->
+    <TextView
+        android:id="@+id/tv_playback_badge"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|start"
+        android:layout_marginStart="18dp"
+        android:layout_marginBottom="18dp"
+        android:background="@drawable/bg_playback_badge"
+        android:paddingLeft="14dp"
+        android:paddingTop="6dp"
+        android:paddingRight="14dp"
+        android:paddingBottom="6dp"
+        android:text="● 录播 · 落后直播 00:00:00"
+        android:textColor="#FFD54F"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:visibility="gone" />
 
     <!-- 顶部信息横幅：竖屏两行（第1行农历+日期，第2行定位+天气），横屏单行（定位天气在行尾，第2行隐藏） -->
     <LinearLayout
