@@ -150,6 +150,35 @@
                 android:gravity="center_horizontal">
 
                 <ImageButton
+                    android:id="@+id/btn_record"
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:background="@drawable/tv_button_selector"
+                    android:src="@drawable/ic_record"
+                    android:contentDescription="开始录制"
+                    android:scaleType="centerInside"
+                    android:focusable="true"
+                    android:focusableInTouchMode="true"
+                    android:padding="18dp" />
+
+                <TextView
+                    android:id="@+id/tv_record_label"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="录制"
+                    android:textColor="#AAAAAA"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="72dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="12dp"
+                android:orientation="vertical"
+                android:gravity="center_horizontal">
+
+                <ImageButton
                     android:id="@+id/btn_channel_menu"
                     android:layout_width="72dp"
                     android:layout_height="72dp"

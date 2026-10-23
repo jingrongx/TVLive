@@ -167,7 +167,11 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_CACHE_PRELOAD_MIN = "cache_preload_min";
     private static final String KEY_RELAY_RECORD_MIN = "relay_record_min";
     private static final String KEY_RELAY_ENABLED = "relay_enabled";
+    private static final String KEY_RECORD_MANUAL = "record_manual";
     private boolean relayEnabled = true;
+    /** 手动控制录制：true=切台不自动录，由底部「录制」按钮开始；false=切台自动开始 */
+    private boolean recordManual = true;
+    private boolean recordBtnRecording = false;
     /** 起播前预缓存分钟数，0=关闭（直接播，退回原来的短缓冲行为） */
     private int cachePreloadMin = 60;
     /** 滚动录制时长（分钟），行车记录仪式：录满覆盖最旧。0=仅按预缓存时长 */
@@ -204,6 +208,8 @@ public class MainActivity extends AppCompatActivity {
     private ImageButton btnChannelMenu;
     private ImageButton btnSettings;
     private ImageButton btnExitApp;
+    private ImageButton btnRecord;
+    private TextView tvRecordLabel;
     private TextView tvSourceInfo;
     private TextView tvConfigInfo;
     private TextView tvNetworkInfo;
@@ -426,6 +432,8 @@ public class MainActivity extends AppCompatActivity {
         btnChannelMenu = findViewById(R.id.btn_channel_menu);
         btnSettings = findViewById(R.id.btn_settings);
         btnExitApp = findViewById(R.id.btn_exit_app);
+        btnRecord = findViewById(R.id.btn_record);
+        tvRecordLabel = findViewById(R.id.tv_record_label);
         tvSourceInfo = findViewById(R.id.tv_source_info);
         tvConfigInfo = findViewById(R.id.tv_config_info);
         tvNetworkInfo = findViewById(R.id.tv_network_info);
@@ -495,6 +503,7 @@ public class MainActivity extends AppCompatActivity {
         });
         btnSettings.setOnClickListener(v -> showSettingsDialog());
         btnExitApp.setOnClickListener(v -> confirmExit());
+        btnRecord.setOnClickListener(v -> toggleRecording());
 
         // 电视/触屏双模式适配：
         // 1) 按钮的focusableInTouchMode是为电视遥控器焦点导航设计的，
@@ -502,7 +511,7 @@ public class MainActivity extends AppCompatActivity {
         boolean tv = isTelevisionDevice();
         ImageButton[] allButtons = {btnPrevSource, btnNextSource,
             btnOrientation, btnLockOrientation,
-            btnChannelMenu, btnSettings, btnExitApp};
+            btnChannelMenu, btnSettings, btnExitApp, btnRecord};
         for (ImageButton b : allButtons) {
             if (b != null) b.setFocusableInTouchMode(tv);
         }
@@ -1319,6 +1328,7 @@ public class MainActivity extends AppCompatActivity {
         cachePreloadMin = prefs.getInt(KEY_CACHE_PRELOAD_MIN, 60);
         relayRecordMin = prefs.getInt(KEY_RELAY_RECORD_MIN, 360);
         relayEnabled = prefs.getBoolean(KEY_RELAY_ENABLED, true);
+        recordManual = prefs.getBoolean(KEY_RECORD_MANUAL, true);
         useWebMode = prefs.getBoolean(KEY_USE_WEB_MODE, true);
         isStreamListEnabled = prefs.getBoolean(KEY_PLAYER_MODE_ENABLED, true);
         bannerVisible = prefs.getBoolean(KEY_BANNER_VISIBLE, true);
@@ -1717,6 +1727,7 @@ public class MainActivity extends AppCompatActivity {
      */
     private void updatePlaybackBadge() {
         if (tvPlaybackBadge == null) return;
+        updateRecordButton();
         if (useWebMode || player == null || player.getPlaybackState() != Player.STATE_READY) {
             tvPlaybackBadge.setVisibility(View.GONE);
             return;
@@ -2775,6 +2786,7 @@ public class MainActivity extends AppCompatActivity {
             startBufferMs = config.optInt("startBuffer", 8000);
             cachePreloadMin = config.optInt("cachePreloadMin", cachePreloadMin);
             relayRecordMin = config.optInt("relayRecordMin", relayRecordMin);
+            recordManual = config.optBoolean("recordManual", recordManual);
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -2801,6 +2813,7 @@ public class MainActivity extends AppCompatActivity {
                 .putInt(KEY_START_BUFFER, startBufferMs)
                 .putInt(KEY_CACHE_PRELOAD_MIN, cachePreloadMin)
                 .putInt(KEY_RELAY_RECORD_MIN, relayRecordMin)
+                .putBoolean(KEY_RECORD_MANUAL, recordManual)
                 .apply();
         } catch (Exception e) {
             e.printStackTrace();
@@ -3989,7 +4002,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        boolean wantRelay = relayEnabled && !useWebMode
+        boolean wantRelay = relayEnabled && !useWebMode && !recordManual
                 && (cachePreloadMin > 0 || relayRecordMin > 0)
                 && isHlsUrl(url) && !isDrmStream(url);
 
@@ -4107,6 +4120,7 @@ public class MainActivity extends AppCompatActivity {
 
         relayHttpServer.register(relay);
         activeRelay = relay;
+        updateRecordButton();
         relay.start();
 
         cachePendingName = name;
@@ -4171,6 +4185,47 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             return 0;
         }
+    }
+
+    /** 底部控制条：开始 / 停止录制（手动模式） */
+    private void toggleRecording() {
+        if (useWebMode) {
+            Toast.makeText(this, "网页模式下不支持本地录制，请按 M 切到播放器模式", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (activeRelay != null) {
+            stopRecordingBackToLive();
+            return;
+        }
+        if (streamUrls.isEmpty()) {
+            Toast.makeText(this, "没有可录制的直播源", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        int idx = Math.min(Math.max(currentUrlIndex, 0), streamUrls.size() - 1);
+        Toast.makeText(this, "开始录制：" + streamNames.get(idx), Toast.LENGTH_SHORT).show();
+        startRelayPreload(streamUrls.get(idx), streamNames.get(idx), 0, false, false);
+        updateRecordButton();
+    }
+
+    /** 停止录制并回到直播（磁盘缓存一起释放） */
+    private void stopRecordingBackToLive() {
+        stopRelaySession();
+        updateRecordButton();
+        if (streamUrls.isEmpty()) return;
+        int idx = Math.min(Math.max(currentUrlIndex, 0), streamUrls.size() - 1);
+        Toast.makeText(this, "已停止录制，回到直播", Toast.LENGTH_SHORT).show();
+        playVideoUrlNow(streamUrls.get(idx), streamNames.get(idx), 0, false, false);
+    }
+
+    /** 录制按钮状态（只在变化时改，避免每秒重设图标） */
+    private void updateRecordButton() {
+        if (btnRecord == null) return;
+        boolean recording = activeRelay != null;
+        if (recording == recordBtnRecording) return;
+        recordBtnRecording = recording;
+        btnRecord.setImageResource(recording ? R.drawable.ic_record_stop : R.drawable.ic_record);
+        btnRecord.setContentDescription(recording ? "停止录制" : "开始录制");
+        if (tvRecordLabel != null) tvRecordLabel.setText(recording ? "停止录制" : "录制");
     }
 
     /** 中继模式下在已录制范围内回看/前进（行车记录仪式回放） */
@@ -4304,6 +4359,7 @@ public class MainActivity extends AppCompatActivity {
             if (relayHttpServer != null) relayHttpServer.unregister(r.getToken());
             try { r.stop(); } catch (Exception ignore) { }
         }
+        updateRecordButton();
     }
 
     /** OK/返回：不等了，用已经攒到的部分立即开播 */
@@ -6145,6 +6201,10 @@ public class MainActivity extends AppCompatActivity {
                 relayEnabled = config.optBoolean("relayEnabled", true);
                 prefs.edit().putBoolean(KEY_RELAY_ENABLED, relayEnabled).apply();
             }
+            if (config.has("recordManual")) {
+                recordManual = config.optBoolean("recordManual", true);
+                prefs.edit().putBoolean(KEY_RECORD_MANUAL, recordManual).apply();
+            }
             if (config.has("useWebMode")) {
                 useWebMode = config.optBoolean("useWebMode", true);
                 prefs.edit().putBoolean(KEY_USE_WEB_MODE, useWebMode).apply();
@@ -6905,6 +6965,7 @@ public class MainActivity extends AppCompatActivity {
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>磁盘剩余</label><input type='text' value='" + relayFreeMb() + " MB' disabled></div>" +
                 "</div>" +
                 "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上。弱网(200~400KB/s)建议码率1000左右，起播缓冲8000~10000；码率会自动限制多码率频道的最高画质，网络差时自动降档。<br><b>先录后看</b>：切台后先录，录够「录多久后开始看」才开始播放，<b>并且从录制起点开始播</b>——画面永远落后直播这么多（屏幕左下角常驻「录播 · 落后直播 X」标志，追到直播边缘会变成「直播」）。录制期间按 OK 可随时从录制起点提前开看。<br><b>滚动录制</b>：像行车记录仪一样一直录，录满自动覆盖最旧的。占用按 <b>源码率 × 时长</b> 计算：60KB/s 约 211MB/小时，171KB/s（CCTV1）约 601MB/小时。空间不足会自动缩短并在遮罩上提示。</div>" +
+                "<label><input type='checkbox' id='recordManual' " + (recordManual ? "checked" : "") + "> 手动控制录制（勾选后切台不自动录，由底部控制条「录制」按钮开始）</label>" +
                 "</div>" +
                 "<div class='section'>" +
                 "<div class='section-title'>📊 顶部信息横幅</div>" +
@@ -7034,7 +7095,7 @@ public class MainActivity extends AppCompatActivity {
                 "  }).catch(e=>{box.innerHTML='<span style=\"color:#C62828\">查询失败: '+e+'</span>';});" +
                 "}" +
                 "function calcDisk(){var m=parseInt(document.getElementById('relayRecordMin').value)||0;var mb=Math.round(m*3.52);document.getElementById('relayDiskEst').value=m?(mb+' MB ≈ '+(mb/1024).toFixed(2)+' GB（按60KB/s）'):'未启用';}" +
-                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,startBuffer:parseInt(document.getElementById('startBuffer').value)||8000,cachePreloadMin:parseInt(document.getElementById('cachePreloadMin').value)||0,relayRecordMin:parseInt(document.getElementById('relayRecordMin').value)||0,maxVideoBitrate:(parseInt(document.getElementById('maxBitrate').value)||1000)*1000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,backgroundPlay:document.getElementById('backgroundPlay').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};var msg=document.getElementById('saveMsg');msg.textContent='⏳ 正在保存…';msg.style.color='#1565c0';fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){var e='❌ 保存失败: '+(x.error||'未知错误')+' (请截图此行反馈)';msg.textContent=e;msg.style.color='#c62828';alert(e);}else{msg.textContent='✅ 保存成功 '+new Date().toLocaleTimeString();msg.style.color='#2e7d32';}}).catch(e=>{var t='❌ 保存失败: '+e;msg.textContent=t;msg.style.color='#c62828';alert(t);});}" +
+                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,startBuffer:parseInt(document.getElementById('startBuffer').value)||8000,cachePreloadMin:parseInt(document.getElementById('cachePreloadMin').value)||0,relayRecordMin:parseInt(document.getElementById('relayRecordMin').value)||0,recordManual:document.getElementById('recordManual').checked,maxVideoBitrate:(parseInt(document.getElementById('maxBitrate').value)||1000)*1000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,backgroundPlay:document.getElementById('backgroundPlay').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};var msg=document.getElementById('saveMsg');msg.textContent='⏳ 正在保存…';msg.style.color='#1565c0';fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){var e='❌ 保存失败: '+(x.error||'未知错误')+' (请截图此行反馈)';msg.textContent=e;msg.style.color='#c62828';alert(e);}else{msg.textContent='✅ 保存成功 '+new Date().toLocaleTimeString();msg.style.color='#2e7d32';}}).catch(e=>{var t='❌ 保存失败: '+e;msg.textContent=t;msg.style.color='#c62828';alert(t);});}" +
                 "renderSources();" +
                 "renderWebsites();" +
                 "calcDisk();" +
