@@ -195,6 +195,9 @@ public class MainActivity extends AppCompatActivity {
     private int etaTick = 0;
     private String etaText = null;
     private boolean relayFinalized = false;
+    /** 开录 15 秒后用实测码率/网速自动校准要录多久 */
+    private boolean calibDone = false;
+    private boolean calibAnnounced = false;
     private Runnable cacheTicker;
     private Runnable relayPosTicker;
     private View cacheOverlay;
@@ -3826,6 +3829,7 @@ public class MainActivity extends AppCompatActivity {
         // 正在本地录制：网页重嗅探不能把播放切走（切走即 stopRelaySession，录制清零）
         if (relayPlaybackActive && activeRelay != null) {
             LogUtil.i("NewsLive", "relay active, skip playVideoUrl: " + url);
+            muteWebVideoQuiet();
             return;
         }
         currentVideoUrl = url;
@@ -3844,6 +3848,7 @@ public class MainActivity extends AppCompatActivity {
             // 静默刷新的唯一价值是给中继续 key；这里把巡检重新挂上，
             // 否则 refreshVideoFromWeb 开头 cancelStreamRotation() 之后就再没人续了
             scheduleStreamRotation();
+            muteWebVideoQuiet();
             return;
         }
         // 幂等保护：嗅探与JS桥双路径可能同时拿到同一新地址，已在播/已在切则忽略
@@ -4169,6 +4174,8 @@ public class MainActivity extends AppCompatActivity {
         activeRelay = relay;
         updateRecordButton();
         relay.start();
+        // 网页模式：录像走 ExoPlayer 本地列表后，网页自己的声音就是干扰，静音
+        muteWebVideoQuiet();
 
         cachePendingName = name;
         cachePendingRetry = retryCount;
@@ -4180,6 +4187,8 @@ public class MainActivity extends AppCompatActivity {
         etaTick = 0;
         etaText = null;
         relayFinalized = false;
+        calibDone = cachePreloadTargetMs <= 0;
+        calibAnnounced = false;
         showCacheOverlay(name);
         startCacheTicker(relay, session);
     }
@@ -4192,6 +4201,40 @@ public class MainActivity extends AppCompatActivity {
                 if (session != relaySession || relay != activeRelay) return;
                 long cached = relay.getReadyMs();
                 long wall = Math.max(1, System.currentTimeMillis() - cachePreloadStartAt);
+
+                // 开录 15 秒后用实测码率/网速校准本次要录多久：
+                // 网速富余 → 按用户设定的落后时长（可全天流畅）；网速不够 → 按"约可连续看30分钟"缩时长并明确告知
+                if (!calibDone && wall >= 15000 && cached >= 8000) {
+                    calibDone = true;
+                    double src = relay.getSourceBitrateKBps();
+                    double net = relay.getDiskBytes() / Math.max(1, wall / 1000.0) / 1024.0;
+                    if (src > 5 && net > 0) {
+                        double ratio = net / src;
+                        int newMin = cachePreloadMin;
+                        String v;
+                        if (ratio >= 1.10) {
+                            v = "网速富余 " + Math.round((ratio - 1) * 100) + "%，可全天流畅";
+                        } else if (ratio >= 1.0) {
+                            v = "网速勉强够（富余<10%），波动时可能缓冲";
+                        } else {
+                            newMin = (int) Math.max(3, Math.min(45, Math.round(30 * (1 - ratio))));
+                            v = "网速只有码率的 " + Math.round(ratio * 100) + "%，本次自动录 " + newMin
+                                    + " 分钟（约可连续看 30 分钟），建议换低码率线路";
+                        }
+                        if (newMin != cachePreloadMin && cachePreloadMin > 0) {
+                            int p = Math.min(newMin, Math.max(1, cacheRetainMin - 5));
+                            cachePreloadTargetMs = p * 60_000L;
+                        }
+                        final String msg = "码率 " + Math.round(src) + "KB/s · 网速 " + Math.round(net) + "KB/s：" + v;
+                        LogUtil.i("NewsLive", "auto-calib: " + msg);
+                        handler.post(new Runnable() {
+                            @Override public void run() {
+                                Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
+                            }
+                        });
+                    }
+                }
+
                 updateCacheOverlay(relay, cached, wall);
 
                 boolean enough = cachePreloadTargetMs <= 0
@@ -4613,6 +4656,16 @@ public class MainActivity extends AppCompatActivity {
         Toast.makeText(this, "录制完成，从头播放录像（切台即回直播）", Toast.LENGTH_SHORT).show();
     }
 
+    /** 录制期间把网页视频静音：画面继续（供嗅探与 key 采集），声音不打扰观看 */
+    private void muteWebVideoQuiet() {
+        if (!useWebMode || webView == null) return;
+        try {
+            webView.evaluateJavascript(
+                    "(function(){try{var vs=document.querySelectorAll('video');"
+                            + "for(var i=0;i<vs.length;i++){vs[i].muted=true;}}catch(e){}})();", null);
+        } catch (Exception ignore) { }
+    }
+
     /** 中继模式下在已录制范围内回看/前进（行车记录仪式回放） */
     private void seekRelayBy(long deltaMs) {
         HlsRelay r = activeRelay;
@@ -4964,7 +5017,16 @@ public class MainActivity extends AppCompatActivity {
                         break;
                     case Player.STATE_ENDED:
                         progressBar.setVisibility(View.GONE);
-
+                        // 定格录像播完了：不要停在最后一帧，自动回直播
+                        if (relayFinalized && activeRelay != null) {
+                            handler.post(new Runnable() {
+                                @Override public void run() {
+                                    Toast.makeText(MainActivity.this, "录像播放完毕，回到直播",
+                                            Toast.LENGTH_SHORT).show();
+                                    stopRecordingBackToLive();
+                                }
+                            });
+                        }
                         break;
                     case Player.STATE_IDLE:
                         progressBar.setVisibility(View.GONE);
