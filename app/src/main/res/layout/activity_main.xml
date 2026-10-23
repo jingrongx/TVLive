@@ -380,6 +380,93 @@
 
     </FrameLayout>
 
+    <!-- 预缓存遮罩：先攒后播。电视观看距离远，倒计时用超大字号，缓存量/网速/码率一行可读 -->
+    <FrameLayout
+        android:id="@+id/cache_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#F2000000"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:paddingLeft="40dp"
+            android:paddingRight="40dp">
+
+            <TextView
+                android:id="@+id/tv_cache_channel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="CCTV-13 新闻"
+                android:textColor="#FFFFFF"
+                android:textSize="26sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="18dp"
+                android:text="正在预缓存"
+                android:textColor="#80DEEA"
+                android:textSize="20sp" />
+
+            <TextView
+                android:id="@+id/tv_cache_countdown"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:fontFamily="monospace"
+                android:text="03:00"
+                android:textColor="#4FC3F7"
+                android:textSize="80sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tv_cache_progress"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="已缓存 00:00 / 03:00 · 0%"
+                android:textColor="#FFFFFF"
+                android:textSize="28sp"
+                android:textStyle="bold" />
+
+            <ProgressBar
+                android:id="@+id/pb_cache"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="20dp"
+                android:layout_marginTop="20dp"
+                android:max="1000"
+                android:progress="0"
+                android:progressTint="#4FC3F7" />
+
+            <TextView
+                android:id="@+id/tv_cache_detail"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="网速 -- KB/s · 源码率 -- KB/s · 已存 -- MB"
+                android:textColor="#B0BEC5"
+                android:textSize="19sp" />
+
+            <TextView
+                android:id="@+id/tv_cache_hint"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="18dp"
+                android:text="按 OK 立即开始播放"
+                android:textColor="#FFB300"
+                android:textSize="21sp" />
+
+        </LinearLayout>
+
+    </FrameLayout>
+
     <!-- 顶部信息横幅：竖屏两行（第1行农历+日期，第2行定位+天气），横屏单行（定位天气在行尾，第2行隐藏） -->
     <LinearLayout
         android:id="@+id/info_overlay"

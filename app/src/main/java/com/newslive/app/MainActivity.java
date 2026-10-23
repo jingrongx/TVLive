@@ -64,6 +64,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
@@ -76,6 +77,7 @@ import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -157,7 +159,35 @@ public class MainActivity extends AppCompatActivity {
     private int maxVideoBitrateBps = 1_000_000;
     // 起播缓冲(ms)：原5000ms，弱网下起播后很快遇到波动就小卡，提到8000ms抗抖动
     private int startBufferMs = 8000;
-    
+
+    // ==================== 长时预缓存（先攒后播） ====================
+    // 弱网底线：80KB/s = 640kbps。扣掉 TS 封装与协议开销，源码率要 ≤ 约 60KB/s 才能持续；
+    // 否则"攒多少都会漏光"，预缓存只会把卡顿推迟而不是消除。
+    private static final int WEAK_NET_KBPS = 80;
+    private static final String KEY_CACHE_PRELOAD_MIN = "cache_preload_min";
+    private static final String KEY_RELAY_RECORD_MIN = "relay_record_min";
+    private static final String KEY_RELAY_ENABLED = "relay_enabled";
+    private boolean relayEnabled = true;
+    /** 起播前预缓存分钟数，0=关闭（直接播，退回原来的短缓冲行为） */
+    private int cachePreloadMin = 10;
+    /** 滚动录制时长（分钟），行车记录仪式：录满覆盖最旧。0=仅按预缓存时长 */
+    private int relayRecordMin = 360;
+    private volatile HlsRelay activeRelay;
+    private RelayServer relayHttpServer;
+    private int relaySession = 0;
+    /** 当前播放的是本地中继地址：卡顿不再重连换源，改为等本地池子 */
+    private volatile boolean relayPlaybackActive = false;
+    private volatile boolean cacheOverlayVisible = false;
+    private long cachePreloadTargetMs = 0;
+    private long cachePreloadStartAt = 0;
+    private int cacheRetainMin = 0;
+    private long cacheFreeMb = 0;
+    private Runnable cacheTicker;
+    private Runnable relayPosTicker;
+    private View cacheOverlay;
+    private TextView tvCacheChannel, tvCacheCountdown, tvCacheProgress, tvCacheDetail, tvCacheHint;
+    private ProgressBar pbCache;
+
     private ExoPlayer player;
     private PlayerView playerView;
     private FrameLayout playerContainer;
@@ -400,6 +430,13 @@ public class MainActivity extends AppCompatActivity {
         switchOverlay = findViewById(R.id.switch_overlay);
         tvSwitchChannel = findViewById(R.id.tv_switch_channel);
         tvSwitchHint = findViewById(R.id.tv_switch_hint);
+        cacheOverlay = findViewById(R.id.cache_overlay);
+        tvCacheChannel = findViewById(R.id.tv_cache_channel);
+        tvCacheCountdown = findViewById(R.id.tv_cache_countdown);
+        tvCacheProgress = findViewById(R.id.tv_cache_progress);
+        tvCacheDetail = findViewById(R.id.tv_cache_detail);
+        tvCacheHint = findViewById(R.id.tv_cache_hint);
+        pbCache = findViewById(R.id.pb_cache);
         portraitPlayOverlay = findViewById(R.id.portrait_play_overlay);
         btnFullscreenPlay = findViewById(R.id.btn_fullscreen_play);
         controlButtonsRow = findViewById(R.id.control_buttons_row);
@@ -1274,6 +1311,9 @@ public class MainActivity extends AppCompatActivity {
         bufferMaxMs = prefs.getInt(KEY_BUFFER_MAX, 60000);
         maxVideoBitrateBps = prefs.getInt(KEY_MAX_BITRATE, 1_000_000);
         startBufferMs = prefs.getInt(KEY_START_BUFFER, 8000);
+        cachePreloadMin = prefs.getInt(KEY_CACHE_PRELOAD_MIN, 10);
+        relayRecordMin = prefs.getInt(KEY_RELAY_RECORD_MIN, 360);
+        relayEnabled = prefs.getBoolean(KEY_RELAY_ENABLED, true);
         useWebMode = prefs.getBoolean(KEY_USE_WEB_MODE, true);
         isStreamListEnabled = prefs.getBoolean(KEY_PLAYER_MODE_ENABLED, true);
         bannerVisible = prefs.getBoolean(KEY_BANNER_VISIBLE, true);
@@ -2700,6 +2740,8 @@ public class MainActivity extends AppCompatActivity {
             bufferMaxMs = config.optInt("bufferMax", 60000);
             maxVideoBitrateBps = config.optInt("maxVideoBitrate", 1_000_000);
             startBufferMs = config.optInt("startBuffer", 8000);
+            cachePreloadMin = config.optInt("cachePreloadMin", cachePreloadMin);
+            relayRecordMin = config.optInt("relayRecordMin", relayRecordMin);
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -2724,6 +2766,8 @@ public class MainActivity extends AppCompatActivity {
                 .putInt(KEY_BUFFER_MAX, bufferMaxMs)
                 .putInt(KEY_MAX_BITRATE, maxVideoBitrateBps)
                 .putInt(KEY_START_BUFFER, startBufferMs)
+                .putInt(KEY_CACHE_PRELOAD_MIN, cachePreloadMin)
+                .putInt(KEY_RELAY_RECORD_MIN, relayRecordMin)
                 .apply();
         } catch (Exception e) {
             e.printStackTrace();
@@ -3896,7 +3940,321 @@ public class MainActivity extends AppCompatActivity {
         playVideoUrlWithRetry(url, name, retryCount, isRefreshed, false);
     }
 
+    /**
+     * 起播入口（带预缓存闸门）：
+     * 弱网下先让中继把直播录到本地，攒够 cachePreloadMin 分钟才开画面，
+     * 屏幕用大字显示倒计时/缓存量/实测网速与源码率；按 OK 可随时提前开始。
+     */
     private void playVideoUrlWithRetry(String url, String name, int retryCount, boolean isRefreshed, boolean silent) {
+        if (player == null || url == null || url.isEmpty()) return;
+
+        // 已经在读本地中继：重试只是重新 prepare，绝不能把中继关掉（否则缓存全丢）
+        HlsRelay cur = activeRelay;
+        if (cur != null && url.equals(cur.getLocalPlaylistUrl())) {
+            relayPlaybackActive = true;
+            playVideoUrlNow(url, name, retryCount, isRefreshed, silent);
+            return;
+        }
+
+        boolean wantRelay = relayEnabled && !useWebMode
+                && (cachePreloadMin > 0 || relayRecordMin > 0)
+                && isHlsUrl(url) && !isDrmStream(url);
+
+        if (!wantRelay) {
+            stopRelaySession();
+            playVideoUrlNow(url, name, retryCount, isRefreshed, silent);
+            return;
+        }
+
+        if (cur != null && cur.isForSource(url)) {
+            // 同一条源的重试：中继还在录，接着用，不重新攒
+            if (cur.hasFirstSegment()) {
+                relayPlaybackActive = true;
+                playVideoUrlNow(cur.getLocalPlaylistUrl(), name, retryCount, isRefreshed, silent);
+            } else {
+                cachePendingName = name;
+                cachePendingRetry = retryCount;
+                cachePendingRefreshed = isRefreshed;
+                cachePendingSilent = silent;
+                startCacheTicker(cur, relaySession);
+            }
+            return;
+        }
+
+        startRelayPreload(url, name, retryCount, isRefreshed, silent);
+    }
+
+    private boolean isHlsUrl(String u) {
+        return u != null && u.toLowerCase().contains("m3u8");
+    }
+
+    private String cachePendingName = "";
+    private int cachePendingRetry = 0;
+    private boolean cachePendingRefreshed = false, cachePendingSilent = false;
+
+    /** 起中继 + 显示预缓存遮罩，攒够再开播 */
+    private void startRelayPreload(final String url, final String name, final int retryCount,
+                                   final boolean isRefreshed, final boolean silent) {
+        stopRelaySession();
+        final int session = ++relaySession;
+        try {
+            if (relayHttpServer == null) relayHttpServer = new RelayServer();
+        } catch (Exception e) {
+            LogUtil.e("NewsLive", "中继服务启动失败，回退直连", e);
+            playVideoUrlNow(url, name, retryCount, isRefreshed, silent);
+            return;
+        }
+
+        final String token = Integer.toHexString((int) (System.currentTimeMillis() & 0x7fffffff))
+                + Integer.toHexString((int) (Math.random() * 0xffff));
+        // 优先外部私有目录（盒子内部 cache 往往只有一两百 MB，装不下分钟级缓存）
+        File relayBase = getExternalFilesDir("relay");
+        if (relayBase == null) relayBase = new File(getCacheDir(), "relay");
+        File dir = new File(relayBase, token);
+
+        // 滚动录制时长与"起播前等多久"解耦：录制像行车记录仪一样长跑，起播只看预缓存目标。
+        // relayRecordMin=0 时退化为"只保留预缓存时长"。
+        int recordMin = relayRecordMin > 0 ? relayRecordMin : Math.max(cachePreloadMin, 5);
+        recordMin = Math.max(5, Math.min(1440, recordMin));
+
+        // 磁盘预检：按 60KB/s（80KB/s 环境下可持续播放的码率上限）保守估算，
+        // 留 25% 余量给系统与碎片，装不下就自动缩短并明确告知，而不是录到一半写失败。
+        long freeBytes = relayBase.getUsableSpace();
+        long perMinBytes = 60L * 1024 * 60;              // 3.6MB/分钟 @60KB/s
+        long needBytes = perMinBytes * recordMin;
+        boolean diskCapped = false;
+        if (needBytes > freeBytes * 0.75) {
+            int fitMin = (int) Math.max(5, (freeBytes * 0.6) / perMinBytes);
+            if (fitMin < recordMin) {
+                recordMin = fitMin;
+                diskCapped = true;
+            }
+        }
+        final int effectiveRecordMin = recordMin;
+        final long freeMb = freeBytes / 1024 / 1024;
+        if (diskCapped) {
+            handler.post(new Runnable() {
+                @Override public void run() {
+                    Toast.makeText(MainActivity.this,
+                            "磁盘剩余 " + freeMb + "MB，最多只够滚动录制 " + effectiveRecordMin
+                                    + " 分钟，已自动缩短（可在配置页调小录制时长）",
+                            Toast.LENGTH_LONG).show();
+                }
+            });
+        }
+        long retainMs = recordMin * 60_000L;
+        this.cacheRetainMin = recordMin;
+        this.cacheFreeMb = freeMb;
+
+        HlsRelay relay = new HlsRelay(this, url, token, dir, relayHttpServer.baseUrlFor(token),
+                retainMs, new HlsRelay.UrlFixer() {
+                    @Override public String fix(String u) {
+                        try { return findFreshCandidateSameChannel(u); } catch (Exception e) { return null; }
+                    }
+                }, new HlsRelay.Listener() {
+                    @Override public void onReady(HlsRelay r) { /* 由 ticker 统一起播 */ }
+
+                    @Override public void onFailed(final HlsRelay r, final String reason) {
+                        handler.post(new Runnable() {
+                            @Override public void run() {
+                                if (session != relaySession) return;
+                                LogUtil.w("NewsLive", "中继起播失败: " + reason);
+                                Toast.makeText(MainActivity.this,
+                                        "该源无法本地缓存，改为直连播放", Toast.LENGTH_SHORT).show();
+                                stopRelaySession();
+                                playVideoUrlNow(url, name, retryCount, isRefreshed, silent);
+                            }
+                        });
+                    }
+                });
+
+        relayHttpServer.register(relay);
+        activeRelay = relay;
+        relay.start();
+
+        cachePendingName = name;
+        cachePendingRetry = retryCount;
+        cachePendingRefreshed = isRefreshed;
+        cachePendingSilent = silent;
+        cachePreloadTargetMs = Math.min(cachePreloadMin, recordMin) * 60_000L;
+        cachePreloadStartAt = System.currentTimeMillis();
+        showCacheOverlay(name);
+        startCacheTicker(relay, session);
+    }
+
+    /** 每 500ms 刷新遮罩；攒够/码率超标/超时 三种情况都会开播 */
+    private void startCacheTicker(final HlsRelay relay, final int session) {
+        stopCacheTicker();
+        cacheTicker = new Runnable() {
+            @Override public void run() {
+                if (session != relaySession || relay != activeRelay) return;
+                long cached = relay.getReadyMs();
+                long wall = Math.max(1, System.currentTimeMillis() - cachePreloadStartAt);
+                updateCacheOverlay(relay, cached, wall);
+
+                boolean enough = cachePreloadTargetMs <= 0
+                        ? relay.hasFirstSegment()
+                        : cached >= cachePreloadTargetMs;
+                // 录制比 = 已缓存内容时长 ÷ 实际耗时。1.0=刚好跟得上直播；<1=源码率超过网速，攒多少都会漏光
+                double recordRatio = wall >= 12000 ? (double) cached / wall : 1.0;
+                boolean starving = wall >= 15000 && recordRatio < 0.92;
+                boolean giveUp = wall > cachePreloadTargetMs * 2 + 90000;
+
+                if (enough || starving || giveUp) {
+                    stopCacheTicker();
+                    if (starving) {
+                        LogUtil.w("NewsLive", "预缓存无法维持 ratio=" + String.format(Locale.US, "%.2f", recordRatio)
+                                + " cached=" + cached + " 源码率=" + Math.round(relay.getSourceBitrateKBps()) + "KB/s");
+                        Toast.makeText(MainActivity.this,
+                                "该源码率约 " + Math.round(relay.getSourceBitrateKBps()) + "KB/s，超过网速 "
+                                        + WEAK_NET_KBPS + "KB/s，缓存无法持续；请换低码率线路",
+                                Toast.LENGTH_LONG).show();
+                    }
+                    hideCacheOverlay();
+                    relayPlaybackActive = true;
+                    // 起播后持续把播放位置喂给中继，滚动淘汰才不会删到正在播的部分
+                    startRelayPositionTicker(relay, session);
+                    playVideoUrlNow(relay.getLocalPlaylistUrl(), cachePendingName,
+                            cachePendingRetry, cachePendingRefreshed, cachePendingSilent);
+                    return;
+                }
+                handler.postDelayed(this, 500);
+            }
+        };
+        handler.post(cacheTicker);
+    }
+
+    /** 缓存目录剩余空间（MB），供配置页显示 */
+    private long relayFreeMb() {
+        try {
+            File base = getExternalFilesDir("relay");
+            if (base == null) base = new File(getCacheDir(), "relay");
+            return base.getUsableSpace() / 1024 / 1024;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /** 每 3 秒把播放位置同步给中继：中继据此只淘汰"早就播过"的分片 */
+    private void startRelayPositionTicker(final HlsRelay relay, final int session) {
+        stopRelayPositionTicker();
+        relayPosTicker = new Runnable() {
+            @Override public void run() {
+                if (session != relaySession || relay != activeRelay || !relayPlaybackActive) return;
+                try {
+                    if (player != null) relay.setPlayerPositionMs(player.getCurrentPosition());
+                } catch (Exception ignore) { }
+                handler.postDelayed(this, 3000);
+            }
+        };
+        handler.post(relayPosTicker);
+    }
+
+    private void stopRelayPositionTicker() {
+        if (relayPosTicker != null) {
+            handler.removeCallbacks(relayPosTicker);
+            relayPosTicker = null;
+        }
+    }
+
+    private void updateCacheOverlay(HlsRelay relay, long cachedMs, long wallMs) {
+        long target = Math.max(1000, cachePreloadTargetMs);
+        long left = Math.max(0, target - cachedMs);
+        double recordRatio = wallMs >= 8000 ? (double) cachedMs / wallMs : 1.0;
+        long eta = recordRatio > 0.2 ? (long) (left / recordRatio) : left;
+        int pct = (int) Math.min(100, cachedMs * 100 / target);
+        int speedKB = wallMs > 0 ? (int) (relay.getDiskBytes() / Math.max(1, wallMs / 1000) / 1024) : 0;
+
+        if (tvCacheChannel != null && cachePendingName != null) tvCacheChannel.setText(cachePendingName);
+        if (tvCacheCountdown != null) tvCacheCountdown.setText(fmtMmSs(eta));
+        if (tvCacheProgress != null) {
+            tvCacheProgress.setText("已缓存 " + fmtMmSs(cachedMs) + " / " + fmtMmSs(target) + " · " + pct + "%");
+        }
+        if (pbCache != null) pbCache.setProgress(pct * 10);
+        if (tvCacheDetail != null) {
+            long storedMb = relay.getDiskBytes() / 1024 / 1024;
+            double bitrate = relay.getSourceBitrateKBps();
+            long needMb = (long) (bitrate * 60 * cacheRetainMin / 1024);
+            String diskNote = (cacheFreeMb > 0 && needMb > cacheFreeMb * 0.9)
+                    ? "（空间仅 " + cacheFreeMb + "MB，够录约 "
+                      + (bitrate > 1 ? (long) (cacheFreeMb * 0.9 * 1024 / (bitrate * 60)) : 0) + "分钟）"
+                    : "";
+            tvCacheDetail.setText("网速 " + speedKB + "KB/s · 源码率 " + Math.round(bitrate)
+                    + "KB/s · 已存 " + storedMb + "MB · 滚动录制 " + cacheRetainMin + "分钟"
+                    + diskNote);
+        }
+        if (tvCacheHint != null) {
+            boolean starving = wallMs > 12000 && recordRatio < 0.92;
+            tvCacheHint.setText(starving
+                    ? "⚠ 源码率超过网速（" + WEAK_NET_KBPS + "KB/s 底线），缓存无法维持，建议换低码率线路"
+                    : "按 OK 立即开始（当前可播 " + fmtMmSs(cachedMs) + "）");
+        }
+    }
+
+    private static String fmtMmSs(long ms) {
+        if (ms < 0) ms = 0;
+        long total = ms / 1000;
+        return String.format(Locale.US, "%02d:%02d", total / 60, total % 60);
+    }
+
+    private void showCacheOverlay(String name) {
+        if (cacheOverlay == null) return;
+        cacheOverlayVisible = true;
+        hideSwitchOverlay();
+        cacheOverlay.setVisibility(View.VISIBLE);
+        if (progressBar != null) progressBar.setVisibility(View.GONE);
+        if (tvCacheChannel != null) tvCacheChannel.setText(name == null ? "" : name);
+        if (tvCacheCountdown != null) tvCacheCountdown.setText(fmtMmSs(cachePreloadTargetMs));
+        if (tvCacheProgress != null) {
+            tvCacheProgress.setText("已缓存 00:00 / " + fmtMmSs(cachePreloadTargetMs) + " · 0%");
+        }
+        if (pbCache != null) pbCache.setProgress(0);
+        if (tvCacheDetail != null) {
+            tvCacheDetail.setText("网速 -- KB/s · 源码率 -- KB/s · 已存 0MB · 正在连接源");
+        }
+        if (tvCacheHint != null) tvCacheHint.setText("按 OK 立即开始播放");
+    }
+
+    private void hideCacheOverlay() {
+        cacheOverlayVisible = false;
+        if (cacheOverlay != null) cacheOverlay.setVisibility(View.GONE);
+    }
+
+    private void stopCacheTicker() {
+        if (cacheTicker != null) {
+            handler.removeCallbacks(cacheTicker);
+            cacheTicker = null;
+        }
+    }
+
+    /** 换台/退出/切网页模式：中继与磁盘池一起销毁 */
+    private void stopRelaySession() {
+        stopCacheTicker();
+        stopRelayPositionTicker();
+        hideCacheOverlay();
+        HlsRelay r = activeRelay;
+        activeRelay = null;
+        relayPlaybackActive = false;
+        if (r != null) {
+            if (relayHttpServer != null) relayHttpServer.unregister(r.getToken());
+            try { r.stop(); } catch (Exception ignore) { }
+        }
+    }
+
+    /** OK/返回：不等了，用已经攒到的部分立即开播 */
+    private void skipCachePreload() {
+        HlsRelay r = activeRelay;
+        stopCacheTicker();
+        hideCacheOverlay();
+        if (r != null && r.hasFirstSegment()) {
+            relayPlaybackActive = true;
+            startRelayPositionTicker(r, relaySession);
+            playVideoUrlNow(r.getLocalPlaylistUrl(), cachePendingName,
+                    cachePendingRetry, cachePendingRefreshed, cachePendingSilent);
+        }
+    }
+
+    private void playVideoUrlNow(String url, String name, int retryCount, boolean isRefreshed, boolean silent) {
         if (player == null || url == null || url.isEmpty()) return;
 
         // 每次换源/重试都先取消上一轮的轮换调度与无缝预载，避免旧调度器/预载器在新播放期间误切换
@@ -3979,7 +4337,22 @@ public class MainActivity extends AppCompatActivity {
                                         LogUtil.w("NewsLive", "Buffering " + bufferingTime[0] + "s, pos=" + player.getCurrentPosition() + " buffered=" + player.getBufferedPosition());
                                     }
                                     if (bufferingTime[0] > 8) {
-                                        if (!isRefreshed && useWebMode && seekRetryCount[0] >= 2) {
+                                        if (relayPlaybackActive && bufferingTime[0] <= 45) {
+                                            // 读本地池子时"缓冲"=池子见底，中继还在按退避重试源。
+                                            // 此刻重连/重prepare会把画面打回池子起点，必须等它自己续上
+                                            handler.postDelayed(this, 1000);
+                                        } else if (relayPlaybackActive) {
+                                            // 45 秒仍无新分片：这条线基本废了，换同频道备用线路（重新攒缓存）
+                                            bufferingTime[0] = 0;
+                                            seekRetryCount[0] = 0;
+                                            if (!useWebMode && streamUrls.size() > 1) {
+                                                int[] r = currentChannelRange();
+                                                currentUrlIndex = currentUrlIndex < r[1] ? currentUrlIndex + 1 : r[0];
+                                                loadStreamFromConfig(currentUrlIndex);
+                                            } else {
+                                                player.prepare();
+                                            }
+                                        } else if (!isRefreshed && useWebMode && seekRetryCount[0] >= 2) {
                                             if (sniffRefreshCount < MAX_SNIFF_REFRESH) {
                                                 sniffRefreshCount++;
                                                 if (!finalSilent) {
@@ -4956,11 +5329,14 @@ public class MainActivity extends AppCompatActivity {
         int minBuffer = Math.max(bufferMinMs, 10000);
         int maxBuffer = Math.max(bufferMaxMs, 60000);
         int startBuffer = Math.max(startBufferMs, 5000);
+        // 关键修正：第4个参数是"卡过一次后要缓冲到多少才继续播"，原先直接复用 minBuffer，
+        // 于是 bufferMin 调多大，卡一次就要干等多久（调成 10 分钟等于卡一次看 10 分钟黑屏）。
+        // 恢复阈值固定为起播缓冲量级，与缓存深度解耦。
+        int rebufferResume = Math.min(Math.max(startBuffer, 8000), 30000);
 
         DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
-            // 起播缓冲默认8000ms（旧值5000ms在弱网下起播后遇波动必小卡一次），
-            // 重缓冲后再缓冲到minBuffer才恢复
-            .setBufferDurationsMs(minBuffer, maxBuffer, startBuffer, minBuffer)
+            // 起播缓冲默认8000ms（旧值5000ms在弱网下起播后遇波动必小卡一次）
+            .setBufferDurationsMs(minBuffer, maxBuffer, startBuffer, rebufferResume)
             .setPrioritizeTimeOverSizeThresholds(true)
             .setBackBuffer(maxBuffer, true)
             .setTargetBufferBytes(-1)
@@ -5063,6 +5439,8 @@ public class MainActivity extends AppCompatActivity {
             webView.setVisibility(View.GONE);
             playerContainer.setVisibility(View.VISIBLE);
             hideSwitchOverlay();
+            // 切到播放器模式：网页嗅探流的中继没有意义，先释放
+            stopRelaySession();
             if (player == null) {
                 initPlayer();
             }
@@ -5529,64 +5907,9 @@ public class MainActivity extends AppCompatActivity {
             currentPlayerListener = null;
         }
 
-        MediaItem mediaItem = MediaItem.fromUri(Uri.parse(streamUrls.get(index)));
-        player.stop();
-        player.setMediaItem(mediaItem);
-        currentPlayerListener = new Player.Listener() {
-            @Override
-            public void onVideoSizeChanged(VideoSize videoSize) {
-                currentVideoWidth = videoSize.width;
-                currentVideoHeight = videoSize.height;
-                updateVideoLayout(videoSize.width, videoSize.height);
-            }
-            
-            @Override
-            public void onPlaybackStateChanged(int playbackState) {
-                switch (playbackState) {
-                    case Player.STATE_BUFFERING:
-                        progressBar.setVisibility(View.VISIBLE);
-                        break;
-                    case Player.STATE_READY:
-                        progressBar.setVisibility(View.GONE);
-                        isPlaying = true;
-                        errorRetryCount = 0;
-                        giveUpRecoveryCount = 0;
-                        cancelGiveUpRecovery();
-                        hideSwitchOverlay();
-                        clearSurfaceIfAudioOnly();
-                        startHideControlTimer();
-                        break;
-                    case Player.STATE_ENDED:
-                    case Player.STATE_IDLE:
-                        progressBar.setVisibility(View.GONE);
-                        break;
-                }
-            }
-
-            @Override
-            public void onPlayerError(PlaybackException error) {
-                progressBar.setVisibility(View.GONE);
-                errorRetryCount++;
-                if (errorRetryCount <= MAX_RETRY_COUNT) {
-                    Toast.makeText(MainActivity.this, 
-                        "播放错误，重试中(" + errorRetryCount + "/" + MAX_RETRY_COUNT + ")...", 
-                        Toast.LENGTH_SHORT).show();
-                    handler.postDelayed(() -> {
-                        if (player != null) {
-                            player.prepare();
-                        }
-                    }, 1000);
-                } else {
-                    Toast.makeText(MainActivity.this,
-                        "播放失败，请切换其他源或检查网络",
-                        Toast.LENGTH_LONG).show();
-                    scheduleGiveUpRecovery();
-                }
-            }
-        };
-        player.addListener(currentPlayerListener);
-        player.prepare();
-        player.setPlayWhenReady(true);
+        // 统一走带预缓存的起播入口：只在 prepare 阶段改地址，播放器监听器沿用
+        // attachMainListener 那套（含缓冲看门狗、403 恢复、解码降级），比原来的简化监听器更完整
+        playVideoUrlWithRetry(streamUrls.get(index), streamNames.get(index), 0, false, false);
     }
 
     private void showControlPanel() {
@@ -5728,6 +6051,20 @@ public class MainActivity extends AppCompatActivity {
                 startBufferMs = Math.max(config.optInt("startBuffer", 8000), 5000);
                 prefs.edit().putInt(KEY_START_BUFFER, startBufferMs).apply();
             }
+            if (config.has("cachePreloadMin")) {
+                // 0=关闭预缓存；起播等待上限 60 分钟（再长就不如直接看回放了）
+                cachePreloadMin = Math.max(0, Math.min(60, config.optInt("cachePreloadMin", 10)));
+                prefs.edit().putInt(KEY_CACHE_PRELOAD_MIN, cachePreloadMin).apply();
+            }
+            if (config.has("relayRecordMin")) {
+                // 滚动录制时长：上限 24 小时，0=只按预缓存时长保留
+                relayRecordMin = Math.max(0, Math.min(1440, config.optInt("relayRecordMin", 360)));
+                prefs.edit().putInt(KEY_RELAY_RECORD_MIN, relayRecordMin).apply();
+            }
+            if (config.has("relayEnabled")) {
+                relayEnabled = config.optBoolean("relayEnabled", true);
+                prefs.edit().putBoolean(KEY_RELAY_ENABLED, relayEnabled).apply();
+            }
             if (config.has("useWebMode")) {
                 useWebMode = config.optBoolean("useWebMode", true);
                 prefs.edit().putBoolean(KEY_USE_WEB_MODE, useWebMode).apply();
@@ -5835,6 +6172,22 @@ public class MainActivity extends AppCompatActivity {
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
         if (event.getAction() == KeyEvent.ACTION_DOWN) {
+            // 预缓存遮罩期间：OK=立即开播，BACK=提前开播而不是退出（避免误触直接杀应用）
+            if (cacheOverlayVisible) {
+                switch (event.getKeyCode()) {
+                    case KeyEvent.KEYCODE_DPAD_CENTER:
+                    case KeyEvent.KEYCODE_ENTER:
+                    case KeyEvent.KEYCODE_BACK:
+                        skipCachePreload();
+                        return true;
+                    case KeyEvent.KEYCODE_DPAD_UP:
+                        switchToPrevSource();
+                        return true;
+                    case KeyEvent.KEYCODE_DPAD_DOWN:
+                        switchToNextSource();
+                        return true;
+                }
+            }
             switch (event.getKeyCode()) {
                 case KeyEvent.KEYCODE_DPAD_CENTER:
                 case KeyEvent.KEYCODE_ENTER:
@@ -6106,6 +6459,9 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        try { stopRelaySession(); } catch (Exception ignore) { }
+        try { if (relayHttpServer != null) relayHttpServer.shutdown(); } catch (Exception ignore) { }
+        relayHttpServer = null;
         try { ChannelStats.get(this).flush(); } catch (Exception ignore) { }
         cancelWebViewTimeoutTimer();
 
@@ -6448,7 +6804,15 @@ public class MainActivity extends AppCompatActivity {
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>起播缓冲 ms (默认8000)</label><input type='number' id='startBuffer' value='" + startBufferMs + "'></div>" +
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>最高码率 Kbps (默认1000)</label><input type='number' id='maxBitrate' value='" + (maxVideoBitrateBps / 1000) + "'></div>" +
                 "</div>" +
-                "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上。弱网(200~400KB/s)建议码率1000左右，起播缓冲8000~10000；码率会自动限制多码率频道的最高画质，网络差时自动降档。</div>" +
+                "<div class='buffer-inputs' style='margin-top:6px'>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>起播预缓存（分钟，0=不等直接播）</label><input type='number' id='cachePreloadMin' min='0' max='60' value='" + cachePreloadMin + "'></div>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>滚动录制时长（分钟，0=跟预缓存一致，最大1440）</label><input type='number' id='relayRecordMin' min='0' max='1440' value='" + relayRecordMin + "' oninput='calcDisk()'></div>" +
+                "</div>" +
+                "<div class='buffer-inputs' style='margin-top:6px'>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>预计占用（按 60KB/s 估算）</label><input type='text' id='relayDiskEst' disabled></div>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>磁盘剩余</label><input type='text' value='" + relayFreeMb() + " MB' disabled></div>" +
+                "</div>" +
+                "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上。弱网(200~400KB/s)建议码率1000左右，起播缓冲8000~10000；码率会自动限制多码率频道的最高画质，网络差时自动降档。<br><b>预缓存</b>：切台后先把直播录到本地磁盘，攒够设定分钟数再开画面（屏幕显示倒计时/缓存量/实测网速与源码率），期间按 OK 可提前开播。<br><b>滚动录制</b>：像行车记录仪一样一直录，录满自动覆盖最旧的（内存只放索引，不占播放器内存）。占用按 <b>源码率 × 时长</b> 计算：60KB/s 约 211MB/小时，171KB/s（CCTV1）约 601MB/小时。空间不足时会自动缩短录制时长并在起播遮罩上提示。</div>" +
                 "</div>" +
                 "<div class='section'>" +
                 "<div class='section-title'>📊 顶部信息横幅</div>" +
@@ -6577,9 +6941,11 @@ public class MainActivity extends AppCompatActivity {
                 "    });" +
                 "  }).catch(e=>{box.innerHTML='<span style=\"color:#C62828\">查询失败: '+e+'</span>';});" +
                 "}" +
-                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,startBuffer:parseInt(document.getElementById('startBuffer').value)||8000,maxVideoBitrate:(parseInt(document.getElementById('maxBitrate').value)||1000)*1000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,backgroundPlay:document.getElementById('backgroundPlay').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};var msg=document.getElementById('saveMsg');msg.textContent='⏳ 正在保存…';msg.style.color='#1565c0';fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){var e='❌ 保存失败: '+(x.error||'未知错误')+' (请截图此行反馈)';msg.textContent=e;msg.style.color='#c62828';alert(e);}else{msg.textContent='✅ 保存成功 '+new Date().toLocaleTimeString();msg.style.color='#2e7d32';}}).catch(e=>{var t='❌ 保存失败: '+e;msg.textContent=t;msg.style.color='#c62828';alert(t);});}" +
+                "function calcDisk(){var m=parseInt(document.getElementById('relayRecordMin').value)||0;var mb=Math.round(m*3.52);document.getElementById('relayDiskEst').value=m?(mb+' MB ≈ '+(mb/1024).toFixed(2)+' GB（按60KB/s）'):'未启用';}" +
+                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,startBuffer:parseInt(document.getElementById('startBuffer').value)||8000,cachePreloadMin:parseInt(document.getElementById('cachePreloadMin').value)||0,relayRecordMin:parseInt(document.getElementById('relayRecordMin').value)||0,maxVideoBitrate:(parseInt(document.getElementById('maxBitrate').value)||1000)*1000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,backgroundPlay:document.getElementById('backgroundPlay').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};var msg=document.getElementById('saveMsg');msg.textContent='⏳ 正在保存…';msg.style.color='#1565c0';fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){var e='❌ 保存失败: '+(x.error||'未知错误')+' (请截图此行反馈)';msg.textContent=e;msg.style.color='#c62828';alert(e);}else{msg.textContent='✅ 保存成功 '+new Date().toLocaleTimeString();msg.style.color='#2e7d32';}}).catch(e=>{var t='❌ 保存失败: '+e;msg.textContent=t;msg.style.color='#c62828';alert(t);});}" +
                 "renderSources();" +
                 "renderWebsites();" +
+                "calcDisk();" +
                 // 页面加载时自动恢复:若有优选任务在跑,继续显示进度(锁屏/刷新后不丢状态)
                 "(function(){fetch('/scan_status').then(function(r){return r.json();}).then(function(d){" +
                 "  if(d.running){document.getElementById('scanBtn').disabled=true;document.getElementById('scanStopBtn').disabled=false;pollScan();}" +

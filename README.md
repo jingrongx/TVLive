@@ -107,6 +107,8 @@ pyinstaller --onefile --noconsole --clean --name IPTVSourceTool --icon app.ico m
   "playerModeEnabled": true,
   "bufferMin": 10000,
   "bufferMax": 60000,
+  "cachePreloadMin": 10,
+  "relayRecordMin": 360,
   "bannerVisible": true,
   "bannerFontSize": 13,
   "bannerHeight": 28,
@@ -123,6 +125,8 @@ pyinstaller --onefile --noconsole --clean --name IPTVSourceTool --icon app.ico m
 | `useWebMode` | 启动默认模式（true=网页模式） |
 | `playerModeEnabled` | 是否启用直播源列表 |
 | `bufferMin` / `bufferMax` | 播放缓冲区间（毫秒），建议 10000/60000 |
+| `cachePreloadMin` | **起播预缓存分钟数**（0=不等直接播，最大 60）。切台后先把直播录到本地磁盘，攒够才开画面；遮罩大字显示倒计时/缓存量/实测网速与源码率，按 OK 可提前开播 |
+| `relayRecordMin` | **滚动录制时长（分钟）**，行车记录仪式：一直录，录满覆盖最旧（最大 1440=24h，0=跟预缓存一致）。占用 ≈ 源码率 × 时长：60KB/s 约 211MB/小时，171KB/s（CCTV1）约 601MB/小时；空间不足会自动缩短并提示 |
 | `bannerVisible` | 顶部信息横幅显隐 |
 | `bannerFontSize` / `bannerHeight` | 横幅字号基准（9-18）与单行高度（20-60dp） |
 | `manualLocation` | 手动地区（**留空=自动IP定位**；需能查到真实天气才生效，查不到会提示且不保存） |
