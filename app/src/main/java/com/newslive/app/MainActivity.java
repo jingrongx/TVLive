@@ -202,6 +202,7 @@ public class MainActivity extends AppCompatActivity {
     // ==================== 录屏（DRM 流的唯一可录路径） ====================
     private static final int REQ_SCREEN_CAPTURE = 1001;
     private ScreenRecorder screenRecorder;
+    private StreamAudioFeeder audioFeeder;
     private android.media.projection.MediaProjectionManager projectionManager;
     private long screenRecStartAt = 0;
 
@@ -4305,6 +4306,7 @@ public class MainActivity extends AppCompatActivity {
                                                 final boolean hadAudio) {
                     runOnUiThread(new Runnable() {
                         @Override public void run() {
+                            stopAudioFeeder();
                             screenRecorder = null;
                             updateRecordButton();
                             if (file == null || !file.exists() || size < 1024) {
@@ -4323,6 +4325,7 @@ public class MainActivity extends AppCompatActivity {
                 @Override public void onError(ScreenRecorder r, final String msg) {
                     runOnUiThread(new Runnable() {
                         @Override public void run() {
+                            stopAudioFeeder();
                             screenRecorder = null;
                             updateRecordButton();
                             Toast.makeText(MainActivity.this, "录屏失败：" + msg, Toast.LENGTH_LONG).show();
@@ -4331,6 +4334,25 @@ public class MainActivity extends AppCompatActivity {
                 }
             });
             screenRecorder.start();
+            // Android 9 及以下没有应用内录音接口：从原流把明文音轨抽出来，直接喂进同一个 MP4
+            if (Build.VERSION.SDK_INT < 29) {
+                final String src = recordingSourceUrl();
+                if (src != null && isHlsUrl(src)) {
+                    File adir = new File(getCacheDir(), "audioseg");
+                    if (!adir.exists()) adir.mkdirs();
+                    final long offsetUs = System.nanoTime() / 1000L - screenRecorder.getStartMicros();
+                    audioFeeder = new StreamAudioFeeder(src, adir, new StreamAudioFeeder.Sink() {
+                        @Override public void onAudioFormat(android.media.MediaFormat f) {
+                            if (screenRecorder != null) screenRecorder.setExternalAudioFormat(f);
+                        }
+
+                        @Override public void onAudioSample(java.nio.ByteBuffer b, long ptsUs) {
+                            if (screenRecorder != null) screenRecorder.writeExternalAudio(b, ptsUs + offsetUs);
+                        }
+                    });
+                    audioFeeder.start();
+                }
+            }
         } catch (Exception e) {
             LogUtil.e("NewsLive", "screen recorder start failed", e);
             screenRecorder = null;
@@ -4344,8 +4366,19 @@ public class MainActivity extends AppCompatActivity {
         if (r == null) return;
         Toast.makeText(this, "正在结束录制…", Toast.LENGTH_SHORT).show();
         new Thread(new Runnable() {
-            @Override public void run() { r.stop(); }
+            @Override public void run() {
+                try { if (audioFeeder != null) audioFeeder.stop(); } catch (Exception ignore) { }
+                r.stop();
+            }
         }, "rec-stop").start();
+    }
+
+    private void stopAudioFeeder() {
+        StreamAudioFeeder f = audioFeeder;
+        audioFeeder = null;
+        if (f != null) {
+            try { f.stop(); } catch (Exception ignore) { }
+        }
     }
 
     /** 用 127.0.0.1 服务把录好的 MP4 交给 ExoPlayer（数据源只认 HTTP） */
@@ -6906,6 +6939,7 @@ public class MainActivity extends AppCompatActivity {
             screenRecorder = null;
             if (sr != null) sr.stop();
         } catch (Exception ignore) { }
+        try { stopAudioFeeder(); } catch (Exception ignore) { }
         try { if (relayHttpServer != null) relayHttpServer.shutdown(); } catch (Exception ignore) { }
         relayHttpServer = null;
         try { ChannelStats.get(this).flush(); } catch (Exception ignore) { }

@@ -38,7 +38,7 @@ public class ScreenRecorder {
     private static final String MIME_AUDIO = "audio/mp4a-latm";
     private static final int SAMPLE_RATE = 44100;
     private static final int CHANNELS = 2;
-    private static final long AUDIO_WAIT_MS = 3000;
+    private static final long AUDIO_WAIT_MS = 6000;
 
     private final MediaProjection projection;
     private final File outFile;
@@ -80,11 +80,29 @@ public class ScreenRecorder {
         this.width = width & ~1;      // H.264 要求偶数
         this.height = height & ~1;
         this.dpi = dpi;
-        this.wantAudio = wantAudio && Build.VERSION.SDK_INT >= 29;
+        this.wantAudio = wantAudio;   // <29 时音频由 StreamAudioFeeder 从原流抽出来喂进来
         this.listener = l;
     }
 
     public File getFile() { return outFile; }
+
+    public long getStartMicros() { return t0Us; }
+
+    /** 低版本：外部（从原流抽取的明文音轨）喂进来的音频格式与样本 */
+    private volatile MediaFormat externalAudioFormat;
+
+    public void setExternalAudioFormat(MediaFormat f) {
+        if (f == null) return;
+        externalAudioFormat = f;
+        tryStartMuxer();
+    }
+
+    public void writeExternalAudio(ByteBuffer data, long ptsUs) {
+        if (data == null || !running) return;
+        try {
+            writeSample(1, data, Math.max(0, ptsUs), 0);
+        } catch (Exception ignore) { }
+    }
 
     public boolean isRecording() { return running; }
 
@@ -108,7 +126,7 @@ public class ScreenRecorder {
             Surface input = vEnc.createInputSurface();
             vEnc.start();
 
-            if (wantAudio) {
+            if (wantAudio && Build.VERSION.SDK_INT >= 29) {
                 try {
                     startAudio();
                 } catch (Exception e) {
@@ -288,13 +306,14 @@ public class ScreenRecorder {
         synchronized (muxLock) {
             if (muxerStarted || muxer == null) return;
             if (videoFormat == null) return;
-            if (wantAudio && audioFormat == null) {
-                // 3 秒还没等到音频格式（可能本机 / 该页面没有可采音频）→ 先按纯视频起封装
+            MediaFormat af = audioFormat != null ? audioFormat : externalAudioFormat;
+            if (wantAudio && af == null) {
+                // 6 秒还没等到音频格式 → 先按纯视频起封装，音频后续也接不进来了
                 if (System.currentTimeMillis() - startWallMs < AUDIO_WAIT_MS) return;
             }
             try {
                 vTrack = muxer.addTrack(videoFormat);
-                if (audioFormat != null) aTrack = muxer.addTrack(audioFormat);
+                if (af != null) aTrack = muxer.addTrack(af);
                 muxer.start();
                 muxerStarted = true;
                 for (Pending p : pending) writeLocked(p);
