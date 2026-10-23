@@ -436,10 +436,11 @@
                 android:textStyle="bold" />
 
             <TextView
+                android:id="@+id/tv_cache_title"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="18dp"
-                android:text="正在录制 · 录够后从录制起点开始播"
+                android:text="检测到当前频道播放不流畅，自动缓存"
                 android:textColor="#80DEEA"
                 android:textSize="20sp" />
 
@@ -459,7 +460,7 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="2dp"
-                android:text="已缓存 00:00 / 03:00 · 0%"
+                android:text="进度 0% · 剩余 03:00"
                 android:textColor="#FFFFFF"
                 android:textSize="28sp"
                 android:textStyle="bold" />
@@ -522,12 +523,12 @@
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|end"
         android:layout_marginEnd="18dp"
-        android:layout_marginBottom="18dp"
+        android:layout_marginBottom="72dp"
         android:background="@drawable/bg_playback_badge"
-        android:paddingLeft="18dp"
-        android:paddingTop="8dp"
-        android:paddingRight="18dp"
-        android:paddingBottom="8dp"
+        android:paddingLeft="12dp"
+        android:paddingTop="4dp"
+        android:paddingRight="12dp"
+        android:paddingBottom="4dp"
         android:text="返回直播"
         android:textColor="#FFFFFF"
         android:textSize="13sp"
