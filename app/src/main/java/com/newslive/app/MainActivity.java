@@ -207,6 +207,15 @@ public class MainActivity extends AppCompatActivity {
     private boolean liveEverReady = false;
     /** 补缓存基线：≥0 表示正在补缓存，进度 = cachedMs − refillBaseMs */
     private long refillBaseMs = -1;
+    /** 补缓存开始时的绝对内容位置（已淘汰时长+窗口内位置），续播据此回到原观看点 */
+    private long refillStopAbsMs = -1;
+    /** 续播定位：≥0 时下一次 setMediaItem 直接落到该位置（补缓存完成/同源重试用），用完即清 */
+    private long relayResumePosMs = -1;
+    /** 录制池子健康监测：最近一次 readyMs 变化时刻（缓冲看门狗与断源提示共用） */
+    private long lastRelayReadyMs = -1;
+    private long lastRelayReadyChangeAt = 0;
+    private int relayRewindCount = 0;
+    private boolean relayStallToasted = false;
     private Runnable cacheTicker;
     private Runnable relayPosTicker;
     private View cacheOverlay;
@@ -1751,6 +1760,7 @@ public class MainActivity extends AppCompatActivity {
                 updateClock();
                 updatePlaybackBadge();
                 sampleLiveNet();
+                monitorRelayHealth();
                 clockHandler.postDelayed(this, 1000);
             }
         };
@@ -1795,12 +1805,47 @@ public class MainActivity extends AppCompatActivity {
             // 看直播时不挂角标（用户要求：只有看录制内容才提示）
             tvPlaybackBadge.setVisibility(View.GONE);
         }
-        // 缓存见底预警：落后量掉到目标 1/3（且≥深度本身）就提前补缓存，别等播到头卡住
+        // 缓存见底预警：落后量掉到目标 1/3（≥45 秒）就提前补缓存，别等播到头卡住。
+        // 手动录制模式没有预缓存目标，按 60 秒底线兜底；前沿处 lag 会归 0，
+        // 所以不能拿 lag>0 当门槛，改用"池子里确实有货"判断
         if (relayPlaybackActive && activeRelay != null && !relayFinalized
-                && refillBaseMs < 0 && lag > 0) {
-            long threshold = Math.min(cachePreloadTargetMs * 3 / 4,
-                    Math.max(45_000, cachePreloadTargetMs / 3));
-            if (cachePreloadTargetMs > 0 && lag <= threshold) startCacheRefill();
+                && refillBaseMs < 0) {
+            HlsRelay rb = activeRelay;
+            long total = rb.getReadyMs();
+            long threshold = cachePreloadTargetMs > 0
+                    ? Math.min(cachePreloadTargetMs * 3 / 4,
+                        Math.max(45_000, cachePreloadTargetMs / 3))
+                    : 60_000;
+            if (total > 3000 && lag <= threshold) startCacheRefill();
+        }
+    }
+
+    /**
+     * 录制健康监测（每秒）：池子长度 60 秒无增长 → 断源，提示一次并记日志；
+     * 恢复增长自动撤提示。缓冲看门狗也用它区分"录制慢"和"录制死了"。
+     */
+    private void monitorRelayHealth() {
+        HlsRelay r = activeRelay;
+        if (r == null) {
+            lastRelayReadyMs = -1;
+            relayStallToasted = false;
+            return;
+        }
+        long total = r.getReadyMs();
+        long now = System.currentTimeMillis();
+        if (total != lastRelayReadyMs) {
+            lastRelayReadyMs = total;
+            lastRelayReadyChangeAt = now;
+            relayStallToasted = false;
+        } else if (relayPlaybackActive && !relayFinalized && refillBaseMs < 0
+                && lastRelayReadyChangeAt > 0 && total > 0
+                && now - lastRelayReadyChangeAt > 60_000 && !relayStallToasted) {
+            relayStallToasted = true;
+            long deadSec = (now - lastRelayReadyChangeAt) / 1000;
+            LogUtil.w("NewsLive", "录制健康: 池子 " + (total / 1000) + "s 已 " + deadSec
+                    + "s 无增长 lastError=" + r.getLastError());
+            Toast.makeText(this, "录制已断源 " + deadSec + " 秒无新内容，正在自动重试…",
+                    Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -4088,6 +4133,15 @@ public class MainActivity extends AppCompatActivity {
         if (cur != null && cur.isForSource(url)) {
             // 同一条源的重试：中继还在录，接着用，不重新攒
             if (cur.hasFirstSegment()) {
+                // 同源重试要保住当前观看点；若此前还没进入播放（异常残留），就从录制起点看
+                try {
+                    if (relayPlaybackActive && player != null
+                            && player.getPlaybackState() != Player.STATE_IDLE) {
+                        relayResumePosMs = Math.max(0, player.getCurrentPosition());
+                    } else if (!relayPlaybackActive) {
+                        relayStartSeekPending = true;
+                    }
+                } catch (Exception ignore) { }
                 relayPlaybackActive = true;
                 playVideoUrlNow(cur.getLocalPlaylistUrl(), name, retryCount, isRefreshed, silent);
             } else {
@@ -4199,6 +4253,19 @@ public class MainActivity extends AppCompatActivity {
                             }
                         });
                     }
+
+                    @Override public void onStalled(final HlsRelay r, final String reason) {
+                        handler.post(new Runnable() {
+                            @Override public void run() {
+                                if (session != relaySession || r != activeRelay) return;
+                                LogUtil.w("NewsLive", "录制断源: " + reason);
+                                // 网页模式：源地址靠网页嗅探续命，刷新网页拿新地址
+                                if (useWebMode) {
+                                    try { refreshVideoFromWeb(false); } catch (Exception ignore) { }
+                                }
+                            }
+                        });
+                    }
                 });
 
         relayHttpServer.register(relay);
@@ -4219,6 +4286,9 @@ public class MainActivity extends AppCompatActivity {
         etaText = null;
         relayFinalized = false;
         refillBaseMs = -1;
+        refillStopAbsMs = -1;
+        relayResumePosMs = -1;
+        relayRewindCount = 0;
         if (tvCacheTitle != null) {
             tvCacheTitle.setText(targetSecOverride > 0
                     ? "检测到当前频道播放不流畅，自动缓存"
@@ -4241,13 +4311,15 @@ public class MainActivity extends AppCompatActivity {
 
                 boolean refill = refillBaseMs >= 0;
                 long progressMs = refill ? Math.max(0, cached - refillBaseMs) : cached;
-                boolean enough = cachePreloadTargetMs <= 0
+                // 补缓存时目标深度有下限（手动录制模式 target 可能为 0，上面已兜底 2 分钟）
+                long effTarget = refill && cachePreloadTargetMs <= 0 ? 120_000L : cachePreloadTargetMs;
+                boolean enough = effTarget <= 0
                         ? relay.hasFirstSegment()
-                        : progressMs >= cachePreloadTargetMs;
+                        : progressMs >= effTarget;
                 // 录制比 = 已缓存内容时长 ÷ 实际耗时。1.0=刚好跟得上直播；<1=源码率超过网速，攒多少都会漏光
                 double recordRatio = wall >= 12000 ? (double) cached / wall : 1.0;
-                boolean starving = wall >= 15000 && recordRatio < 0.92;
-                boolean giveUp = wall > cachePreloadTargetMs * 2 + 90000;
+                boolean starving = !refill && wall >= 15000 && recordRatio < 0.92;
+                boolean giveUp = wall > effTarget * 2 + 90000;
 
                 if (enough || starving || giveUp) {
                     stopCacheTicker();
@@ -4262,8 +4334,11 @@ public class MainActivity extends AppCompatActivity {
                     hideCacheOverlay();
                     relayPlaybackActive = true;
                     if (refill) {
-                        // 补缓存完成：从缓存头部继续（不打回录制起点，落后量=补货量）
+                        // 补缓存完成：回到补缓存前的观看点继续（落后量=剩余深度+补货量）。
+                        // 基本没补到货（源基本断了）就额外回退 5 分钟重播，保证面前有可看内容
+                        long refilled = progressMs;
                         refillBaseMs = -1;
+                        armRelayRefillResume(relay, refilled, true);
                         startRelayPositionTicker(relay, session);
                         playVideoUrlNow(relay.getLocalPlaylistUrl(), cachePendingName,
                                 cachePendingRetry, cachePendingRefreshed, true);
@@ -4620,6 +4695,16 @@ public class MainActivity extends AppCompatActivity {
         final HlsRelay r = activeRelay;
         if (r == null || refillBaseMs >= 0) return;
         refillBaseMs = r.getReadyMs();
+        // 记住此刻观看点（绝对内容位置 = 已淘汰时长 + 窗口内位置）：
+        // 补完缓存回到这里继续，而不是落到列表最前沿（前沿=录制边缘，网速跟不上就秒卡）
+        try {
+            refillStopAbsMs = r.getEvictedMs()
+                    + Math.max(0, player != null ? player.getCurrentPosition() : 0);
+        } catch (Exception e) {
+            refillStopAbsMs = r.getEvictedMs() + r.getReadyMs();
+        }
+        // 手动录制模式没有预缓存目标：补缓存按 2 分钟深度执行，否则永远等不出头
+        if (cachePreloadTargetMs <= 0) cachePreloadTargetMs = 120_000L;
         cachePreloadStartAt = System.currentTimeMillis();
         muteWebVideoQuiet();
         try { if (player != null) player.stop(); } catch (Exception ignore) { }
@@ -4630,6 +4715,23 @@ public class MainActivity extends AppCompatActivity {
         Toast.makeText(this, "缓存不足，正在补充（无画面无声音），补满后自动继续",
                 Toast.LENGTH_LONG).show();
         LogUtil.i("NewsLive", "cache refill: base=" + refillBaseMs + " target=" + cachePreloadTargetMs);
+    }
+
+    /**
+     * 补缓存结束后续播定位：把"补缓存前的观看点"从绝对内容位置换算回当前播放列表窗口，
+     * 让播放器从原观看点继续（面前还有补货量+剩余深度的内容），而不是跳到列表最前沿。
+     * 源基本断供（补货 < 30 秒）时额外回退 jumpBackMs 重播已有内容兜底，避免续播即卡死。
+     */
+    private void armRelayRefillResume(HlsRelay relay, long refilledMs, boolean allowJumpBack) {
+        long pos = refillStopAbsMs >= 0 ? refillStopAbsMs - relay.getEvictedMs() : 0;
+        if (allowJumpBack && refilledMs < 30_000) pos -= 300_000;   // 基本没补到：回退 5 分钟重播
+        pos = Math.max(0, pos);
+        long total = relay.getReadyMs();
+        if (total < 5000) {
+            relayResumePosMs = 0;
+            return;
+        }
+        relayResumePosMs = Math.min(pos, total - 2000);
     }
 
     /** 停止录制并回到直播（磁盘缓存一起释放）；本次频道不再自动重新进入缓存，切台才重新武装 */
@@ -4827,7 +4929,9 @@ public class MainActivity extends AppCompatActivity {
         long progressMs = refillBaseMs >= 0 ? Math.max(0, cachedMs - refillBaseMs) : cachedMs;
         long target = Math.max(1000, cachePreloadTargetMs);
         long left = Math.max(0, target - progressMs);
-        double recordRatio = wallMs >= 8000 ? (double) cachedMs / wallMs : 1.0;
+        // 补缓存期间用"本次补货速度"算录制比（拿累计已录量除会得出巨大比值，警告永远不出现）
+        double ratioBase = refillBaseMs >= 0 ? progressMs : cachedMs;
+        double recordRatio = wallMs >= 8000 ? (double) ratioBase / wallMs : 1.0;
         // 内容以 1x 到达：剩余等待就是 目标−已录，直接减，不估速率（估了开局必乱跳）
         etaText = "剩余 " + fmtHms(left);
         int pct = (int) Math.min(100, progressMs * 100 / target);
@@ -4911,6 +5015,11 @@ public class MainActivity extends AppCompatActivity {
         stopRelayPositionTicker();
         hideCacheOverlay();
         relayFinalized = false;
+        refillStopAbsMs = -1;
+        relayResumePosMs = -1;
+        relayRewindCount = 0;
+        relayStallToasted = false;
+        lastRelayReadyMs = -1;
         HlsRelay r = activeRelay;
         activeRelay = null;
         relayPlaybackActive = false;
@@ -4939,8 +5048,10 @@ public class MainActivity extends AppCompatActivity {
         hideCacheOverlay();
         relayPlaybackActive = true;
         if (refill) {
-            // 补缓存期间按 OK：从缓存头部继续，不打回录制起点
+            // 补缓存期间按 OK：回到补缓存前的观看点继续（面前有已补货量）
+            long refilled = Math.max(0, r.getReadyMs() - refillBaseMs);
             refillBaseMs = -1;
+            armRelayRefillResume(r, refilled, false);
         } else {
             relayStartSeekPending = true;
         }
@@ -4979,7 +5090,12 @@ public class MainActivity extends AppCompatActivity {
             if (!silent) {
                 player.stop();
             }
-            if (relayPlaybackActive && relayStartSeekPending) {
+            if (relayPlaybackActive && relayResumePosMs >= 0) {
+                // 补缓存后续播/同源重试：显式落回原观看点。
+                // EVENT 列表不给位置会跳到列表最前沿（录制边缘），录制慢/断时续播即卡死
+                player.setMediaItem(mediaItem, relayResumePosMs);
+                relayResumePosMs = -1;
+            } else if (relayPlaybackActive && relayStartSeekPending) {
                 // 首次起播：本地列表起点 = 录制起点，必须显式给 0，
                 // 否则直播语义会让播放器直接跳到列表尾部（变成看直播）
                 player.setMediaItem(mediaItem, 0L);
@@ -5055,15 +5171,35 @@ public class MainActivity extends AppCompatActivity {
                                             // 此刻重连/重prepare会把画面打回池子起点，必须等它自己续上
                                             handler.postDelayed(this, 1000);
                                         } else if (relayPlaybackActive && !relayFinalized) {
-                                            // 45 秒仍无新分片：这条线基本废了，换同频道备用线路（重新攒缓存）
+                                            // 45 秒无新分片：先看池子还在不在长——在长=录制慢，
+                                            // 等它自己续上；冻结了才回退 60 秒重播已有内容，
+                                            // 连续 3 次无效才换线（换线会销毁全部已录缓存，轻易不做）
+                                            HlsRelay rr = activeRelay;
+                                            boolean poolGrowing = rr != null
+                                                    && System.currentTimeMillis() - lastRelayReadyChangeAt < 20_000;
                                             bufferingTime[0] = 0;
                                             seekRetryCount[0] = 0;
-                                            if (!useWebMode && streamUrls.size() > 1) {
-                                                int[] r = currentChannelRange();
-                                                currentUrlIndex = currentUrlIndex < r[1] ? currentUrlIndex + 1 : r[0];
-                                                loadStreamFromConfig(currentUrlIndex);
+                                            if (poolGrowing) {
+                                                handler.postDelayed(this, 1000);
                                             } else {
-                                                player.prepare();
+                                                relayRewindCount++;
+                                                if (relayRewindCount <= 2) {
+                                                    try {
+                                                        long p = player.getCurrentPosition();
+                                                        player.seekTo(Math.max(0, p - 60_000));
+                                                        LogUtil.w("NewsLive", "缓存池冻结，回退 60s 重播（第 " + relayRewindCount + " 次）");
+                                                    } catch (Exception ignore) { }
+                                                    handler.postDelayed(this, 1000);
+                                                } else {
+                                                    relayRewindCount = 0;
+                                                    if (!useWebMode && streamUrls.size() > 1) {
+                                                        int[] r = currentChannelRange();
+                                                        currentUrlIndex = currentUrlIndex < r[1] ? currentUrlIndex + 1 : r[0];
+                                                        loadStreamFromConfig(currentUrlIndex);
+                                                    } else {
+                                                        player.prepare();
+                                                    }
+                                                }
                                             }
                                         } else if (!isRefreshed && useWebMode && seekRetryCount[0] >= 2) {
                                             if (sniffRefreshCount < MAX_SNIFF_REFRESH) {
@@ -5131,6 +5267,8 @@ public class MainActivity extends AppCompatActivity {
                         hasError[0] = false;
                         seekRetryCount[0] = 0;
                         pauseRetryCount[0] = 0;
+                        relayResumePosMs = -1;   // 防残留：续播定位一次一清，别劫持下一次起播
+                        relayRewindCount = 0;
                         sniffRefreshCount = 0;
                         giveUpRecoveryCount = 0;
                         cancelGiveUpRecovery();

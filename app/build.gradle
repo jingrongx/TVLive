@@ -4,13 +4,13 @@ plugins {
 
 // 从 version.properties 读取版本号（GitHub Action 会自动递增）
 def versionPropsFile = rootProject.file("version.properties")
-def versionCode = 1
-def versionName = "1.0.0"
+def vCode = 1
+def vName = "1.0.0"
 if (versionPropsFile.exists()) {
     def versionProps = new Properties()
     versionProps.load(new FileInputStream(versionPropsFile))
-    versionCode = versionProps['VERSION_CODE'].toInteger()
-    versionName = versionProps['VERSION_NAME']
+    vCode = versionProps['VERSION_CODE'].toInteger()
+    vName = versionProps['VERSION_NAME']
 }
 
 android {
@@ -21,8 +21,8 @@ android {
         applicationId "com.newslive.app"
         minSdk 21
         targetSdk 28
-        versionCode = versionCode
-        versionName = versionName
+        versionCode = vCode
+        versionName = vName
     }
 
     // 签名配置：本地用 keystore 文件，CI 用环境变量解码的 keystore
@@ -55,7 +55,7 @@ android {
             // 输出 APK 文件名：newslive-v<版本号>.apk
             android.applicationVariants.all { variant ->
                 variant.outputs.all {
-                    outputFileName = "newslive-v${versionName}.apk"
+                    outputFileName = "newslive-v${vName}.apk"
                 }
             }
         }

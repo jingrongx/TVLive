@@ -40,6 +40,9 @@ public class HlsRelay {
 
         /** 起播前连续失败，建议回退直连源 */
         void onFailed(HlsRelay relay, String reason);
+
+        /** 录制中但源持续拿不到新内容（403/断流/源停播等），宿主可提示或尝试恢复 */
+        void onStalled(HlsRelay relay, String reason);
     }
 
     /** auth_key 过期时可由宿主改成最新签名地址（复用 App 现有的同频道候选逻辑） */
@@ -65,6 +68,8 @@ public class HlsRelay {
         double durSec;
         String fileName;
         boolean ready;
+        boolean failed;     // 重试后仍取不到（典型：分片已滚出源窗口 404），跳过它保住后面的
+        int failRounds;     // 连续失败的轮数
         boolean discontinuity;
         String keyTag;      // 已绝对化的 EXT-X-KEY 原始行
         String mapTag;      // 已绝对化的 EXT-X-MAP 原始行
@@ -100,6 +105,14 @@ public class HlsRelay {
     private volatile long evictedMs = 0;
     private volatile long playerPosMs = 0;
     private int initSeq = 0;
+    // 源端序号回退检测：服务器重启/换 CDN 会把 MEDIA-SEQUENCE 打回去，直接并库会与旧分片
+    // 撞号而被静默丢弃（表现为录制冻结）。给新一轮序号加纪元偏移即可保住已录内容。
+    private long seqEpochBase = 0;
+    private long lowestSrcSeq = -1;
+    // 断源检测：最近一次索引到新分片的时刻
+    private volatile long lastNewSegAt = System.currentTimeMillis();
+    private volatile boolean stalledFired = false;
+    private volatile long lastStallNotifyAt = 0;
 
     public HlsRelay(Context ctx, String sourceUrl, String token, File dir,
                     String baseUrl, long retainMs, UrlFixer fixer, Listener listener) {
@@ -229,10 +242,19 @@ public class HlsRelay {
                     lastStats = now;
                     LogUtil.i(TAG, "relay " + token + " " + getStatsLine());
                 }
+                // 断源检测：已起播但 60 秒没有索引到任何新分片 → 通知宿主（限频 2 分钟一次）
+                if (readyFired && now - lastNewSegAt > 60_000
+                        && (!stalledFired || now - lastStallNotifyAt > 120_000)) {
+                    stalledFired = true;
+                    lastStallNotifyAt = now;
+                    fireStalled("源 " + ((now - lastNewSegAt) / 1000) + "s 无新分片"
+                            + (lastError.isEmpty() ? "" : "，最后错误 " + lastError));
+                }
                 Thread.sleep(Math.max(700L, Math.min(2500L, targetDurationSec * 350L)));
             } catch (InterruptedException ie) {
                 return;
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                // 连 Error 也兜住：录制线程若因 OOM 等静默死亡，外面没有任何恢复手段
                 lastError = e.toString();
                 failures++;
                 LogUtil.w(TAG, "relay loop error(" + failures + "): " + e);
@@ -262,6 +284,15 @@ public class HlsRelay {
         if (l == null) return;
         main.post(new Runnable() {
             @Override public void run() { l.onFailed(HlsRelay.this, reason); }
+        });
+    }
+
+    private void fireStalled(final String reason) {
+        final Listener l = listener;
+        if (l == null) return;
+        LogUtil.w(TAG, "recording stalled: " + reason);
+        main.post(new Runnable() {
+            @Override public void run() { l.onStalled(HlsRelay.this, reason); }
         });
     }
 
@@ -382,6 +413,20 @@ public class HlsRelay {
         }
         if (td > 0) targetDurationSec = td;
 
+        // 序号回退检测：正常情况下源窗口起点只会前移；一旦倒退说明源端重启/换源了，
+        // 新序号会与已录分片撞号。给这一轮全部加上纪元偏移并打上断点标记。
+        if (!parsed.isEmpty()) {
+            long firstRaw = parsed.get(0).seq;
+            if (lowestSrcSeq >= 0 && firstRaw < lowestSrcSeq) {
+                seqEpochBase += 1_000_000_000L;
+                for (Seg s : parsed) { s.seq += seqEpochBase; s.discontinuity = true; }
+                LogUtil.w(TAG, "source sequence reset detected, epoch base=" + seqEpochBase);
+            } else {
+                for (Seg s : parsed) s.seq += seqEpochBase;
+            }
+            lowestSrcSeq = lowestSrcSeq < 0 ? firstRaw : Math.min(lowestSrcSeq, firstRaw);
+        }
+
         double windowSec = 0;
         for (Seg s : parsed) windowSec += s.durSec;
         sourceWindowSec = (int) Math.round(windowSec);
@@ -401,6 +446,8 @@ public class HlsRelay {
                         s.initName = downloadInit(s.mapTag, s.initName);
                     }
                     segs.put(s.seq, s);
+                    lastNewSegAt = System.currentTimeMillis();
+                    stalledFired = false;    // 恢复有新内容了：撤掉断源标记
                 }
             }
             evictIfNeededLocked();
@@ -454,7 +501,7 @@ public class HlsRelay {
         }
         for (Seg s : snapshot) {
             if (!running) return;
-            if (s.ready) continue;
+            if (s.ready || s.failed) continue;
             boolean ok = false;
             for (int attempt = 0; attempt < 3 && running && !ok; attempt++) {
                 try {
@@ -472,14 +519,27 @@ public class HlsRelay {
                     ok = true;
                 } catch (Exception e) {
                     lastError = e.toString();
+                    // 清理半截临时文件：弱网下反复失败会把磁盘慢慢塞满
+                    new File(dir, "tmp_" + s.seq).delete();
                     if (attempt < 2) {
                         try { Thread.sleep(400L * (attempt + 1)); } catch (InterruptedException ie) { return; }
                     }
                 }
             }
             if (!ok) {
-                // 保持顺序：这一段没下来，后面的先不拉，下一轮继续重试它
-                return;
+                // 404/410=分片已滚出源窗口，永远取不到了；普通失败连续两轮也放弃。
+                // 卡在一个取不到的分片上会让整条录制线冻结，跳过它（打断点）保住后面的。
+                boolean gone = lastError != null
+                        && (lastError.contains("HTTP 404") || lastError.contains("HTTP 410"));
+                if (gone || ++s.failRounds >= 2) {
+                    s.failed = true;
+                    LogUtil.w(TAG, "segment " + s.seq + " skipped: " + lastError);
+                    synchronized (lock) { rebuildPlaylistLocked(); }
+                } else {
+                    // 保持顺序：这一段没下来，后面的先不拉，下一轮继续重试它
+                    return;
+                }
+                continue;
             }
             synchronized (lock) {
                 diskBytes += s.bytes;
@@ -538,8 +598,15 @@ public class HlsRelay {
     private void rebuildPlaylistLocked() {
         List<Seg> ready = new ArrayList<>();
         long sum = 0;
+        boolean pendingDisc = false;   // 前面有被跳过的死分片：下一个可用分片要打断点
         for (Seg s : segs.values()) {
-            if (!s.ready) break;      // 只输出"从起点开始连续就绪"的前缀
+            if (!s.ready) {
+                if (!s.failed) break;  // 只输出"从起点开始连续就绪"的前缀（死分片除外）
+                pendingDisc = true;    // 已判死的分片：跳过，内容时间轴在它后面会有跳变
+                continue;
+            }
+            if (pendingDisc && !ready.isEmpty()) s.discontinuity = true;
+            pendingDisc = false;
             ready.add(s);
             sum += (long) (s.durSec * 1000);
         }
@@ -561,9 +628,11 @@ public class HlsRelay {
         }
         String lastKey = null;
         String lastMap = null;
+        boolean justDisc = false;
         for (int i = 0; i < ready.size(); i++) {
             Seg s = ready.get(i);
-            if (s.discontinuity && i > 0) sb.append("#EXT-X-DISCONTINUITY\n");
+            if (s.discontinuity && i > 0 && !justDisc) sb.append("#EXT-X-DISCONTINUITY\n");
+            justDisc = s.discontinuity && i > 0;
             if (s.keyTag != null && !s.keyTag.equals(lastKey)) {
                 sb.append(s.keyTag).append('\n');
                 lastKey = s.keyTag;
@@ -602,7 +671,7 @@ public class HlsRelay {
             Seg s = it.next().getValue();
             long segEnd = evictedMs + (long) (s.durSec * 1000);
             if (playing && !overCap && segEnd > playerAbs - 90_000L) break;
-            if (!s.ready) break;
+            if (!s.ready && !s.failed) break;
             File f = s.fileName != null ? new File(dir, s.fileName) : null;
             if (f != null) f.delete();
             diskBytes -= s.bytes;

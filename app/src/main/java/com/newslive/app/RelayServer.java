@@ -68,14 +68,26 @@ public class RelayServer {
 
     private void acceptLoop() {
         while (running) {
-            Socket client = null;
             try {
-                client = serverSocket.accept();
-                handle(client);
+                final Socket client = serverSocket.accept();
+                // 每连接独立线程：一个慢请求（大分片/客户端停读）不能堵住播放列表刷新，
+                // 否则播放器会误判"列表不更新"而进入无限缓冲
+                Thread t = new Thread(new Runnable() {
+                    @Override public void run() {
+                        try {
+                            handle(client);
+                        } catch (Exception e) {
+                            LogUtil.w(TAG, "handle error: " + e);
+                        } finally {
+                            try { client.close(); } catch (Exception ignore) { }
+                        }
+                    }
+                }, "RelayConn");
+                t.setDaemon(true);
+                t.start();
             } catch (Exception e) {
-                if (running) LogUtil.w(TAG, "accept/handle error: " + e);
-            } finally {
-                try { if (client != null) client.close(); } catch (Exception ignore) { }
+                if (running) LogUtil.w(TAG, "accept error: " + e);
+                try { Thread.sleep(200); } catch (InterruptedException ie) { return; }
             }
         }
     }
