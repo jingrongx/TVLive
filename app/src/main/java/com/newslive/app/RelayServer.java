@@ -70,6 +70,19 @@ public class RelayServer {
         while (running) {
             try {
                 final Socket client = serverSocket.accept();
+                // 写堵塞兜底：setSoTimeout 只管读；客户端停止读取又不关连接时（如播放器
+                // 在传输中途 stop），send 会永久阻塞。30 秒后从外部强断连接放开线程。
+                final Socket sock = client;
+                Thread watchdog = new Thread(new Runnable() {
+                    @Override public void run() {
+                        try {
+                            Thread.sleep(30_000);
+                            sock.close();
+                        } catch (Exception ignore) { }
+                    }
+                }, "RelayWd");
+                watchdog.setDaemon(true);
+                watchdog.start();
                 // 每连接独立线程：一个慢请求（大分片/客户端停读）不能堵住播放列表刷新，
                 // 否则播放器会误判"列表不更新"而进入无限缓冲
                 Thread t = new Thread(new Runnable() {

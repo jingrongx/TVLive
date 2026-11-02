@@ -201,14 +201,32 @@ public class MainActivity extends AppCompatActivity {
     private double emaBitrateKB = 0, emaNetKB = 0;
     private int monSamples = 0;
     private int insufficientStreak = 0;
+    /** 网速不足确认窗口：瞬时抖动/忽快忽慢不触发，必须持续不足才进缓存 */
+    private static final long INSUFFICIENT_CONFIRM_MS = 60_000L;
+    /** 严重缺口（网速不到码率一半）时缓冲很快耗光，等不了 1 分钟，用短确认窗口 */
+    private static final long INSUFFICIENT_CONFIRM_FAST_MS = 20_000L;
+    /** 网速连续不足的起算时刻；任何一个窗口恢复即清零 */
+    private long insufficientSinceAt = 0;
     private boolean autoCachePrompted = false;
     /** 卡顿频率统计：5 分钟窗口内 ≥3 次即判网络不稳定 */
     private final java.util.LinkedList<Long> liveStallTimes = new java.util.LinkedList<>();
+    /** 正在进行的卡顿起点：BUFFERING 持续满 2 秒才算一次真卡顿，瞬时缓冲抖动不计数 */
+    private long stallStartedAt = 0;
     private boolean liveEverReady = false;
     /** 补缓存基线：≥0 表示正在补缓存，进度 = cachedMs − refillBaseMs */
     private long refillBaseMs = -1;
     /** 补缓存开始时的绝对内容位置（已淘汰时长+窗口内位置），续播据此回到原观看点 */
     private long refillStopAbsMs = -1;
+    /** 补缓存目标深度：按完整预缓存深度补＝几十分钟黑屏，封顶 {@link #REFILL_TARGET_CAP_MS} */
+    private long refillTargetMs = 0;
+    /** 补缓存深度上限：录制以 1 倍速进行，5 分钟够绝大多数网络波动恢复 */
+    private static final long REFILL_TARGET_CAP_MS = 300_000L;
+    /** 本次频道会话内不再对该源进缓存（窗口受限/断源救不回），换台才重新武装 */
+    private String relayBailUrl = null;
+    /** 中继断源续key（静默harvest）的最后一次尝试时刻，去抖防刷新风暴 */
+    private long lastRelayHarvestAt = 0;
+    /** harvest收尾的延迟暂停网页任务（消除播放器背后的WebView双解码） */
+    private Runnable webHarvestPauseRunnable;
     /** 续播定位：≥0 时下一次 setMediaItem 直接落到该位置（补缓存完成/同源重试用），用完即清 */
     private long relayResumePosMs = -1;
     /** 录制池子健康监测：最近一次 readyMs 变化时刻（缓冲看门狗与断源提示共用） */
@@ -458,7 +476,11 @@ public class MainActivity extends AppCompatActivity {
         handler = new Handler(Looper.getMainLooper());
         prefs = getSharedPreferences(PREF_NAME, MODE_PRIVATE);
         executorService = Executors.newFixedThreadPool(4);
-        
+
+        // 清理上次进程被杀遗留的孤儿中继缓存目录：正常 stop() 会自删，
+        // 进程被杀时残留可达上GB（默认滚动录制360分钟），只吃磁盘没有任何用处
+        executorService.execute(() -> cleanOrphanRelayDirs(this));
+
         playerView = findViewById(R.id.player_view);
         playerContainer = findViewById(R.id.player_container);
         webView = findViewById(R.id.web_view);
@@ -1761,6 +1783,7 @@ public class MainActivity extends AppCompatActivity {
                 updatePlaybackBadge();
                 sampleLiveNet();
                 monitorRelayHealth();
+                confirmStall();
                 clockHandler.postDelayed(this, 1000);
             }
         };
@@ -2751,6 +2774,7 @@ public class MainActivity extends AppCompatActivity {
     private void stopAllPlayback() {
         stopRelaySession();
         autoCachePrompted = false;   // 网页换台：自动缓存重新武装
+        relayBailUrl = null;         // 换台：源窗口/断源判定一并作废
         stopWebVideoStallDetector();
         cancelWebRefreshFallback();
         cancelStreamRotation();
@@ -3198,6 +3222,13 @@ public class MainActivity extends AppCompatActivity {
                                     candidateByVariant.put(variant, url);
                                     candidateTimeByVariant.put(variant, now);
                                 }
+                            }
+                            // 录播会话：新候选喂给中继续key，随后收网页（消除双解码）
+                            if (lower.contains(".m3u8")) {
+                                runOnUiThread(() -> {
+                                    feedFreshCandidateToRelay();
+                                    scheduleWebPauseAfterHarvest(8000);
+                                });
                             }
                             // 延迟2秒，等视频元素就绪后检查播放状态
                             runOnUiThread(() -> {
@@ -3911,9 +3942,10 @@ public class MainActivity extends AppCompatActivity {
         // （切走会 stopRelaySession，几小时录制直接清零）
         if (relayPlaybackActive && activeRelay != null) {
             LogUtil.i("NewsLive", "relay active, skip silent switch to " + url);
-            // 静默刷新的唯一价值是给中继续 key；这里把巡检重新挂上，
-            // 否则 refreshVideoFromWeb 开头 cancelStreamRotation() 之后就再没人续了
-            scheduleStreamRotation();
+            // 静默刷新的唯一价值是给中继续 key：把新候选喂给中继并重新挂巡检
+            // （feed 内含 scheduleStreamRotation，否则 refreshVideoFromWeb 取消后就没人续了）
+            feedFreshCandidateToRelay();
+            scheduleWebPauseAfterHarvest(8000);
             muteWebVideoQuiet();
             return;
         }
@@ -4122,7 +4154,8 @@ public class MainActivity extends AppCompatActivity {
 
         boolean wantRelay = relayEnabled && !useWebMode && !recordManual
                 && (cachePreloadMin > 0 || relayRecordMin > 0)
-                && isHlsUrl(url) && !isDrmStream(url);
+                && isHlsUrl(url) && !isDrmStream(url)
+                && !url.equals(relayBailUrl);   // 已判定窗口受限/断源救不回的源，本次会话不再进缓存
 
         if (!wantRelay) {
             stopRelaySession();
@@ -4236,7 +4269,17 @@ public class MainActivity extends AppCompatActivity {
         HlsRelay relay = new HlsRelay(this, url, token, dir, relayHttpServer.baseUrlFor(token),
                 retainMs, new HlsRelay.UrlFixer() {
                     @Override public String fix(String u) {
-                        try { return findFreshCandidateSameChannel(u); } catch (Exception e) { return null; }
+                        try {
+                            String fresh = findFreshCandidateSameChannel(u);
+                            // 403 且本地没有可用新候选：触发静默harvest续key（内部有去抖）。
+                            // key约3.5分钟过期，不续的话录制会在几分钟内冻结
+                            if (fresh == null || fresh.isEmpty()) {
+                                handler.post(new Runnable() {
+                                    @Override public void run() { maybeHarvestForRelay("403无候选"); }
+                                });
+                            }
+                            return fresh;
+                        } catch (Exception e) { return null; }
                     }
                 }, new HlsRelay.Listener() {
                     @Override public void onReady(HlsRelay r) { /* 由 ticker 统一起播 */ }
@@ -4259,10 +4302,9 @@ public class MainActivity extends AppCompatActivity {
                             @Override public void run() {
                                 if (session != relaySession || r != activeRelay) return;
                                 LogUtil.w("NewsLive", "录制断源: " + reason);
-                                // 网页模式：源地址靠网页嗅探续命，刷新网页拿新地址
-                                if (useWebMode) {
-                                    try { refreshVideoFromWeb(false); } catch (Exception ignore) { }
-                                }
+                                // 断源续命：优先换用新鲜候选地址，没有就静默刷新网页harvest
+                                // （不切画面、不动播放器；旧版可见刷新会闪屏且留下WebView常驻解码）
+                                maybeHarvestForRelay("断源");
                             }
                         });
                     }
@@ -4287,6 +4329,7 @@ public class MainActivity extends AppCompatActivity {
         relayFinalized = false;
         refillBaseMs = -1;
         refillStopAbsMs = -1;
+        refillTargetMs = 0;
         relayResumePosMs = -1;
         relayRewindCount = 0;
         if (tvCacheTitle != null) {
@@ -4296,6 +4339,8 @@ public class MainActivity extends AppCompatActivity {
         }
         showCacheOverlay(name);
         startCacheTicker(relay, session);
+        // 预缓存期间播放器停着，key巡检必须照跑（约3.5分钟key过期，不续录制必断）
+        scheduleStreamRotation();
     }
 
     /** 每 500ms 刷新遮罩；攒够/码率超标/超时 三种情况都会开播 */
@@ -4311,15 +4356,46 @@ public class MainActivity extends AppCompatActivity {
 
                 boolean refill = refillBaseMs >= 0;
                 long progressMs = refill ? Math.max(0, cached - refillBaseMs) : cached;
-                // 补缓存时目标深度有下限（手动录制模式 target 可能为 0，上面已兜底 2 分钟）
-                long effTarget = refill && cachePreloadTargetMs <= 0 ? 120_000L : cachePreloadTargetMs;
+                // 补缓存目标用封顶后的 refillTargetMs（按完整预缓存深度补＝几十分钟黑屏）；
+                // 手动录制模式 target 可能为 0，兜底 2 分钟
+                long effTarget = refill
+                        ? (refillTargetMs > 0 ? refillTargetMs
+                            : Math.max(120_000L, Math.min(cachePreloadTargetMs, REFILL_TARGET_CAP_MS)))
+                        : cachePreloadTargetMs;
                 boolean enough = effTarget <= 0
                         ? relay.hasFirstSegment()
                         : progressMs >= effTarget;
                 // 录制比 = 已缓存内容时长 ÷ 实际耗时。1.0=刚好跟得上直播；<1=源码率超过网速，攒多少都会漏光
                 double recordRatio = wall >= 12000 ? (double) cached / wall : 1.0;
-                boolean starving = !refill && wall >= 15000 && recordRatio < 0.92;
-                boolean giveUp = wall > effTarget * 2 + 90000;
+                // 池子冻结（30秒无增长）说明录制断源而非码率超标，不能按"starving"提前开播
+                boolean poolFrozen = lastRelayReadyChangeAt > 0
+                        && System.currentTimeMillis() - lastRelayReadyChangeAt > 30_000;
+                // ---- 死路确定性退出：绝不进"补缓存↔回退重播"死循环，回直连并如实说明 ----
+                // 1) 源窗口受限：本地最多只能攒到源播放列表窗口时长，分钟级目标永远到不了
+                int win = relay.getSourceWindowSec();
+                boolean windowCapped = win > 0 && wall > 40_000 && (win + 5) * 1000L < effTarget;
+                boolean starving = !refill && wall >= 15000 && recordRatio < 0.92
+                        && !poolFrozen && !windowCapped;
+                // 超时放弃：目标两倍还多；或池子冻结满 5 分钟（续key已试过几轮仍无货）
+                boolean giveUp = wall > effTarget * 2 + 90000
+                        || (poolFrozen && wall > 300_000);
+                // 2) 预缓存阶段录制断源 150 秒且续key无效，池子连可看内容都没有
+                boolean deadEarly = !refill && poolFrozen && wall > 150_000 && cached < 45_000;
+                // 3) 补缓存到点仍几乎没补上（源断供/窗口受限）
+                boolean refillStuck = refill && giveUp && progressMs < 30_000;
+                if (windowCapped || deadEarly || refillStuck) {
+                    stopCacheTicker();
+                    String why = windowCapped ? "该源直播窗口仅 " + win + " 秒，无法分钟级缓存"
+                            : deadEarly ? "录制断源且自动续key无效" : "缓存迟迟补不上";
+                    LogUtil.w("NewsLive", "relay bail(" + why + "): " + relay.getStatsLine());
+                    relayBailUrl = relay.getSourceUrl();
+                    autoCachePrompted = true;   // 本次频道会话不再自动进缓存，切台重新武装
+                    stopRelaySession();
+                    Toast.makeText(MainActivity.this, why + "，改为直连播放", Toast.LENGTH_LONG).show();
+                    playVideoUrlNow(relay.getSourceUrl(), cachePendingName,
+                            cachePendingRetry, cachePendingRefreshed, false);
+                    return;
+                }
 
                 if (enough || starving || giveUp) {
                     stopCacheTicker();
@@ -4366,6 +4442,32 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             return 0;
         }
+    }
+
+    /**
+     * 清理上次进程被杀遗留的孤儿中继缓存目录（默认滚动录制360分钟，残留可达上GB）。
+     * 只动 10 分钟前最后写入的目录：本进程刚建的录制目录不受影响，刚被杀的残留
+     * 留到下次启动再清，绝不冒误删正在录制的目录的风险。
+     */
+    private static void cleanOrphanRelayDirs(Context ctx) {
+        try {
+            File base = ctx.getExternalFilesDir("relay");
+            if (base == null) base = new File(ctx.getCacheDir(), "relay");
+            File[] children = base.listFiles();
+            if (children == null) return;
+            long cutoff = System.currentTimeMillis() - 10 * 60_000L;
+            for (File f : children) {
+                if (f.lastModified() > cutoff) continue;
+                deleteTree(f);
+                LogUtil.i("NewsLive", "清理孤儿缓存目录: " + f.getName());
+            }
+        } catch (Exception ignore) { }
+    }
+
+    private static void deleteTree(File f) {
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) deleteTree(k);
+        f.delete();
     }
 
     /** 底部控制条：开始 / 停止录制（播放器模式与网页模式都支持） */
@@ -4705,7 +4807,12 @@ public class MainActivity extends AppCompatActivity {
         }
         // 手动录制模式没有预缓存目标：补缓存按 2 分钟深度执行，否则永远等不出头
         if (cachePreloadTargetMs <= 0) cachePreloadTargetMs = 120_000L;
+        // 补缓存深度封顶 5 分钟：录制以 1 倍速进行，按完整预缓存深度补＝几十分钟黑屏
+        refillTargetMs = Math.max(120_000L,
+                Math.min(cachePreloadTargetMs, REFILL_TARGET_CAP_MS));
         cachePreloadStartAt = System.currentTimeMillis();
+        // 补缓存期间播放器停着，key巡检照跑（不续key的话补缓存永远等不出货）
+        scheduleStreamRotation();
         muteWebVideoQuiet();
         try { if (player != null) player.stop(); } catch (Exception ignore) { }
         if (tvCacheTitle != null) tvCacheTitle.setText("网络波动，正在补充缓存…");
@@ -4794,9 +4901,91 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception ignore) { }
     }
 
+    // ---------------------------------------------------------------- 录制断源续命
+
+    /**
+     * 中继断源续命：录制用的签名 key 约 3.5 分钟过期，候选地址只认 210 秒内的新鲜度。
+     * 优先换用本地已有的新鲜候选（不动网页）；没有就静默刷新网页 harvest（无画面切换）。
+     * 60 秒去抖：403 每 6 秒重试一次，不能每 fail 都重载页面。
+     */
+    private void maybeHarvestForRelay(String why) {
+        HlsRelay r = activeRelay;
+        if (r == null || r.isEnded()) return;
+        long now = System.currentTimeMillis();
+        if (now - lastRelayHarvestAt < 60_000) return;
+        lastRelayHarvestAt = now;
+        String fresh = null;
+        try { fresh = findFreshCandidateSameChannel(r.getSourceUrl()); } catch (Exception ignore) { }
+        if (fresh != null && !fresh.isEmpty()) {
+            r.setPlaylistUrl(fresh);
+            LogUtil.i("NewsLive", "relay续命(" + why + "): 换用新鲜候选，无需动网页");
+            return;
+        }
+        if (!useWebMode || webView == null) {
+            LogUtil.w("NewsLive", "relay续命(" + why + "): 无候选且非网页模式，无法续key");
+            return;
+        }
+        LogUtil.i("NewsLive", "relay续命(" + why + "): 静默刷新网页harvest新key");
+        refreshVideoFromWeb(true);
+        // 兜底：页面迟迟没嗅探到新地址也要收网页，别让它常驻解码
+        scheduleWebPauseAfterHarvest(30_000);
+    }
+
+    /**
+     * 网页harvest到新地址后喂给中继：候选来自嗅探（shouldInterceptRequest/静默刷新跳转）。
+     * refreshVideoFromWeb 开头会 cancelStreamRotation，这里无论是否喂成都要把巡检重新挂上。
+     */
+    private void feedFreshCandidateToRelay() {
+        scheduleStreamRotation();
+        HlsRelay r = activeRelay;
+        if (r == null) return;
+        String fresh = null;
+        try { fresh = findFreshCandidateSameChannel(r.getSourceUrl()); } catch (Exception ignore) { }
+        if (fresh == null || fresh.isEmpty()) return;
+        r.setPlaylistUrl(fresh);
+        LogUtil.i("NewsLive", "relay续命: harvest到新key，中继已换源");
+    }
+
+    /**
+     * harvest收尾：给页面几秒完成多清晰度嗅探，然后暂停网页。
+     * 旧版静默刷新后 WebView 一直 resume+播muted视频，播放器背后双路解码，
+     * 弱网下还与录制抢带宽——这正是"电视资源被吃光"的主要来源。
+     */
+    private void scheduleWebPauseAfterHarvest(long delayMs) {
+        if (webView == null) return;
+        if (webHarvestPauseRunnable != null) handler.removeCallbacks(webHarvestPauseRunnable);
+        webHarvestPauseRunnable = new Runnable() {
+            @Override public void run() {
+                webHarvestPauseRunnable = null;
+                WebView wv = webView;
+                if (wv == null) return;
+                // 只收录播会话里的网页；正常网页播放（非录播）不动
+                if (activeRelay == null && wv.getVisibility() != View.INVISIBLE) return;
+                try {
+                    wv.evaluateJavascript(
+                            "(function(){try{window.__nlKeepPaused=true;"
+                                    + "var vs=document.querySelectorAll('video');"
+                                    + "for(var i=0;i<vs.length;i++){vs[i].muted=true;try{vs[i].pause();}catch(e){}}}"
+                                    + "}catch(e){}})();", null);
+                } catch (Exception ignore) { }
+                try {
+                    wv.onPause();
+                    wv.pauseTimers();
+                    wv.setVisibility(View.GONE);
+                } catch (Exception ignore) { }
+                LogUtil.i("NewsLive", "harvest收尾: 网页已暂停，消除双解码");
+            }
+        };
+        handler.postDelayed(webHarvestPauseRunnable, delayMs);
+    }
+
     // ---------------------------------------------------------------- 无感自动缓存
 
-    /** 播放直播时每秒采样一次（内部 5 秒一窗）：网速 < 码率 且持续，就自动进入缓存模式 */
+    /**
+     * 播放直播时每秒采样一次（内部 5 秒一窗）：网速低于码率且"持续"才自动进入缓存模式。
+     * 触发门槛见 INSUFFICIENT_CONFIRM_MS/INSUFFICIENT_CONFIRM_FAST_MS——瞬时抖动、
+     * 忽快忽慢都进不来；持续慢网由网速路径兜底，真卡顿由 confirmStall 的频率统计兜底。
+     */
     private void sampleLiveNet() {
         try {
             if (player == null || activeRelay != null || screenRecorder != null) return;
@@ -4812,7 +5001,12 @@ public class MainActivity extends AppCompatActivity {
             long bytesDelta = monTotalBytes - monMarkBytes;
             long contentDelta = monContentMs - monMarkContentMs;
             monMarkWall = now; monMarkBytes = monTotalBytes; monMarkContentMs = monContentMs;
-            if (contentDelta < 3000 || bytesDelta < 40 * 1024) return;
+            if (contentDelta < 3000) return;   // 内容没推进：本窗口不可信，不足计时保持原状
+            if (bytesDelta < 40 * 1024) {
+                // 基本没拉数据＝缓冲充足＝网速当前够用：不足计时清零
+                insufficientSinceAt = 0;
+                return;
+            }
 
             double bKB = bytesDelta / 1024.0 / (contentDelta / 1000.0);
             double nKB = netMeter != null && netMeter.getBitrateEstimate() > 0
@@ -4821,11 +5015,26 @@ public class MainActivity extends AppCompatActivity {
             emaBitrateKB = emaBitrateKB <= 0 ? bKB : emaBitrateKB * 0.6 + bKB * 0.4;
             emaNetKB = emaNetKB <= 0 ? nKB : emaNetKB * 0.6 + nKB * 0.4;
             monSamples++;
-            // 连续 2 个窗口（约 10 秒）都撑不住才触发：刚换台的头几秒不作数
-            if (emaNetKB < emaBitrateKB * 0.95) insufficientStreak++; else insufficientStreak = 0;
-            if (monSamples >= 2 && insufficientStreak >= 2) {
+            // 网速不足必须"持续"才触发：任何一次恢复即清零重来。
+            // 旧版连续 2 个窗口（约10秒）就动手，瞬时抖动/忽快忽慢都会误进缓存。
+            // 严重缺口（网速不到码率一半）走 20 秒快速确认——那种网速下缓冲十几秒就耗光。
+            if (emaNetKB < emaBitrateKB * 0.95) {
+                insufficientStreak++;
+                if (insufficientSinceAt == 0) insufficientSinceAt = now;
+            } else {
                 insufficientStreak = 0;
-                maybeAutoCacheStart();
+                insufficientSinceAt = 0;
+            }
+            if (monSamples >= 2 && insufficientSinceAt > 0) {
+                long sustainedMs = now - insufficientSinceAt;
+                boolean severeSustained = sustainedMs >= INSUFFICIENT_CONFIRM_FAST_MS
+                        && emaNetKB < emaBitrateKB * 0.5;
+                boolean mildSustained = sustainedMs >= INSUFFICIENT_CONFIRM_MS;
+                if (severeSustained || mildSustained) {
+                    insufficientSinceAt = 0;
+                    insufficientStreak = 0;
+                    maybeAutoCacheStart();
+                }
             }
         } catch (Exception ignore) { }
     }
@@ -4843,8 +5052,17 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         int depthSec = (int) Math.max(30, Math.min(3600, Math.ceil(1800 * deficit)));
-        beginAutoCache(depthSec, "当前网速较慢（" + Math.round(emaNetKB) + "KB/s，频道码率 "
+        beginAutoCache(depthSec, "网速持续偏慢（" + Math.round(emaNetKB) + "KB/s，频道码率 "
                 + Math.round(emaBitrateKB) + "KB/s）");
+    }
+
+    /** 卡顿确认（每秒时钟调用）：BUFFERING 持续满 2 秒才记一次真卡顿，然后做频率统计 */
+    private void confirmStall() {
+        if (stallStartedAt == 0) return;
+        long heldMs = System.currentTimeMillis() - stallStartedAt;
+        if (heldMs < 2000) return;
+        stallStartedAt = 0;   // 一次持续卡顿只计一次
+        recordStall();
     }
 
     /** 卡顿频率统计：5 分钟窗口内 ≥3 次即判定网络不稳定，触发自动缓存 */
@@ -4860,7 +5078,7 @@ public class MainActivity extends AppCompatActivity {
         double deficit = (emaBitrateKB > 40 && emaNetKB > 0)
                 ? Math.max(0.02, 1 - emaNetKB / emaBitrateKB) : 0.05;
         int depthSec = (int) Math.max(30, Math.min(3600, Math.ceil(1800 * deficit)));
-        beginAutoCache(depthSec, "该频道 5 分钟内卡顿 3 次以上，网络不稳定");
+        beginAutoCache(depthSec, "该频道反复卡顿（5 分钟内 3 次卡满 2 秒），网络不稳定");
     }
 
     /** 统一进入自动缓存：提示 → 深度覆盖 → 中继起录（等待期无画面无声音） */
@@ -4925,9 +5143,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void updateCacheOverlay(HlsRelay relay, long cachedMs, long wallMs) {
-        // 补缓存期间：进度按"本次已补量"算，不看累计已录
+        // 补缓存期间：进度按"本次已补量"算，不看累计已录；目标也用封顶后的深度
         long progressMs = refillBaseMs >= 0 ? Math.max(0, cachedMs - refillBaseMs) : cachedMs;
-        long target = Math.max(1000, cachePreloadTargetMs);
+        long target = Math.max(1000, refillBaseMs >= 0 && refillTargetMs > 0
+                ? refillTargetMs : cachePreloadTargetMs);
         long left = Math.max(0, target - progressMs);
         // 补缓存期间用"本次补货速度"算录制比（拿累计已录量除会得出巨大比值，警告永远不出现）
         double ratioBase = refillBaseMs >= 0 ? progressMs : cachedMs;
@@ -5016,6 +5235,7 @@ public class MainActivity extends AppCompatActivity {
         hideCacheOverlay();
         relayFinalized = false;
         refillStopAbsMs = -1;
+        refillTargetMs = 0;
         relayResumePosMs = -1;
         relayRewindCount = 0;
         relayStallToasted = false;
@@ -5074,6 +5294,7 @@ public class MainActivity extends AppCompatActivity {
         monMarkBytes = 0; monMarkContentMs = 0; monMarkWall = 0;
         monSamples = 0;
         insufficientStreak = 0;
+        insufficientSinceAt = 0;
         liveEverReady = false;
         liveStallTimes.clear();
 
@@ -5148,8 +5369,11 @@ public class MainActivity extends AppCompatActivity {
                 LogUtil.i("NewsLive", "onPlaybackStateChanged: " + playbackState + " url=" + url);
                 switch (playbackState) {
                     case Player.STATE_BUFFERING:
-                        // 统计卡顿频率：5 分钟内 ≥3 次也算不稳定，自动进缓存
-                        if (liveEverReady) recordStall();
+                        // 卡顿起点：由每秒时钟 confirmStall() 确认满 2 秒才记为真卡顿
+                        // （瞬时缓冲抖动和 re-prepare 连锁不应凑进卡顿频率误触发自动缓存）
+                        if (liveEverReady && stallStartedAt == 0) {
+                            stallStartedAt = System.currentTimeMillis();
+                        }
                         // 无缝预载进行中时不弹转圈：旧画面还在播，短暂缓冲不该打扰观看
                         if (!finalSilent && pendingPlayer == null) {
                             progressBar.setVisibility(View.VISIBLE);
@@ -5252,6 +5476,7 @@ public class MainActivity extends AppCompatActivity {
                         progressBar.setVisibility(View.GONE);
                         isPlaying = true;
                         liveEverReady = true;   // 起播成功后，后续 BUFFERING 才算"卡顿"
+                        stallStartedAt = 0;     // 卡顿结束：未确认的卡顿起点作废
                         // 本地中继：把起播位置钉在录制起点。直播语义下播放器默认会跳到列表尾部
                         if (relayPlaybackActive && relayStartSeekPending) {
                             relayStartSeekPending = false;
@@ -5728,22 +5953,29 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** 主动轮换（key养护）：key过期由数据源层透明重写（KeyRewritingDataSource）处理，
-     *  不再切换播放器实例；这里只负责定期通过静默刷新网页harvest新的签名key备胎 */
+     *  不再切换播放器实例；这里只负责定期通过静默刷新网页harvest新的签名key备胎。
+     *  录播会话（预缓存/补缓存期间播放器是停着的）也必须harvest：候选210秒过期、
+     *  key约3.5分钟失效，不续的话录制必断——这是"录几分钟就断源"的根源 */
     private void scheduleStreamRotation() {
         cancelStreamRotation();
         final Runnable[] holder = new Runnable[1];
         holder[0] = () -> {
             if (holder[0] != streamRotateRunnable) return; // 已被新的调度取代
-            if (player == null || playerContainer.getVisibility() != View.VISIBLE || !useWebMode) {
-                return; // 播放器已退出，停止轮换
-            }
-            if (player.isPlaying() && player.getPlaybackState() == Player.STATE_READY
-                    && keyRewriteCapable && currentPlayStartTime > 0
+            if (player == null || !useWebMode) return;
+            boolean relayAlive = activeRelay != null;
+            boolean playerVisible = playerContainer != null
+                    && playerContainer.getVisibility() == View.VISIBLE;
+            if (!relayAlive && !playerVisible) return; // 既没录播也没播放，无需养key
+            boolean playing = player.isPlaying()
+                    && player.getPlaybackState() == Player.STATE_READY;
+            if ((playing || relayAlive) && keyRewriteCapable && currentPlayStartTime > 0
                     && System.currentTimeMillis() - currentPlayStartTime > PREFETCH_AFTER_MS
                     && System.currentTimeMillis() - lastKeyHarvestTime > KEY_HARVEST_INTERVAL_MS) {
                 lastKeyHarvestTime = System.currentTimeMillis();
                 LogUtil.i("NewsLive", "Rotation: harvest fresh keys via silent web refresh");
                 refreshVideoFromWeb(true);
+                // harvest完不留网页后台解码（只限录播会话；正常播放由无缝切换自行收网页）
+                if (relayAlive) scheduleWebPauseAfterHarvest(20_000);
             }
             // 始终自续期（harvest完成后由本循环按间隔继续巡检）
             handler.postDelayed(holder[0], STREAM_ROTATE_INTERVAL_MS);
@@ -6738,6 +6970,7 @@ public class MainActivity extends AppCompatActivity {
     private void loadStreamFromConfig(int index) {
         // 换台：自动缓存重新武装（上一个频道的"不再触发"标记清掉）
         autoCachePrompted = false;
+        relayBailUrl = null;
         // 兼容节目单混合模式:从网页模式直接点播放器源时,先收起网页并初始化播放器
         // (此前该路径下 player==null 会导致 NPE 崩溃)
         if (useWebMode) {

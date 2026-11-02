@@ -140,6 +140,21 @@ public class HlsRelay {
 
     public String getSourceUrl() { return sourceUrl; }
 
+    /** 当前实际录制地址（可能已被 403 重写/重定向/换源过） */
+    public String getPlaylistUrl() { return playlistUrl; }
+
+    /**
+     * 断源续命：把录制目标换到同一直播流的新签名地址（auth_key 轮换/CDN 切换）。
+     * 与 403 时的 fixer 路径等效，但由宿主主动喂入——覆盖"连接正常但源冻结"
+     * 这类 fixer 永远不会被触发的情况。序号回退由既有的纪元偏移逻辑兜底。
+     */
+    public void setPlaylistUrl(String url) {
+        if (url == null || url.isEmpty() || url.equals(playlistUrl)) return;
+        this.playlistUrl = url;
+        this.lastError = "";
+        LogUtil.i(TAG, "relay retarget -> " + url);
+    }
+
     public boolean hasFirstSegment() { return readyFired; }
 
     public String getPlaylistText() { return playlistText; }
