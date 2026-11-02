@@ -323,6 +323,8 @@ public class MainActivity extends AppCompatActivity {
     private volatile boolean isAppInForeground = true;
     // 顶部信息横幅设置
     private android.view.View infoOverlay;
+    /** 横幅是否已挂到独立子面板窗口（防 WebView DRM 视频硬件叠加层遮挡） */
+    private boolean bannerWindowAttached = false;
     private boolean bannerVisible = true;
     private int bannerFontSize = 16;   // 基准字号 sp
     private int bannerHeight = 28;      // 横幅高度 dp
@@ -609,6 +611,9 @@ public class MainActivity extends AppCompatActivity {
         initOrientationListener();
         loadSavedConfig();
         applyBannerStyle();
+        // 横幅挪到独立子面板窗口：WebView DRM 视频的硬件叠加层会盖住应用内视图，
+        // 普通布局永远在视频之下（横幅"可见"但像素被顶掉），独立窗口才能常驻
+        attachBannerOverlayWindow();
         // 横幅尺寸变化（旋转/首帧布局/文字变化）时重新自适应字号
         if (infoOverlay != null) {
             infoOverlay.addOnLayoutChangeListener(
@@ -1323,6 +1328,15 @@ public class MainActivity extends AppCompatActivity {
             || lowerUrl.contains("cctv.cn")
             || (lowerUrl.contains("cctv") && lowerUrl.contains(".m3u8") && !lowerUrl.contains("cctvnews"));
         if (isCctvStream) {
+            // 竞态封堵：ExoPlayer 已在播/预载同频道的非DRM流时，后到的DRM嗅探
+            // 不能把画面切回网页——否则"有声无画"（声音在播放器，画面停在网页封面）。
+            // 换台到DRM频道的正常路径会先 stopAllPlayback（player 已停），不受影响
+            if (player != null
+                    && (player.isPlaying()
+                        || player.getPlaybackState() == Player.STATE_BUFFERING)) {
+                LogUtil.i("NewsLive", "skip keep-WebView flip: ExoPlayer already playing (race guard)");
+                return;
+            }
             LogUtil.i("NewsLive", "skip ExoPlayer for CCTV/DRM stream, keep WebView: " + videoUrl);
             // 确保WebView可见并触发自动播放
             if (webView != null) {
@@ -1576,10 +1590,21 @@ public class MainActivity extends AppCompatActivity {
         boolean portrait = getResources().getConfiguration().orientation == Configuration.ORIENTATION_PORTRAIT;
         float density = getResources().getDisplayMetrics().density;
         int heightPx = (int) (bannerHeight * (portrait ? 3 : 1) * density + 0.5f);
-        android.view.ViewGroup.LayoutParams lp = infoOverlay.getLayoutParams();
-        if (lp != null && lp.height != heightPx) {
-            lp.height = heightPx;
-            infoOverlay.setLayoutParams(lp);
+        if (bannerWindowAttached) {
+            // 独立窗口：高度走 WindowManager 参数
+            try {
+                WindowManager.LayoutParams lp = (WindowManager.LayoutParams) infoOverlay.getLayoutParams();
+                if (lp.height != heightPx) {
+                    lp.height = heightPx;
+                    getWindowManager().updateViewLayout(infoOverlay, lp);
+                }
+            } catch (Exception ignore) { }
+        } else {
+            android.view.ViewGroup.LayoutParams lp = infoOverlay.getLayoutParams();
+            if (lp != null && lp.height != heightPx) {
+                lp.height = heightPx;
+                infoOverlay.setLayoutParams(lp);
+            }
         }
         // 所有横幅文本强制单行，杜绝换行
         List<TextView> bannerTexts = new ArrayList<>();
@@ -1590,6 +1615,54 @@ public class MainActivity extends AppCompatActivity {
         applyBannerFontSizes();
         // 自适应：文字总宽超出横幅宽度时自动缩小字号（手机窄屏不再换行/截断）
         scheduleBannerAutoFit();
+    }
+
+    /**
+     * 把横幅挪进独立子面板窗口（TYPE_APPLICATION_SUB_PANEL，挂 Activity token，无需权限）。
+     * 原因：WebView 里 DRM 视频（CCTV1/2/4/5/7 等 tv.cctv.com 流）走硬件叠加层渲染，
+     * 会盖住应用窗口内的所有普通视图——横幅在视图层级里"可见"但像素被视频顶掉。
+     * 子面板窗口的合成层级高于应用窗口与视频叠加层，横幅才能在播放中常驻。
+     * Activity token 要到窗口附上之后才有，未就绪时延迟重试。
+     */
+    private void attachBannerOverlayWindow() {
+        if (bannerWindowAttached || infoOverlay == null || getWindow() == null) return;
+        android.os.IBinder token = getWindow().getDecorView().getApplicationWindowToken();
+        if (token == null) {
+            handler.postDelayed(this::attachBannerOverlayWindow, 300);
+            return;
+        }
+        ViewGroup parent = (ViewGroup) infoOverlay.getParent();
+        if (parent != null) parent.removeView(infoOverlay);
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                infoOverlay.getHeight() > 0 ? infoOverlay.getHeight() : 100,
+                WindowManager.LayoutParams.TYPE_APPLICATION_SUB_PANEL,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                android.graphics.PixelFormat.TRANSLUCENT);
+        lp.token = token;
+        lp.gravity = android.view.Gravity.TOP;
+        try {
+            getWindowManager().addView(infoOverlay, lp);
+            bannerWindowAttached = true;
+            applyBannerStyle();
+            LogUtil.i("NewsLive", "横幅已挂到子面板窗口（防WebView视频叠加层遮挡）");
+        } catch (Exception e) {
+            LogUtil.e("NewsLive", "横幅窗口挂载失败，回退应用内布局", e);
+            ViewGroup root = (ViewGroup) findViewById(R.id.root_layout);
+            if (root != null) root.addView(infoOverlay);
+            bannerWindowAttached = false;
+            applyBannerStyle();
+        }
+    }
+
+    private void detachBannerOverlayWindow() {
+        if (!bannerWindowAttached || infoOverlay == null) return;
+        try {
+            getWindowManager().removeView(infoOverlay);
+        } catch (Exception ignore) { }
+        bannerWindowAttached = false;
     }
 
     /** 按当前自适应缩放比例设置横幅各文字字号 */
@@ -7608,6 +7681,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        try { detachBannerOverlayWindow(); } catch (Exception ignore) { }
         try { stopRelaySession(); } catch (Exception ignore) { }
         try {
             ScreenRecorder sr = screenRecorder;
