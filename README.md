@@ -75,6 +75,11 @@ Android TV / 手机直播应用 + Windows 桌面源筛选工具。App 聚合央�
 - 旧版 gitee raw 地址（`.../raw/master/tv-live-source.json`）已内置迁移逻辑，升级 App 后自动切到新地址
 - 也支持局域网下发：任意静态 HTTP 服务指向该文件，App 远程 URL 填 `http://<PC_IP>:<端口>/tv_live_config.json`（App 已允许明文 HTTP）
 
+### 应用自更新
+- 每次启动 1 分钟后自动检查 GitHub Releases：发现新版本弹窗提示，确认后后台下载，完成后提示安装（需在系统里允许"安装未知来源应用"）
+- 下载线路按地区自动排序：国内优先代理镜像（ghfast.top / mirror.ghproxy.com / github.moeyy.xyz），逐线路超时回退，GitHub 直连兜底；区域检测结果缓存 1 小时
+- 配置页「🔄 检查应用更新」按钮可手动触发；HTTP 接口 `/check_update?force=1` 强制重下最新包（同版本重装可用于修复）
+
 ## IPTV 源筛选工具（Windows 桌面版）
 
 仓库 `iptv_tool/` 目录，单文件免安装 exe（PyInstaller 打包），双击即用。

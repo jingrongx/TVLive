@@ -335,6 +335,8 @@ public class MainActivity extends AppCompatActivity {
     private volatile boolean isAppInForeground = true;
     // 顶部信息横幅设置
     private android.view.View infoOverlay;
+    /** 应用自更新流程进行中（防重复弹窗/重复下载） */
+    private volatile boolean updateFlowRunning = false;
     private boolean bannerVisible = true;
     private int bannerFontSize = 16;   // 基准字号 sp
     private int bannerHeight = 28;      // 横幅高度 dp
@@ -630,6 +632,8 @@ public class MainActivity extends AppCompatActivity {
                 (v, l, t, r, b, ol, ot, or2, ob) -> scheduleBannerAutoFit());
         }
         startHttpServer();
+        // 应用自更新：启动1分钟后自动检查一次（避免与起播抢带宽），有新版弹窗提示
+        handler.postDelayed(() -> startUpdateFlow(false), 60_000);
         // 实时速度显示:每 5 秒刷新频道信息栏(速度+稳定性分)
         Runnable speedTicker = new Runnable() {
             @Override
@@ -4588,6 +4592,87 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // ---------------------------------------------------------------- 应用自更新
+
+    /** 启动 60 秒后自动检查一次；配置页「检查应用更新」可手动触发（force=强制重下最新包） */
+    private void startUpdateFlow(final boolean force) {
+        if (updateFlowRunning) {
+            Toast.makeText(this, "更新检查已在进行中", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        updateFlowRunning = true;
+        executorService.execute(() -> {
+            try {
+                String current = AppUpdater.currentVersion(getApplicationContext());
+                String latest = AppUpdater.fetchLatestVersion();
+                if (latest == null) {
+                    handler.post(() -> {
+                        updateFlowRunning = false;
+                        Toast.makeText(MainActivity.this, "检查更新失败：无法连接版本服务",
+                                Toast.LENGTH_LONG).show();
+                    });
+                    return;
+                }
+                if (!force && !AppUpdater.isNewer(latest, current)) {
+                    handler.post(() -> {
+                        updateFlowRunning = false;
+                        if (force) {
+                            Toast.makeText(MainActivity.this, "已是最新版本 v" + current,
+                                    Toast.LENGTH_SHORT).show();
+                        }
+                    });
+                    return;
+                }
+                handler.post(() -> {
+                    if (isFinishing()) { updateFlowRunning = false; return; }
+                    new android.app.AlertDialog.Builder(MainActivity.this)
+                            .setTitle("发现新版本 v" + latest)
+                            .setMessage("当前 v" + current + "。将自动后台下载"
+                                    + "（国内优先代理线路，完成后提示安装）。")
+                            .setPositiveButton("开始下载", (d, w) -> {
+                                Toast.makeText(MainActivity.this,
+                                        "开始后台下载 v" + latest + "…", Toast.LENGTH_SHORT).show();
+                                executorService.execute(() -> {
+                                    File apk = AppUpdater.downloadApk(getApplicationContext(),
+                                            latest, (pct, totalMb) -> {
+                                                if (pct == 50) {
+                                                    handler.post(() -> Toast.makeText(
+                                                            MainActivity.this,
+                                                            "更新下载中 " + pct + "%（约" + totalMb + "MB）",
+                                                            Toast.LENGTH_SHORT).show());
+                                                }
+                                            });
+                                    handler.post(() -> {
+                                        updateFlowRunning = false;
+                                        if (isFinishing()) return;
+                                        if (apk == null) {
+                                            Toast.makeText(MainActivity.this,
+                                                    "更新下载失败（所有线路均不通），可稍后重试或到 Releases 页手动下载",
+                                                    Toast.LENGTH_LONG).show();
+                                            return;
+                                        }
+                                        new android.app.AlertDialog.Builder(MainActivity.this)
+                                                .setTitle("更新包已下载")
+                                                .setMessage("v" + latest + " 下载完成，是否立即安装？"
+                                                        + "（安装过程中应用会重启）")
+                                                .setPositiveButton("立即安装",
+                                                        (d2, w2) -> AppUpdater.installApk(
+                                                                MainActivity.this, apk))
+                                                .setNegativeButton("稍后", null)
+                                                .show();
+                                    });
+                                });
+                            })
+                            .setNegativeButton("暂不更新", (d, w) -> updateFlowRunning = false)
+                            .show();
+                });
+            } catch (Exception e) {
+                LogUtil.e("NewsLive", "update flow error", e);
+                handler.post(() -> updateFlowRunning = false);
+            }
+        });
+    }
+
     /** 底部控制条：开始 / 停止录制（播放器模式与网页模式都支持） */
     private void toggleRecording() {
         if (screenRecorder != null) {
@@ -7951,6 +8036,12 @@ public class MainActivity extends AppCompatActivity {
                 } else if (request != null && request.startsWith("GET") && request.contains("/scan_status")) {
                     String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + scanStatusJson;
                     client.getOutputStream().write(response.getBytes());
+                } else if (request != null && request.startsWith("GET") && request.contains("/check_update")) {
+                    // 手动触发应用自更新（配置页按钮）；force=1 时同版本也重下重装（修复用）
+                    final boolean forceUpdate = request.contains("force=1");
+                    runOnUiThread(() -> startUpdateFlow(forceUpdate));
+                    String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n{\"status\":\"ok\",\"msg\":\"已在电视上开始检查，有新版本时将弹窗提示\"}";
+                    client.getOutputStream().write(response.getBytes());
                 } else {
                     String html = getHtmlPage();
                     String response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + html;
@@ -8111,7 +8202,7 @@ public class MainActivity extends AppCompatActivity {
                 "</div>" +
                 "<div class='buffer-inputs' style='margin-top:6px'>" +
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>网页DRM频道清晰度上限（低配盒子选标清/流畅，硬解稳的电视选不限制）</label><select id='webVideoQualityCap' style='width:100%'>" + webVideoQualityCapOptions() + "</select></div>" +
-                "<div></div>" +
+                "<div><button class='btn-fetch' style='width:100%' onclick=\"fetch('/check_update?force=0').then(r=>r.json()).then(d=>alert(d.msg)).catch(e=>alert('触发失败:'+e))\">🔄 检查应用更新</button></div>" +
                 "</div>" +
                 "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上。弱网(200~400KB/s)建议码率1000左右，起播缓冲8000~10000；码率会自动限制多码率频道的最高画质，网络差时自动降档。<br><b>先录后看</b>：切台后先录，录够「录多久后开始看」才开始播放，<b>并且从录制起点开始播</b>——画面永远落后直播这么多（屏幕左下角常驻「录播 · 落后直播 X」标志，追到直播边缘会变成「直播」）。录制期间按 OK 可随时从录制起点提前开看。<br><b>滚动录制</b>：像行车记录仪一样一直录，录满自动覆盖最旧的。占用按 <b>源码率 × 时长</b> 计算：60KB/s 约 211MB/小时，171KB/s（CCTV1）约 601MB/小时。空间不足会自动缩短并在遮罩上提示。</div>" +
                 "<label><input type='checkbox' id='recordManual' " + (recordManual ? "checked" : "") + "> 手动控制录制（勾选后切台不自动录，由底部控制条「录制」按钮开始）</label>" +
