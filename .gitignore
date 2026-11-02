@@ -46,3 +46,4 @@ iptv_tool/dist/
 iptv_tool/output/
 iptv_tool/.venv_gui/
 iptv_tool/*.spec
+.release-dl/
