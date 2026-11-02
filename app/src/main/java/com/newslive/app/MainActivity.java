@@ -1337,6 +1337,11 @@ public class MainActivity extends AppCompatActivity {
                 LogUtil.i("NewsLive", "skip keep-WebView flip: ExoPlayer already playing (race guard)");
                 return;
             }
+            // DRM页面已全屏在播：每10秒的嗅探都会走到这里，重注入CSS/点播放/重启
+            // 检查链全是重复开销（渲染主线程已被解码顶满，样式抖动直接掉帧），跳过
+            if (isWebVideoFullscreenRequested) {
+                return;
+            }
             LogUtil.i("NewsLive", "skip ExoPlayer for CCTV/DRM stream, keep WebView: " + videoUrl);
             // 确保WebView可见并触发自动播放
             if (webView != null) {
@@ -6348,6 +6353,14 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void run() {
                 if (webView == null) return;
+                // 页面加载期间渲染器忙是常态（重页面要几十秒），JS回询迟响应≠挂起；
+                // 此期间不做挂起累计，否则加载到一半被误判重建、页面从头再来
+                if (isWebViewLoading) {
+                    stallCheckPending = false;
+                    stallHungCount = 0;
+                    handler.postDelayed(this, WEB_STALL_CHECK_INTERVAL);
+                    return;
+                }
                 if (stallCheckPending) {
                     // 上一轮查询迟迟没有回调：渲染进程可能已挂起/崩溃
                     stallHungCount++;
@@ -6472,6 +6485,8 @@ public class MainActivity extends AppCompatActivity {
         isWebViewLoading = true;
         webViewLoadStartTime = System.currentTimeMillis();
         webViewRetryCount = 0;
+        // 新页面加载：全屏CSS状态复位（页面内样式元素已随旧页面销毁，需重新注入）
+        isWebVideoFullscreenRequested = false;
 
         webView.resumeTimers();
         webView.onResume();
