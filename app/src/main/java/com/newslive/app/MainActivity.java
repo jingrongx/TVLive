@@ -177,6 +177,18 @@ public class MainActivity extends AppCompatActivity {
     private boolean recordBtnRecording = false;
     /** 起播前预缓存分钟数，0=关闭（直接播，退回原来的短缓冲行为） */
     private int cachePreloadMin = 60;
+    private static final String KEY_WEB_VIDEO_QUALITY_CAP = "web_video_quality_cap";
+    /** 网页DRM流清晰度上限（td<ud<md<hd），空=不限制。低配盒子软解高清吃力时压档保流畅 */
+    private String webVideoQualityCap = "";
+    /** 清晰度档位表：数值小=更流畅。未收录的档位不参与改写 */
+    private static final java.util.Map<String, Integer> VARIANT_TIER = new java.util.HashMap<>();
+    static {
+        VARIANT_TIER.put("td", 0);
+        VARIANT_TIER.put("ud", 1);
+        VARIANT_TIER.put("sd", 1);
+        VARIANT_TIER.put("md", 2);
+        VARIANT_TIER.put("hd", 3);
+    }
     /** 滚动录制时长（分钟），行车记录仪式：录满覆盖最旧。0=仅按预缓存时长 */
     private int relayRecordMin = 360;
     private volatile HlsRelay activeRelay;
@@ -1422,6 +1434,7 @@ public class MainActivity extends AppCompatActivity {
         isOrientationLocked = prefs.getBoolean(KEY_LOCK_ORIENTATION, false);
         backgroundPlay = prefs.getBoolean(KEY_BACKGROUND_PLAY, false);
         currentSiteIndex = prefs.getInt(KEY_CURRENT_SITE_INDEX, 0);
+        webVideoQualityCap = prefs.getString(KEY_WEB_VIDEO_QUALITY_CAP, "");
 
         loadWebSites();
 
@@ -3227,6 +3240,18 @@ public class MainActivity extends AppCompatActivity {
                     boolean isStream = lower.endsWith(".m3u8") || lower.contains(".m3u8?")
                         || lower.endsWith(".mp4") || lower.contains(".mp4?")
                         || lower.endsWith(".flv") || lower.contains(".flv?");
+                    // 网页DRM流清晰度上限：低配盒子软解高清吃力，按配置把更高档位的
+                    // 播放列表请求改写到上限档（分片URI已绝对化，后续分片直接命中上限档）
+                    if (isStream && lower.contains(".m3u8") && !webVideoQualityCap.isEmpty()
+                            && (lower.contains("cdrm") || lower.contains("kcdnvip") || lower.contains("cctv.cn"))) {
+                        String capped = capStreamVariantUrl(url, webVideoQualityCap);
+                        if (capped != null) {
+                            LogUtil.i("NewsLive", "清晰度上限(" + webVideoQualityCap + "): " + url
+                                    + " -> " + capped);
+                            WebResourceResponse cappedResp = fetchCappedPlaylist(capped);
+                            if (cappedResp != null) return cappedResp;
+                        }
+                    }
                     if (isStream) {
                         long now = System.currentTimeMillis();
                         // 防抖：切换频道后允许第一次嗅探，之后10秒内不重复触发（避免master+子流重复）
@@ -4490,6 +4515,77 @@ public class MainActivity extends AppCompatActivity {
         File[] kids = f.listFiles();
         if (kids != null) for (File k : kids) deleteTree(k);
         f.delete();
+    }
+
+    /** 配置页的清晰度上限下拉选项（按当前值选中） */
+    private String webVideoQualityCapOptions() {
+        String[][] opts = {{"", "不限制（按页面自适应）"}, {"td", "流畅 td"}, {"ud", "低清 ud"}, {"md", "标清 md"}, {"hd", "高清 hd"}};
+        StringBuilder sb = new StringBuilder();
+        for (String[] o : opts) {
+            sb.append("<option value='").append(o[0]).append("'");
+            if (o[0].equals(webVideoQualityCap)) sb.append(" selected");
+            sb.append(">").append(o[1]).append("</option>");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 把网页播放器请求的 DRM 播放列表档位压到配置上限：BR=hd 的请求在 cap=md 时改写为
+     * BR=md。返回改写后的URL；无需改写（未设上限/档位不高于上限/档位未知）返回 null。
+     */
+    private String capStreamVariantUrl(String url, String cap) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("[?&]BR=([a-z]+)").matcher(url);
+        if (!m.find()) return null;
+        Integer curTier = VARIANT_TIER.get(m.group(1));
+        Integer capTier = VARIANT_TIER.get(cap);
+        if (curTier == null || capTier == null || curTier <= capTier) return null;
+        return url.substring(0, m.start(1)) + cap + url.substring(m.end(1));
+    }
+
+    /**
+     * 取改写后档位的播放列表并返回给 WebView：分片URI全部绝对化（基于改写后档位的
+     * 地址解析，分片才能落到正确的档位目录）。失败返回 null，调用方回退直连原始请求。
+     */
+    private WebResourceResponse fetchCappedPlaylist(String url) {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(10000);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
+            conn.setRequestProperty("Referer", "https://tv.cctv.com/");
+            int code = conn.getResponseCode();
+            if (code != 200) return null;
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
+            StringBuilder sb = new StringBuilder(4096);
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (!line.isEmpty() && line.charAt(0) != '#') {
+                    sb.append(resolveUrl(url, line)).append('\n');
+                } else {
+                    sb.append(line).append('\n');
+                }
+            }
+            r.close();
+            byte[] body = sb.toString().getBytes("UTF-8");
+            return new WebResourceResponse("application/vnd.apple.mpegurl", "utf-8",
+                    new java.io.ByteArrayInputStream(body));
+        } catch (Exception e) {
+            LogUtil.w("NewsLive", "清晰度上限取流失败，回退原始请求: " + e);
+            return null;
+        } finally {
+            try { if (conn != null) conn.disconnect(); } catch (Exception ignore) { }
+        }
+    }
+
+    private static String resolveUrl(String base, String uri) {
+        try {
+            if (uri.startsWith("http://") || uri.startsWith("https://")) return uri;
+            return new URL(new URL(base), uri).toString();
+        } catch (Exception e) {
+            return uri;
+        }
     }
 
     /** 底部控制条：开始 / 停止录制（播放器模式与网页模式都支持） */
@@ -7243,6 +7339,11 @@ public class MainActivity extends AppCompatActivity {
                 backgroundPlay = config.optBoolean("backgroundPlay", false);
                 prefs.edit().putBoolean(KEY_BACKGROUND_PLAY, backgroundPlay).apply();
             }
+            if (config.has("webVideoQualityCap")) {
+                String cap = config.optString("webVideoQualityCap", "");
+                webVideoQualityCap = VARIANT_TIER.containsKey(cap) ? cap : "";
+                prefs.edit().putString(KEY_WEB_VIDEO_QUALITY_CAP, webVideoQualityCap).apply();
+            }
             if (config.has("bannerVisible")) {
                 bannerVisible = config.optBoolean("bannerVisible", true);
                 prefs.edit().putBoolean(KEY_BANNER_VISIBLE, bannerVisible).apply();
@@ -8008,6 +8109,10 @@ public class MainActivity extends AppCompatActivity {
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>预计占用（按 60KB/s 估算）</label><input type='text' id='relayDiskEst' disabled></div>" +
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>磁盘剩余</label><input type='text' value='" + relayFreeMb() + " MB' disabled></div>" +
                 "</div>" +
+                "<div class='buffer-inputs' style='margin-top:6px'>" +
+                "<div><label style='display:block;font-size:12px;margin-bottom:4px'>网页DRM频道清晰度上限（低配盒子选标清/流畅，硬解稳的电视选不限制）</label><select id='webVideoQualityCap' style='width:100%'>" + webVideoQualityCapOptions() + "</select></div>" +
+                "<div></div>" +
+                "</div>" +
                 "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上。弱网(200~400KB/s)建议码率1000左右，起播缓冲8000~10000；码率会自动限制多码率频道的最高画质，网络差时自动降档。<br><b>先录后看</b>：切台后先录，录够「录多久后开始看」才开始播放，<b>并且从录制起点开始播</b>——画面永远落后直播这么多（屏幕左下角常驻「录播 · 落后直播 X」标志，追到直播边缘会变成「直播」）。录制期间按 OK 可随时从录制起点提前开看。<br><b>滚动录制</b>：像行车记录仪一样一直录，录满自动覆盖最旧的。占用按 <b>源码率 × 时长</b> 计算：60KB/s 约 211MB/小时，171KB/s（CCTV1）约 601MB/小时。空间不足会自动缩短并在遮罩上提示。</div>" +
                 "<label><input type='checkbox' id='recordManual' " + (recordManual ? "checked" : "") + "> 手动控制录制（勾选后切台不自动录，由底部控制条「录制」按钮开始）</label>" +
                 "<div class='tip'>" + audioCaptureHint() + "</div>" +
@@ -8140,7 +8245,7 @@ public class MainActivity extends AppCompatActivity {
                 "  }).catch(e=>{box.innerHTML='<span style=\"color:#C62828\">查询失败: '+e+'</span>';});" +
                 "}" +
                 "function calcDisk(){var m=parseInt(document.getElementById('relayRecordMin').value)||0;var mb=Math.round(m*3.52);document.getElementById('relayDiskEst').value=m?(mb+' MB ≈ '+(mb/1024).toFixed(2)+' GB（按60KB/s）'):'未启用';}" +
-                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,startBuffer:parseInt(document.getElementById('startBuffer').value)||8000,cachePreloadMin:parseInt(document.getElementById('cachePreloadMin').value)||0,relayRecordMin:parseInt(document.getElementById('relayRecordMin').value)||0,recordManual:document.getElementById('recordManual').checked,maxVideoBitrate:(parseInt(document.getElementById('maxBitrate').value)||1000)*1000,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,backgroundPlay:document.getElementById('backgroundPlay').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};var msg=document.getElementById('saveMsg');msg.textContent='⏳ 正在保存…';msg.style.color='#1565c0';fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){var e='❌ 保存失败: '+(x.error||'未知错误')+' (请截图此行反馈)';msg.textContent=e;msg.style.color='#c62828';alert(e);}else{msg.textContent='✅ 保存成功 '+new Date().toLocaleTimeString();msg.style.color='#2e7d32';}}).catch(e=>{var t='❌ 保存失败: '+e;msg.textContent=t;msg.style.color='#c62828';alert(t);});}" +
+                "function saveConfig(){var d={sources:sources,websites:websites,remoteUrl:document.getElementById('remoteUrl').value,autoUpdate:document.getElementById('autoUpdate').checked,bufferMin:parseInt(document.getElementById('bufferMin').value)||5000,bufferMax:parseInt(document.getElementById('bufferMax').value)||30000,startBuffer:parseInt(document.getElementById('startBuffer').value)||8000,cachePreloadMin:parseInt(document.getElementById('cachePreloadMin').value)||0,relayRecordMin:parseInt(document.getElementById('relayRecordMin').value)||0,recordManual:document.getElementById('recordManual').checked,maxVideoBitrate:(parseInt(document.getElementById('maxBitrate').value)||1000)*1000,webVideoQualityCap:document.getElementById('webVideoQualityCap').value,useWebMode:document.getElementById('useWebMode').checked,playerModeEnabled:document.getElementById('playerModeEnabled').checked,backgroundPlay:document.getElementById('backgroundPlay').checked,bannerVisible:document.getElementById('bannerVisible').checked,bannerAutoFit:document.getElementById('bannerAutoFit').checked,bannerFontSize:parseInt(document.getElementById('bannerFontSize').value)||13,bannerHeight:parseInt(document.getElementById('bannerHeight').value)||28,manualLocation:document.getElementById('manualLocation').value};var msg=document.getElementById('saveMsg');msg.textContent='⏳ 正在保存…';msg.style.color='#1565c0';fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(r=>r.json()).then(x=>{if(x.status==='error'){var e='❌ 保存失败: '+(x.error||'未知错误')+' (请截图此行反馈)';msg.textContent=e;msg.style.color='#c62828';alert(e);}else{msg.textContent='✅ 保存成功 '+new Date().toLocaleTimeString();msg.style.color='#2e7d32';}}).catch(e=>{var t='❌ 保存失败: '+e;msg.textContent=t;msg.style.color='#c62828';alert(t);});}" +
                 "renderSources();" +
                 "renderWebsites();" +
                 "calcDisk();" +

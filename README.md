@@ -136,6 +136,7 @@ pyinstaller --onefile --noconsole --clean --name IPTVSourceTool --icon app.ico m
 | `cachePreloadMin` | **录多久后开始看（分钟，默认 60，最大 1440）**：切台先录，录够后**从录制起点开始播**，画面永远落后直播这么多；左下角常驻「● 缓存 HH:MM:SS」角标（落后量=缓存深度），缓存快见底自动补货并回到原观看点续播。录制期间按 OK 可从起点提前开看 |
 | `relayRecordMin` | **滚动录制总时长（分钟，默认 360=6h，最大 1440=24h，0=预缓存+10）**，需大于上一项；行车记录仪式覆盖最旧。占用 ≈ 源码率 × 时长：60KB/s 约 211MB/小时，171KB/s（CCTV1）约 601MB/小时；空间不足自动缩短并提示 |
 | `recordManual` | **手动控制录制**（默认 true）：勾选时切台不自动录，由底部控制条「录制」按钮开始；false=切台自动录制 |
+| `webVideoQualityCap` | **网页DRM频道清晰度上限**（默认空=不限制）：`td`/`ud`/`md`/`hd`。低配盒子软解 DRM 高清吃力时设为 `md`（标清）或 `td`（流畅），App 在网络层把页面播放器请求的更高档位播放列表自动改写到上限档；硬解稳的电视留空即可 |
 | `bannerVisible` | 顶部信息横幅显隐 |
 | `bannerFontSize` / `bannerHeight` | 横幅字号基准（9-18）与单行高度（20-60dp） |
 | `manualLocation` | 手动地区（**留空=自动IP定位**；需能查到真实天气才生效，查不到会提示且不保存） |
