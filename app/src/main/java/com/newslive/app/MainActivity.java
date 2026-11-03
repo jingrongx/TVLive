@@ -3150,6 +3150,24 @@ public class MainActivity extends AppCompatActivity {
         settings.setAllowFileAccessFromFileURLs(true);
         settings.setAllowUniversalAccessFromFileURLs(true);
 
+        // 文档创建时立即禁用WebRTC：央视频道的P2P模块会发起STUN/ICE打洞风暴（日志刷屏
+        // 的stun_port/socket_manager错误），叠加播放器JS把渲染主线程吃到100%饱和，
+        // 硬解码器喂数被饿死（media.metrics实测单次4秒延迟尖峰）→ 视频周期性卡顿。
+        // 本地播放走CDN的HLS流，P2P纯属浪费；文档创建时置空构造器让P2P SDK走禁用分支。
+        // 必须用document-start注入，晚于页面脚本执行就拦不住SDK初始化
+        try {
+            androidx.webkit.WebViewCompat.addDocumentStartJavaScript(webView,
+                "(function(){try{window.RTCPeerConnection=undefined;"
+                    + "window.webkitRTCPeerConnection=undefined;"
+                    + "window.RTCDataChannel=undefined;"
+                    + "if(window.navigator&&navigator.mediaDevices){"
+                    + "try{navigator.mediaDevices.getUserMedia=undefined;}catch(e){}}"
+                    + "}catch(e){}})();",
+                java.util.Collections.singleton("*"));
+        } catch (Exception e) {
+            LogUtil.e("NewsLive", "addDocumentStartJavaScript failed", e);
+        }
+
         // 电视遥控器焦点导航支持
         webView.setFocusable(true);
         webView.setFocusableInTouchMode(true);
