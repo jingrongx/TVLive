@@ -394,6 +394,8 @@ public class MainActivity extends AppCompatActivity {
     private static final int STALL_REFRESH_COOLDOWN_MS = 30000; // 刷新冷却30秒，避免连续刷新
     private long lastStallRefreshTime = 0;
     private boolean isWebVideoFullscreenRequested = false;
+    /** 旋转后延迟重注入全屏样式的任务（持有引用以便撤销上一次未执行的回调） */
+    private Runnable webFullscreenReapplyTask;
     private int fullscreenRetryCount = 0; // 网页视频未就绪时的全屏CSS重试次数
     // 刷新后兜底定时器：如果视频长时间未恢复播放，再次刷新
     private Runnable webRefreshFallbackRunnable;
@@ -6402,39 +6404,41 @@ public class MainActivity extends AppCompatActivity {
                 && infoOverlay.getHeight() > 0) {
             topPx = infoOverlay.getHeight();
         }
-        // 对指定document注入video全屏样式；iframe里的video还要把iframe元素本身拉全屏
+        // 对指定document注入video全屏样式；iframe里的video还要把iframe元素本身拉全屏。
+        // 注意：iframe文档内部一律用 top:0 / 100vh——iframe元素本身已经定位到横幅下方，
+        // 内部再偏移一次会"二次扣减"横幅高度（画面偏下且变矮）
         String js = "(function(){try{" +
             "var TOP=" + topPx + ";" +
             "var VH='calc(100vh - '+TOP+'px)';" +
-            "function styleVideo(doc){" +
+            "function styleVideo(doc,T,H){" +
             "  try{var v=doc.querySelector('video');if(!v)return false;" +
             "  var st=doc.getElementById('news-live-fullscreen-style');" +
             "  if(!st){st=doc.createElement('style');st.id='news-live-fullscreen-style';" +
-            "    st.textContent='video{position:fixed!important;top:'+TOP+'px!important;left:0!important;" +
-            "width:100vw!important;height:'+VH+'!important;min-width:100vw!important;min-height:'+VH+'!important;" +
-            "max-width:100vw!important;max-height:'+VH+'!important;z-index:2147483647!important;" +
+            "    (doc.head||doc.documentElement).appendChild(st);}" +
+            "  st.textContent='video{position:fixed!important;top:'+T+'px!important;left:0!important;" +
+            "width:100vw!important;height:'+H+'!important;min-width:100vw!important;min-height:'+H+'!important;" +
+            "max-width:100vw!important;max-height:'+H+'!important;z-index:2147483647!important;" +
             "object-fit:contain!important;background:#000000!important;outline:none!important;border:none!important;}" +
             "video::-webkit-media-controls{display:none!important;}" +
             "html,body{margin:0!important;padding:0!important;overflow:hidden!important;background:#000!important;}';" +
-            "    (doc.head||doc.documentElement).appendChild(st);}" +
             "  var el=v.parentNode;var n=0;" +
             "  while(el&&el!==doc.body&&n<20){" +
-            "    el.style.position='fixed';el.style.top=TOP+'px';el.style.left='0';" +
-            "    el.style.width='100vw';el.style.height=VH;" +
+            "    el.style.position='fixed';el.style.top=T+'px';el.style.left='0';" +
+            "    el.style.width='100vw';el.style.height=H;" +
             "    el.style.zIndex='2147483646';el.style.background='#000000';el.style.overflow='hidden';" +
             "    el=el.parentNode;n++;}" +
-            "  v.style.position='fixed';v.style.top=TOP+'px';v.style.left='0';" +
-            "  v.style.width='100vw';v.style.height=VH;" +
+            "  v.style.position='fixed';v.style.top=T+'px';v.style.left='0';" +
+            "  v.style.width='100vw';v.style.height=H;" +
             "  v.style.zIndex='2147483647';v.style.objectFit='contain';v.style.background='#000000';" +
             "  var ch=doc.body?doc.body.children:null;" +
             "  if(ch){for(var i=0;i<ch.length;i++){var c=ch[i];if(c===v)continue;if(!c.contains(v)){c.style.display='none';}}}" +
             "  return true;" +
             "  }catch(e){return false;}}" +
-            "var ok=styleVideo(document);" +
+            "var ok=styleVideo(document,TOP,VH);" +
             "var frames=document.querySelectorAll('iframe');" +
             "for(var i=0;i<frames.length;i++){" +
             "  try{var fd=frames[i].contentDocument;if(!fd)continue;" +
-            "    if(styleVideo(fd)){" +
+            "    if(styleVideo(fd,0,'100vh')){" +
             "      var f=frames[i];" +
             "      f.style.setProperty('position','fixed','important');f.style.setProperty('top',TOP+'px','important');" +
             "      f.style.setProperty('left','0','important');f.style.setProperty('width','100vw','important');" +
@@ -7945,6 +7949,24 @@ public class MainActivity extends AppCompatActivity {
         if (currentVideoWidth > 0 && currentVideoHeight > 0) {
             updateVideoLayout(currentVideoWidth, currentVideoHeight);
         }
+        // 全屏CSS里的顶部偏移是注入时横幅高度的像素快照（vh/vw会自动跟随旋转，偏移不会）。
+        // 竖屏横幅三行/横屏单行，高度差异很大，必须按新方向的横幅高度重新注入，
+        // 否则视频被钉在旧偏移位置（横屏画面偏下+大黑边）。延迟等横幅完成重排再取高度
+        if (useWebMode && webView != null && isWebVideoFullscreenRequested) {
+            if (webFullscreenReapplyTask == null) {
+                webFullscreenReapplyTask = this::reapplyWebVideoFullscreen;
+            }
+            handler.removeCallbacks(webFullscreenReapplyTask);
+            handler.postDelayed(webFullscreenReapplyTask, 600);
+        }
+    }
+
+    /** 旋转后按新方向的横幅高度重新注入网页视频全屏样式（顶部偏移是写死的像素值，必须刷新） */
+    private void reapplyWebVideoFullscreen() {
+        if (webView == null || !useWebMode) return;
+        isWebVideoFullscreenRequested = false;
+        fullscreenRetryCount = 0;
+        requestWebVideoFullscreen(false);
     }
 
     private class SimpleHttpServer extends Thread {
