@@ -1322,7 +1322,10 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    private void switchToPlayerMode(String videoUrl) {
+    private void switchToPlayerMode(String rawVideoUrl) {
+        // cdrm流规整（去BR/b变体参数）必须先于去重判断，否则嗅探地址与当前地址
+        // "看似不同实则相同"，会造成每10秒一次的无谓重prepare
+        String videoUrl = normalizeCdrmUrlForExo(rawVideoUrl);
         if (videoUrl == null || videoUrl.isEmpty()) return;
         // 播放器模式下拒绝网页嗅探/JS桥触发的切换（页面已暂停理论上不会触发，防御历史回调）
         if (!useWebMode) {
@@ -1345,14 +1348,11 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        // CCTV的流含cdrm(DRM加密)，ExoPlayer无法解密；kcdnvip域名的流也常解码失败。
-        // 这些流交给WebView自带播放器播放（网页有解密逻辑），不切换到ExoPlayer，避免黑屏。
+        // kcdnvip域名的流常解码失败，交给WebView自带播放器播放，避免黑屏。
         // 注意：cctvnews.cctv.com（央视新闻直播）的流可以被ExoPlayer正常播放，不在此列。
-        String lowerUrl = videoUrl.toLowerCase();
-        boolean isCctvStream = lowerUrl.contains("cdrm")
-            || lowerUrl.contains("kcdnvip")
-            || lowerUrl.contains("cctv.cn")
-            || (lowerUrl.contains("cctv") && lowerUrl.contains(".m3u8") && !lowerUrl.contains("cctvnews"));
+        // 央视tv.cctv.com直播CDN的cdrm路径流实测未加密（无EXT-X-KEY），走ExoPlayer硬解，
+        // 见shouldKeepInWebView注释。
+        boolean isCctvStream = shouldKeepInWebView(videoUrl);
         if (isCctvStream) {
             // 竞态封堵：ExoPlayer 已在播/预载同频道的非DRM流时，后到的DRM嗅探
             // 不能把画面切回网页——否则"有声无画"（声音在播放器，画面停在网页封面）。
@@ -3271,6 +3271,13 @@ public class MainActivity extends AppCompatActivity {
                         || lower.contains("imasdk") || lower.contains("pubmatic") || lower.contains("rubiconproject")) {
                         return new WebResourceResponse("text/plain", "utf-8", new java.io.ByteArrayInputStream("".getBytes()));
                     }
+                    // 央视P2P加速SDK（hlsp2p.js）：与RTCPeerConnection禁用双保险。SDK加载失败时
+                    // 播放器走CDN分支直播，消除STUN/ICE打洞与P2P线程的CPU占用——document-start
+                    // 注入覆盖不到的执行环境（iframe/worker）靠这里兜底
+                    if (lower.contains("hlsp2p")) {
+                        LogUtil.d("NewsLive", "blocked P2P sdk: " + url);
+                        return new WebResourceResponse("text/plain", "utf-8", new java.io.ByteArrayInputStream("".getBytes()));
+                    }
                     boolean isStream = lower.endsWith(".m3u8") || lower.contains(".m3u8?")
                         || lower.endsWith(".mp4") || lower.contains(".mp4?")
                         || lower.endsWith(".flv") || lower.contains(".flv?");
@@ -3828,11 +3835,11 @@ public class MainActivity extends AppCompatActivity {
                         boolean isDirectLink = videoUrl.contains(".m3u8") || videoUrl.contains(".mp4") || videoUrl.contains(".flv") || videoUrl.contains(".ts");
                         if (!videoUrl.isEmpty() && isDirectLink) {
                             // CCTV的DRM流ExoPlayer无法解密，交给WebView播放器播放
-                            // 注意：cctvnews.cctv.com（央视新闻直播）的流可以被ExoPlayer正常播放
-                            String lowerVid = videoUrl.toLowerCase();
-                            boolean isCctv = lowerVid.contains("cdrm") || lowerVid.contains("kcdnvip")
-                                || lowerVid.contains("cctv.cn")
-                                || (lowerVid.contains("cctv") && lowerVid.contains(".m3u8") && !lowerVid.contains("cctvnews"));
+                            // 注意：cctvnews.cctv.com（央视新闻直播）的流可以被ExoPlayer正常播放；
+                            // cdrm路径的央视流实测未加密，仍走ExoPlayer硬解（见shouldKeepInWebView）
+                            // 规整cdrm地址须先于幂等判断，原因同switchToPlayerMode
+                            final String exoUrl = normalizeCdrmUrlForExo(videoUrl);
+                            boolean isCctv = shouldKeepInWebView(exoUrl);
                             if (isCctv) {
                                 LogUtil.i("NewsLive", "extractAndPlay: keep WebView for CCTV/DRM stream: " + videoUrl);
                                 autoClickPlayButton();
@@ -3855,7 +3862,7 @@ public class MainActivity extends AppCompatActivity {
                             runOnUiThread(() -> {
                                 // 幂等保护：嗅探/JS桥/本轮询三条链路都会在页面视频就绪时触发切换，
                                 // 后到的必须跳过——否则刚播放几秒就会被重复stop+prepare卡一下（每次进入必现）
-                                if (player != null && videoUrl.equals(currentVideoUrl)
+                                if (player != null && exoUrl.equals(currentVideoUrl)
                                         && (player.isPlaying()
                                             || player.getPlaybackState() == Player.STATE_BUFFERING)) {
                                     LogUtil.i("NewsLive", "extract: same url already playing, skip duplicate switch");
@@ -3864,7 +3871,7 @@ public class MainActivity extends AppCompatActivity {
                                 if (wasSilentRefresh && keyRewriteCapable
                                         && player != null && player.isPlaying()) {
                                     // 数据源层支持key透明重写：本次刷新只为harvest，画面不动
-                                    completeSilentRefreshAsHarvest(videoUrl);
+                                    completeSilentRefreshAsHarvest(exoUrl);
                                     return;
                                 }
                                 webView.setVisibility(View.GONE);
@@ -3882,9 +3889,9 @@ public class MainActivity extends AppCompatActivity {
                                 // 静默网页刷新恢复的流：无感切换，不闪进度条/控制面板
                                 if (wasSilentRefresh) {
                                     silentRefreshPending = false;
-                                    playVideoUrlSilent(videoUrl, finalPageName);
+                                    playVideoUrlSilent(exoUrl, finalPageName);
                                 } else {
-                                    playVideoUrl(videoUrl, finalPageName);
+                                    playVideoUrl(exoUrl, finalPageName);
                                 }
                             });
                         } else if (retryCount < maxRetries) {
@@ -5833,6 +5840,12 @@ public class MainActivity extends AppCompatActivity {
 
                 LogUtil.e("NewsLive", "onPlayerError: " + error.getMessage() + " errorCode=" + error.errorCode + " cause=" + (error.getCause() != null ? error.getCause().getMessage() : "null"), error);
 
+                // cdrm流ExoPlayer解不动（真加密/特殊编码）：失败满2次拉黑前缀并回退网页，
+                // 避免重试→刷新→再嗅探→再交ExoPlayer的循环空转
+                if (isCdrmPlainHlsUrl(url) && isDecoderFatalError(error)) {
+                    onCdrmExoFatal(url);
+                }
+
                 // CCTV直播流403：auth_key配额/有效期耗尽，同一URL重试必然失败。
                 // 优先使用网页嗅探到的新地址（新auth_key）直接切换，秒级恢复；
                 // 没有可用候选地址时才回退到静默刷新网页重新获取。
@@ -6673,6 +6686,106 @@ public class MainActivity extends AppCompatActivity {
         String lower = url.toLowerCase();
         return lower.contains("cdrm") || lower.contains("kcdnvip")
             || (lower.contains("cctv") && lower.contains(".m3u8") && !lower.contains("cctvnews"));
+    }
+
+    /**
+     * 网页嗅探到的直链流是否继续留在WebView播放（true=ExoPlayer不接）。
+     * 央视tv.cctv.com直播CDN路径（…/ld?cctvwbcd/cdrmldcctvN_x/…m3u8）虽含"cdrm"字样，
+     * 但实测播放列表无EXT-X-KEY、分片是标准H.264/AAC TS，CDN也无鉴权——"cdrm"只是
+     * CDN目录的历史命名，并非真DRM。这类流交给WebView只会触发P2P+软解风暴
+     * （渲染主线程100%、周期性卡顿），必须走ExoPlayer硬解。
+     * ExoPlayer实测解不动的地址前缀进会话级黑名单，回退网页（真加密流兜底）。
+     */
+    private boolean shouldKeepInWebView(String url) {
+        if (url == null || url.isEmpty()) return false;
+        if (isCdrmPlainHlsUrl(url)) {
+            return cdrmExoFailedPrefixes.contains(cdrmUrlPrefix(url));
+        }
+        String lower = url.toLowerCase();
+        return lower.contains("kcdnvip")
+            || lower.contains("cctv.cn")
+            || (lower.contains("cctv") && lower.contains(".m3u8") && !lower.contains("cctvnews"));
+    }
+
+    /** 央视直播CDN的cdrm目录命名流（URL含cdrm的m3u8）。实测未加密，可由ExoPlayer硬解 */
+    private boolean isCdrmPlainHlsUrl(String url) {
+        if (url == null) return false;
+        String lower = url.toLowerCase();
+        return lower.contains("cdrm") && lower.contains(".m3u8");
+    }
+
+    /** cdrm地址的去参数前缀：同一播放列表的不同变体/轮换地址共享同一个前缀 */
+    private String cdrmUrlPrefix(String url) {
+        int q = url.indexOf('?');
+        return q > 0 ? url.substring(0, q) : url;
+    }
+
+    /**
+     * cdrm流交给ExoPlayer前的地址规整：央视wbcd CDN的变体选择参数（BR=档位 / b=带宽区间）
+     * 是网页播放器的选档逻辑，ExoPlayer不需要——剥掉后回master播放列表，由ExoPlayer
+     * 按带宽ABR+maxVideoBitrate自选档位（硬解下还能吃满高清）。已设网页清晰度上限时
+     * 保持嗅探地址不变（嗅探请求已被shouldInterceptRequest改写到上限档）。
+     * 仅限wbcd CDN路径，避免误伤其他CDN的同名参数（可能承担鉴权）。
+     */
+    private String normalizeCdrmUrlForExo(String url) {
+        if (url == null || !isCdrmPlainHlsUrl(url) || !webVideoQualityCap.isEmpty()
+                || !url.toLowerCase().contains("wbcd")) {
+            return url;
+        }
+        try {
+            android.net.Uri u = android.net.Uri.parse(url);
+            java.util.Set<String> names = u.getQueryParameterNames();
+            if (names.isEmpty() || (!names.contains("BR") && !names.contains("b"))) return url;
+            android.net.Uri.Builder nb = u.buildUpon().clearQuery();
+            for (String p : names) {
+                if (!p.equalsIgnoreCase("BR") && !p.equals("b")) {
+                    nb.appendQueryParameter(p, u.getQueryParameter(p));
+                }
+            }
+            return nb.toString();
+        } catch (Exception e) {
+            return url;
+        }
+    }
+
+    /** ExoPlayer解不动的cdrm地址前缀（会话级黑名单），命中后该前缀回退WebView播放 */
+    private final java.util.Set<String> cdrmExoFailedPrefixes =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+    private final java.util.Map<String, Integer> cdrmExoFailCounts = new java.util.HashMap<>();
+
+    /**
+     * cdrm流在ExoPlayer上出现解码/封装层致命错误：计一次失败，满2次拉黑前缀并回退网页。
+     * 满2次才拉黑：单次DECODING_FAILED可能是瞬时坏分片，不至于判死刑。
+     */
+    private void onCdrmExoFatal(String url) {
+        String prefix = cdrmUrlPrefix(url);
+        int fails;
+        synchronized (cdrmExoFailCounts) {
+            Integer n = cdrmExoFailCounts.get(prefix);
+            fails = n == null ? 0 : n;
+            cdrmExoFailCounts.put(prefix, fails + 1);
+        }
+        if (fails + 1 >= 2) {
+            LogUtil.w("NewsLive", "cdrm stream unplayable by ExoPlayer, blacklist prefix and fallback to web: " + prefix);
+            cdrmExoFailedPrefixes.add(prefix);
+            if (useWebMode) {
+                refreshVideoFromWeb(false);
+            }
+        }
+    }
+
+    /** 解码器/解封装层致命错误（流内容ExoPlayer解不动，与网络类错误相对） */
+    private boolean isDecoderFatalError(PlaybackException error) {
+        int code = error.errorCode;
+        return code == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED
+            || code == PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED
+            || code == PlaybackException.ERROR_CODE_DECODING_FAILED
+            || code == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES
+            || code == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED
+            || code == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED
+            || code == PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED
+            || code == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED
+            || code == PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED;
     }
 
     /** 停止WebView视频卡顿检测 */
