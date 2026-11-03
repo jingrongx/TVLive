@@ -337,6 +337,16 @@ public class MainActivity extends AppCompatActivity {
     private android.view.View infoOverlay;
     /** 应用自更新流程进行中（防重复弹窗/重复下载） */
     private volatile boolean updateFlowRunning = false;
+    // 应用自更新状态机（配置页更新区块轮询 /update_status 内联显示；后台定时检测自动下载）
+    private static final int UPDATE_IDLE = 0, UPDATE_CHECKING = 1,
+            UPDATE_DOWNLOADING = 2, UPDATE_READY = 3, UPDATE_ERROR = 4;
+    private volatile int updateState = UPDATE_IDLE;
+    private volatile String updateStateMsg = "";
+    private volatile int updateProgressPct = 0;
+    private volatile String updateLatestVersion = null;
+    private volatile File updateApkFile = null;
+    private volatile String updateStatusJson =
+            "{\"state\":\"idle\",\"has_update\":false,\"pct\":0,\"latest\":\"\",\"current\":\"\",\"msg\":\"\"}";
     private boolean bannerVisible = true;
     private int bannerFontSize = 16;   // 基准字号 sp
     private int bannerHeight = 28;      // 横幅高度 dp
@@ -394,8 +404,6 @@ public class MainActivity extends AppCompatActivity {
     private static final int STALL_REFRESH_COOLDOWN_MS = 30000; // 刷新冷却30秒，避免连续刷新
     private long lastStallRefreshTime = 0;
     private boolean isWebVideoFullscreenRequested = false;
-    /** 旋转后延迟重注入全屏样式的任务（持有引用以便撤销上一次未执行的回调） */
-    private Runnable webFullscreenReapplyTask;
     private int fullscreenRetryCount = 0; // 网页视频未就绪时的全屏CSS重试次数
     // 刷新后兜底定时器：如果视频长时间未恢复播放，再次刷新
     private Runnable webRefreshFallbackRunnable;
@@ -626,16 +634,18 @@ public class MainActivity extends AppCompatActivity {
         loadSavedConfig();
         applyBannerStyle();
         // 注：横幅不能用独立窗口压在 WebView 视频上——Amlogic 盒子上视频硬件叠加层与
-        // 额外窗口层会互相抢占，视频在"平面合成/GPU合成"间翻转导致卡顿。改为让全屏
-        // 视频从横幅下方开始（见 requestWebVideoFullscreen 的顶部偏移），二者互不重叠
+        // 额外窗口层会互相抢占，视频在"平面合成/GPU合成"间翻转导致卡顿。横幅保持普通
+        // 视图悬浮在视频上方（v1.0.80 起全屏视频不再让位横幅，避免画面比例/位置变化）
         // 横幅尺寸变化（旋转/首帧布局/文字变化）时重新自适应字号
         if (infoOverlay != null) {
             infoOverlay.addOnLayoutChangeListener(
                 (v, l, t, r, b, ol, ot, or2, ob) -> scheduleBannerAutoFit());
         }
         startHttpServer();
-        // 应用自更新：启动1分钟后自动检查一次（避免与起播抢带宽），有新版弹窗提示
-        handler.postDelayed(() -> startUpdateFlow(false), 60_000);
+        // 应用自更新：启动1分钟后自动检查一次（避免与起播抢带宽），之后每6小时
+        // 定时静默检测；发现新版自动后台下载，完成弹「立即安装」一键弹窗
+        handler.postDelayed(() -> runUpdateFlowAsync(false), 60_000);
+        schedulePeriodicUpdateCheck();
         // 实时速度显示:每 5 秒刷新频道信息栏(速度+稳定性分)
         Runnable speedTicker = new Runnable() {
             @Override
@@ -4596,83 +4606,144 @@ public class MainActivity extends AppCompatActivity {
 
     // ---------------------------------------------------------------- 应用自更新
 
-    /** 启动 60 秒后自动检查一次；配置页「检查应用更新」可手动触发（force=强制重下最新包） */
-    private void startUpdateFlow(final boolean force) {
+    /** 更新状态同步到 JSON（配置页更新区块轮询 /update_status 用） */
+    private synchronized void setUpdateState(int state, String msg, int pct) {
+        updateState = state;
+        updateStateMsg = msg == null ? "" : msg;
+        updateProgressPct = pct;
+        String s = "idle";
+        if (state == UPDATE_CHECKING) s = "checking";
+        else if (state == UPDATE_DOWNLOADING) s = "downloading";
+        else if (state == UPDATE_READY) s = "ready";
+        else if (state == UPDATE_ERROR) s = "error";
+        updateStatusJson = "{\"state\":\"" + s + "\",\"has_update\":" + (updateLatestVersion != null)
+                + ",\"pct\":" + pct
+                + ",\"latest\":" + jsonEscape(updateLatestVersion)
+                + ",\"current\":" + jsonEscape(AppUpdater.currentVersion(getApplicationContext()))
+                + ",\"msg\":" + jsonEscape(updateStateMsg) + "}";
+    }
+
+    private static String jsonEscape(String s) {
+        if (s == null) return "\"\"";
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\r", " ").replace("\n", " ") + "\"";
+    }
+
+    /**
+     * 更新流程总入口：检查 → 发现新版直接自动后台下载（不再先弹确认框）→
+     * 下载完成弹「立即安装」一键弹窗。manual=true 时检查结果用 Toast 兜底提示；
+     * 后台定时检测传 false（静默检查，只有新版下载完成才弹窗打扰）。
+     */
+    private void runUpdateFlowAsync(final boolean manual) {
+        if (isFinishing() || isDestroyed()) return;
         if (updateFlowRunning) {
-            Toast.makeText(this, "更新检查已在进行中", Toast.LENGTH_SHORT).show();
+            if (manual) Toast.makeText(this, "更新检查已在进行中", Toast.LENGTH_SHORT).show();
             return;
         }
         updateFlowRunning = true;
         executorService.execute(() -> {
             try {
-                String current = AppUpdater.currentVersion(getApplicationContext());
-                String latest = AppUpdater.fetchLatestVersion();
-                if (latest == null) {
-                    handler.post(() -> {
-                        updateFlowRunning = false;
-                        Toast.makeText(MainActivity.this, "检查更新失败：无法连接版本服务",
-                                Toast.LENGTH_LONG).show();
-                    });
-                    return;
-                }
-                if (!force && !AppUpdater.isNewer(latest, current)) {
-                    handler.post(() -> {
-                        updateFlowRunning = false;
-                        if (force) {
-                            Toast.makeText(MainActivity.this, "已是最新版本 v" + current,
-                                    Toast.LENGTH_SHORT).show();
-                        }
-                    });
-                    return;
-                }
-                handler.post(() -> {
-                    if (isFinishing()) { updateFlowRunning = false; return; }
-                    new android.app.AlertDialog.Builder(MainActivity.this)
-                            .setTitle("发现新版本 v" + latest)
-                            .setMessage("当前 v" + current + "。将自动后台下载"
-                                    + "（国内优先代理线路，完成后提示安装）。")
-                            .setPositiveButton("开始下载", (d, w) -> {
-                                Toast.makeText(MainActivity.this,
-                                        "开始后台下载 v" + latest + "…", Toast.LENGTH_SHORT).show();
-                                executorService.execute(() -> {
-                                    File apk = AppUpdater.downloadApk(getApplicationContext(),
-                                            latest, (pct, totalMb) -> {
-                                                if (pct == 50) {
-                                                    handler.post(() -> Toast.makeText(
-                                                            MainActivity.this,
-                                                            "更新下载中 " + pct + "%（约" + totalMb + "MB）",
-                                                            Toast.LENGTH_SHORT).show());
-                                                }
-                                            });
-                                    handler.post(() -> {
-                                        updateFlowRunning = false;
-                                        if (isFinishing()) return;
-                                        if (apk == null) {
-                                            Toast.makeText(MainActivity.this,
-                                                    "更新下载失败（所有线路均不通），可稍后重试或到 Releases 页手动下载",
-                                                    Toast.LENGTH_LONG).show();
-                                            return;
-                                        }
-                                        new android.app.AlertDialog.Builder(MainActivity.this)
-                                                .setTitle("更新包已下载")
-                                                .setMessage("v" + latest + " 下载完成，是否立即安装？"
-                                                        + "（安装过程中应用会重启）")
-                                                .setPositiveButton("立即安装",
-                                                        (d2, w2) -> AppUpdater.installApk(
-                                                                MainActivity.this, apk))
-                                                .setNegativeButton("稍后", null)
-                                                .show();
-                                    });
-                                });
-                            })
-                            .setNegativeButton("暂不更新", (d, w) -> updateFlowRunning = false)
-                            .show();
-                });
+                String latest = checkForUpdateSync(manual);
+                if (latest != null) downloadAndOfferInstall(latest);
             } catch (Exception e) {
                 LogUtil.e("NewsLive", "update flow error", e);
-                handler.post(() -> updateFlowRunning = false);
+                setUpdateState(UPDATE_ERROR, "更新流程异常：" + e.getMessage(), 0);
+            } finally {
+                updateFlowRunning = false;
             }
         });
+    }
+
+    /** 检查最新版本（worker 线程调用）。有新版返回版本号；失败/已最新返回 null 并置好状态 */
+    private String checkForUpdateSync(boolean manual) {
+        setUpdateState(UPDATE_CHECKING, "正在检查更新…", 0);
+        String current = AppUpdater.currentVersion(getApplicationContext());
+        String latest = AppUpdater.fetchLatestVersion();
+        if (latest == null) {
+            setUpdateState(UPDATE_ERROR, "检查更新失败：无法连接版本服务", 0);
+            if (manual) handler.post(() -> Toast.makeText(MainActivity.this,
+                    "检查更新失败：无法连接版本服务", Toast.LENGTH_LONG).show());
+            return null;
+        }
+        updateLatestVersion = latest;
+        if (!AppUpdater.isNewer(latest, current)) {
+            setUpdateState(UPDATE_IDLE, "已是最新版本 v" + current, 0);
+            if (manual) handler.post(() -> Toast.makeText(MainActivity.this,
+                    "已是最新版本 v" + current, Toast.LENGTH_SHORT).show());
+            return null;
+        }
+        // 置为非终态（checking）+提示文案：页面轮询只在 ready/error/idle+有文案 时停止，
+        // 避免"发现新版本"与"开始下载"之间的间隙被页面误判为流程结束
+        setUpdateState(UPDATE_CHECKING, "发现新版本 v" + latest + "（当前 v" + current + "），准备下载…", 0);
+        return latest;
+    }
+
+    /** 后台下载指定版本，完成后弹「立即安装」弹窗（worker 线程调用） */
+    private void downloadAndOfferInstall(final String latest) {
+        // 同版本安装包已在本地：跳过下载直接进入可安装状态
+        if (updateApkFile != null && updateApkFile.exists()
+                && updateApkFile.getName().contains(latest)) {
+            setUpdateState(UPDATE_READY, "v" + latest + " 安装包已就绪", 100);
+            handler.post(this::showInstallReadyDialog);
+            return;
+        }
+        setUpdateState(UPDATE_DOWNLOADING, "开始后台下载 v" + latest + "…", 0);
+        handler.post(() -> {
+            if (!isFinishing()) Toast.makeText(MainActivity.this,
+                    "发现新版本 v" + latest + "，开始后台下载…", Toast.LENGTH_SHORT).show();
+        });
+        File apk = AppUpdater.downloadApk(getApplicationContext(), latest, (pct, totalMb) -> {
+            setUpdateState(UPDATE_DOWNLOADING, "下载中 v" + latest + "（约" + totalMb + "MB）", pct);
+            if (pct == 50) {
+                handler.post(() -> {
+                    if (!isFinishing()) Toast.makeText(MainActivity.this,
+                            "更新下载中 50%（约" + totalMb + "MB）", Toast.LENGTH_SHORT).show();
+                });
+            }
+        });
+        if (apk == null) {
+            setUpdateState(UPDATE_ERROR, "更新下载失败（所有线路均不通），可稍后重试", 0);
+            handler.post(() -> {
+                if (!isFinishing()) Toast.makeText(MainActivity.this,
+                        "更新下载失败（所有线路均不通），可稍后重试或到 Releases 页手动下载",
+                        Toast.LENGTH_LONG).show();
+            });
+            return;
+        }
+        updateApkFile = apk;
+        setUpdateState(UPDATE_READY, "v" + latest + " 下载完成，可安装", 100);
+        handler.post(this::showInstallReadyDialog);
+    }
+
+    /** 下载完成后的一键安装弹窗（主线程调用） */
+    private void showInstallReadyDialog() {
+        if (isFinishing() || isDestroyed()) return;
+        File apk = updateApkFile;
+        if (apk == null || !apk.exists()) return;
+        new android.app.AlertDialog.Builder(MainActivity.this)
+                .setTitle("更新已就绪")
+                .setMessage("新版本安装包已后台下载完成，是否立即安装？（安装过程中应用会重启）")
+                .setPositiveButton("立即安装", (d, w) -> installReadyUpdate())
+                .setNegativeButton("稍后", null)
+                .show();
+    }
+
+    /** 一键安装已下载好的更新包（弹窗/配置页更新区块均可触发） */
+    private void installReadyUpdate() {
+        File apk = updateApkFile;
+        if (apk == null || !apk.exists()) {
+            Toast.makeText(this, "安装包未就绪，请先检查更新", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        AppUpdater.installApk(this, apk);
+    }
+
+    /** 后台定时检测循环：每 6 小时静默检查一次，发现新版自动下载并提示安装 */
+    private void schedulePeriodicUpdateCheck() {
+        handler.postDelayed(() -> {
+            runUpdateFlowAsync(false);
+            schedulePeriodicUpdateCheck();
+        }, 6 * 3600_000L);
     }
 
     /** 底部控制条：开始 / 停止录制（播放器模式与网页模式都支持） */
@@ -6397,13 +6468,9 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         isWebVideoFullscreenRequested = true;
-        // 顶部偏移：横幅独占顶部条，全屏视频从横幅下方开始——视频硬件叠加层与横幅
-        // 无交集，既不互相遮挡也不会引发合成模式翻转（Amlogic 上翻转=卡顿）
+        // 横幅按原方案悬浮在视频上方（普通视图直接覆盖）：全屏视频从 0 开始铺满，
+        // 不让位横幅——让位方案会把横幅高度写死进 CSS，旋转后画面位置/比例全乱
         int topPx = 0;
-        if (infoOverlay != null && infoOverlay.getVisibility() == View.VISIBLE
-                && infoOverlay.getHeight() > 0) {
-            topPx = infoOverlay.getHeight();
-        }
         // 对指定document注入video全屏样式；iframe里的video还要把iframe元素本身拉全屏。
         // 注意：iframe文档内部一律用 top:0 / 100vh——iframe元素本身已经定位到横幅下方，
         // 内部再偏移一次会"二次扣减"横幅高度（画面偏下且变矮）
@@ -7949,24 +8016,6 @@ public class MainActivity extends AppCompatActivity {
         if (currentVideoWidth > 0 && currentVideoHeight > 0) {
             updateVideoLayout(currentVideoWidth, currentVideoHeight);
         }
-        // 全屏CSS里的顶部偏移是注入时横幅高度的像素快照（vh/vw会自动跟随旋转，偏移不会）。
-        // 竖屏横幅三行/横屏单行，高度差异很大，必须按新方向的横幅高度重新注入，
-        // 否则视频被钉在旧偏移位置（横屏画面偏下+大黑边）。延迟等横幅完成重排再取高度
-        if (useWebMode && webView != null && isWebVideoFullscreenRequested) {
-            if (webFullscreenReapplyTask == null) {
-                webFullscreenReapplyTask = this::reapplyWebVideoFullscreen;
-            }
-            handler.removeCallbacks(webFullscreenReapplyTask);
-            handler.postDelayed(webFullscreenReapplyTask, 600);
-        }
-    }
-
-    /** 旋转后按新方向的横幅高度重新注入网页视频全屏样式（顶部偏移是写死的像素值，必须刷新） */
-    private void reapplyWebVideoFullscreen() {
-        if (webView == null || !useWebMode) return;
-        isWebVideoFullscreenRequested = false;
-        fullscreenRetryCount = 0;
-        requestWebVideoFullscreen(false);
     }
 
     private class SimpleHttpServer extends Thread {
@@ -8058,11 +8107,20 @@ public class MainActivity extends AppCompatActivity {
                 } else if (request != null && request.startsWith("GET") && request.contains("/scan_status")) {
                     String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + scanStatusJson;
                     client.getOutputStream().write(response.getBytes());
-                } else if (request != null && request.startsWith("GET") && request.contains("/check_update")) {
-                    // 手动触发应用自更新（配置页按钮）；force=1 时同版本也重下重装（修复用）
-                    final boolean forceUpdate = request.contains("force=1");
-                    runOnUiThread(() -> startUpdateFlow(forceUpdate));
-                    String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n{\"status\":\"ok\",\"msg\":\"已在电视上开始检查，有新版本时将弹窗提示\"}";
+                } else if (request != null && request.startsWith("GET") && request.contains("/update_status")) {
+                    // 配置页更新区块轮询：内联显示检查/下载进度/可安装状态
+                    String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n" + updateStatusJson;
+                    client.getOutputStream().write(response.getBytes());
+                } else if (request != null && request.startsWith("GET") && request.contains("/update_install")) {
+                    // 配置页「立即安装」按钮：拉起系统安装器
+                    runOnUiThread(() -> installReadyUpdate());
+                    String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n{\"status\":\"ok\",\"msg\":\"已拉起系统安装\"}";
+                    client.getOutputStream().write(response.getBytes());
+                } else if (request != null && request.startsWith("GET")
+                        && (request.contains("/update_check") || request.contains("/check_update"))) {
+                    // 配置页「检查更新」按钮：触发完整流程（检查→发现新版自动下载→可安装）
+                    runOnUiThread(() -> runUpdateFlowAsync(true));
+                    String response = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n\r\n{\"status\":\"ok\",\"msg\":\"已开始检查\"}";
                     client.getOutputStream().write(response.getBytes());
                 } else {
                     String html = getHtmlPage();
@@ -8166,6 +8224,12 @@ public class MainActivity extends AppCompatActivity {
                 "<div class='tip'>💡 按住卡片左上角 ☰ 手柄上下拖动调整顺序（仅手柄区域可拖动） | 频道+/-切换网站</div>" +
                 "<div class='network-status " + (isNetworkAvailable ? "network-ok" : "network-error") + "'>" +
                 "网络状态: " + (isNetworkAvailable ? "✅ 已连接" : "❌ 未连接") + "</div>" +
+                "<div class='section' style='background:#FFF8E1;border:1px solid #FF9800'>" +
+                "<div class='section-title'>🔄 应用更新</div>" +
+                "<div class='btn-group'><button class='btn-fetch' id='updBtn' style='min-width:150px' onclick='updateCheckStart()'>🔄 检查更新</button>" +
+                "<span class='tip' style='margin-left:8px'>当前版本 v" + AppUpdater.currentVersion(MainActivity.this) + "</span></div>" +
+                "<div id='updStatus' class='tip' style='text-align:left'>点「检查更新」：有新版本会自动后台下载，下载完成后出现「立即安装」按钮，点一下即完成。</div>" +
+                "</div>" +
                 "<div class='group-header'>🌐 网页浏览区</div>" +
                 "<div class='section web-mode-section'>" +
                 "<div class='section-title'>🌐 网页模式 <span class='status-badge " + (useWebMode ? "status-on" : "status-off") + "'>" + (useWebMode ? "已启用" : "已禁用") + "</span></div>" +
@@ -8224,7 +8288,6 @@ public class MainActivity extends AppCompatActivity {
                 "</div>" +
                 "<div class='buffer-inputs' style='margin-top:6px'>" +
                 "<div><label style='display:block;font-size:12px;margin-bottom:4px'>网页DRM频道清晰度上限（低配盒子选标清/流畅，硬解稳的电视选不限制）</label><select id='webVideoQualityCap' style='width:100%'>" + webVideoQualityCapOptions() + "</select></div>" +
-                "<div><button class='btn-fetch' style='width:100%' onclick=\"fetch('/check_update?force=0').then(r=>r.json()).then(d=>alert(d.msg)).catch(e=>alert('触发失败:'+e))\">🔄 检查应用更新</button></div>" +
                 "</div>" +
                 "<div class='tip'>缓冲越大越流畅，建议最小10000，最大60000以上。弱网(200~400KB/s)建议码率1000左右，起播缓冲8000~10000；码率会自动限制多码率频道的最高画质，网络差时自动降档。<br><b>先录后看</b>：切台后先录，录够「录多久后开始看」才开始播放，<b>并且从录制起点开始播</b>——画面永远落后直播这么多（屏幕左下角常驻「录播 · 落后直播 X」标志，追到直播边缘会变成「直播」）。录制期间按 OK 可随时从录制起点提前开看。<br><b>滚动录制</b>：像行车记录仪一样一直录，录满自动覆盖最旧的。占用按 <b>源码率 × 时长</b> 计算：60KB/s 约 211MB/小时，171KB/s（CCTV1）约 601MB/小时。空间不足会自动缩短并在遮罩上提示。</div>" +
                 "<label><input type='checkbox' id='recordManual' " + (recordManual ? "checked" : "") + "> 手动控制录制（勾选后切台不自动录，由底部控制条「录制」按钮开始）</label>" +
@@ -8265,6 +8328,32 @@ public class MainActivity extends AppCompatActivity {
                 "var websites=" + webSitesJson.toString() + ";" +
                 "var draggedItem=null;" +
                 "var srcPage=0;var srcFilter='';var SRC_PAGE_SIZE=20;" +
+                "var updTimer=null;" +
+                "function updateCheckStart(){" +
+                "  var btn=document.getElementById('updBtn'),st=document.getElementById('updStatus');" +
+                "  btn.disabled=true;btn.textContent='检查中…';st.textContent='正在检查更新…';" +
+                "  fetch('/update_check').catch(function(e){st.textContent='触发失败:'+e;btn.disabled=false;});" +
+                "  if(updTimer)clearInterval(updTimer);" +
+                "  updTimer=setInterval(pollUpdateStatus,1000);" +
+                "}" +
+                "function pollUpdateStatus(){" +
+                "  fetch('/update_status').then(function(r){return r.json()}).then(function(d){" +
+                "    var st=document.getElementById('updStatus'),btn=document.getElementById('updBtn');" +
+                "    if(d.state=='checking'){st.textContent='正在检查更新…';}" +
+                "    else if(d.state=='downloading'){st.textContent=(d.msg||'正在下载更新包')+' '+d.pct+'%';}" +
+                "    else if(d.state=='ready'){" +
+                "      clearInterval(updTimer);btn.disabled=false;btn.textContent='🔄 重新检查';" +
+                "      st.innerHTML='<button class=\"btn-add\" onclick=\"updateInstall()\">⬇ 立即安装 v'+(d.latest||'')+'</button>'+(d.msg?'<div style=\"margin-top:6px\">'+d.msg+'</div>':'');" +
+                "    }" +
+                "    else if(d.state=='error'){clearInterval(updTimer);btn.disabled=false;btn.textContent='🔄 重新检查';st.textContent=d.msg||'检查失败，请重试';}" +
+                "    else if(d.msg){clearInterval(updTimer);btn.disabled=false;btn.textContent='🔄 重新检查';st.textContent=d.msg;}" +
+                "  }).catch(function(e){});" +
+                "}" +
+                "function updateInstall(){" +
+                "  var st=document.getElementById('updStatus');" +
+                "  st.textContent='正在拉起系统安装…（若未响应，请检查是否允许「安装未知来源应用」）';" +
+                "  fetch('/update_install').catch(function(e){st.textContent='拉起失败:'+e});" +
+                "}" +
                 "function renderSources(){" +
                 "  var list=[];" +
                 "  for(var i=0;i<sources.length;i++){" +
