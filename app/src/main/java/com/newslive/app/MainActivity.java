@@ -3738,7 +3738,18 @@ public class MainActivity extends AppCompatActivity {
             "}" +
             "" +
             "checkVideos();" +
-            "setInterval(function(){ checkVideos(); }, 800);" +
+            // 800ms轮询只在起播阶段需要（找video/自动播放/全屏）。视频稳定播放后必须自停：
+            // 央视DRM流在页面主线程跑JS解复用+解密（WebView83老V8上吃满一核勉强跟上直播），
+            // 本轮询每次都要querySelectorAll+遍历iframe，与喂数抢同一条主线程切片，
+            // MSE缓冲被挤到见底就是可见的周期性卡顿（readyState 4↔1抖动实测）。
+            // 停轮询后由事件监听器（play/pause/ended）+MutationObserver兜底，页面重载会重新注入
+            "var __nlHealthy=0;" +
+            "var __nlTimer=setInterval(function(){ checkVideos();" +
+            "  var v=document.querySelector('video');" +
+            "  var ifs=document.querySelectorAll('iframe');" +
+            "  for(var i=0;i<ifs.length;i++){try{var iv=ifs[i].contentDocument&&ifs[i].contentDocument.querySelector('video');if(iv){v=iv;break;}}catch(e){}}" +
+            "  if(v && !v.paused && v.readyState>=3 && v.currentTime>0){ if(++__nlHealthy>=3){ clearInterval(__nlTimer); } } else { __nlHealthy=0; }" +
+            "}, 800);" +
             "for (var _i = 1; _i <= 10; _i++) { setTimeout(tryAutoplayAll, _i * 600); }" +
             "" +
             "var observer = new MutationObserver(function(mutations) {" +
