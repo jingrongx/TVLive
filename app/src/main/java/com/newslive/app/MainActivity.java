@@ -8289,6 +8289,7 @@ public class MainActivity extends AppCompatActivity {
                 ".network-error{background:#FFEBEE;color:#C62828}" +
                 ".website-item{background:#E3F2FD;border:1px solid #2196F3}" +
                 ".player-video-item{background:#FFF8E1;border:1px solid #FF9800}" +
+                "button:focus,input:focus,textarea:focus,select:focus{outline:3px solid #FF5722;outline-offset:1px}" +
                 "</style></head><body>" +
                 "<h1>📺 新闻直播配置</h1>" +
                 "<div class='tip'>💡 按住卡片左上角 ☰ 手柄上下拖动调整顺序（仅手柄区域可拖动） | 频道+/-切换网站</div>" +
@@ -8563,6 +8564,56 @@ public class MainActivity extends AppCompatActivity {
                 "    }).catch(function(){});" +
                 "  },1000);" +
                 "}" +
+                "</script>" +
+                "<script>" +
+                // 遥控器支持：上下键逐元素移焦，输入框按OK才进入编辑（避免遥控经过弹键盘干扰）
+                "(function(){" +
+                "var tvMode=false;" +
+                "function visibles(){" +
+                "var els=document.querySelectorAll('button,input,textarea,select,a[href],[tabindex]');" +
+                "var out=[];" +
+                "for(var i=0;i<els.length;i++){var el=els[i];" +
+                "if(el.disabled)continue;" +
+                "var tb=el.getAttribute&&el.getAttribute('tabindex');if(tb==='-1')continue;" +
+                "var r=el.getBoundingClientRect();if(r.width<=0||r.height<=0)continue;" +
+                "out.push(el);}" +
+                "return out;}" +
+                "function center(el){try{var r=el.getBoundingClientRect();" +
+                "window.scrollBy(0,r.top-window.innerHeight/2+r.height/2);}catch(e){}}" +
+                "function move(dir){var list=visibles();if(!list.length)return;" +
+                "var idx=list.indexOf(document.activeElement);var n;" +
+                "if(idx<0)n=dir>0?0:list.length-1;" +
+                "else{n=idx+dir;if(n<0)n=list.length-1;if(n>=list.length)n=0;}" +
+                "var el=list[n];el.focus();center(el);}" +
+                "function lockAll(){var els=document.querySelectorAll('input,textarea');" +
+                "for(var i=0;i<els.length;i++){var el=els[i];" +
+                "if(el.disabled||el.type==='checkbox')continue;" +
+                "if(!el.readOnly)el.readOnly=true;}}" +
+                "function isEdit(el){return el&&((el.tagName==='INPUT'&&el.type!=='checkbox')||el.tagName==='TEXTAREA');}" +
+                "document.addEventListener('keydown',function(e){" +
+                "var k=e.keyCode;var el=document.activeElement;" +
+                "if(el&&el.tagName==='SELECT')return;" +
+                "if(k===40||k===38){" +
+                "if(!tvMode){tvMode=true;lockAll();}" +
+                "if(isEdit(el)&&!el.readOnly)return;" +
+                "e.preventDefault();move(k===40?1:-1);return;}" +
+                "if(k===13&&isEdit(el)){" +
+                "e.preventDefault();" +
+                "if(el.readOnly){el._tvU=true;el.readOnly=false;el.blur();" +
+                "setTimeout(function(){try{el.focus();}catch(x){}},60);}" +
+                "else{el.blur();}" +
+                "return;}" +
+                "if(k===13&&el&&el.tagName==='INPUT'&&el.type==='checkbox'){" +
+                "e.preventDefault();el.click();return;}" +
+                "},true);" +
+                "document.addEventListener('focusout',function(e){" +
+                "if(!tvMode)return;" +
+                "var el=e.target;" +
+                "if(!el||!isEdit(el))return;" +
+                "if(el._tvU){el._tvU=false;return;}" +
+                "el.readOnly=true;" +
+                "},true);" +
+                "})();" +
                 "</script></body></html>";
         }
     }
