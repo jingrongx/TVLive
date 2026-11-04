@@ -490,6 +490,8 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // 第一时间安装崩溃捕获：越早装越能抓到启动期崩溃（含布局加载失败）
+        CrashHandler.install(this);
         super.onCreate(savedInstanceState);
         // 初始化日志落盘（自动保存+轮转清理）
         LogUtil.init(this);

@@ -44,6 +44,10 @@ android {
         }
     }
 
+    buildFeatures {
+        buildConfig true   // 崩溃报告需要读取 BuildConfig.VERSION_NAME/CODE
+    }
+
     buildTypes {
         release {
             minifyEnabled false
