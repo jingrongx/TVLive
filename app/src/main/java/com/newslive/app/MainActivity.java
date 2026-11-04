@@ -492,6 +492,8 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         // 第一时间安装崩溃捕获：越早装越能抓到启动期崩溃（含布局加载失败）
         CrashHandler.install(this);
+        // 上次运行若有未查看的崩溃报告，先弹出来给用户看（截图反馈定位问题）
+        CrashHandler.showPreviousCrashIfAny(this);
         super.onCreate(savedInstanceState);
         // 初始化日志落盘（自动保存+轮转清理）
         LogUtil.init(this);
