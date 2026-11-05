@@ -13,6 +13,7 @@ import android.content.pm.PackageManager;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
+import android.net.NetworkInfo;
 import android.net.NetworkRequest;
 import android.net.Uri;
 import android.os.Build;
@@ -1005,13 +1006,19 @@ public class MainActivity extends AppCompatActivity {
     
     private boolean isNetworkConnected() {
         if (connectivityManager == null) return false;
-        Network network = connectivityManager.getActiveNetwork();
-        if (network == null) return false;
-        NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
-        // 只要具备INTERNET能力即认为已联网（不强制要求VALIDATED，
-        // 因为电视开机后网络验证可能延迟完成，导致误判为无网络而无法播放）
-        return capabilities != null &&
-               capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        if (Build.VERSION.SDK_INT >= 23) {
+            Network network = connectivityManager.getActiveNetwork();
+            if (network == null) return false;
+            NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
+            // 只要具备INTERNET能力即认为已联网（不强制要求VALIDATED，
+            // 因为电视开机后网络验证可能延迟完成，导致误判为无网络而无法播放）
+            return capabilities != null &&
+                   capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        }
+        // API 22及以下（如比亚迪车机Android 5.1.1）没有getActiveNetwork()（API 23引入，
+        // 直接调用会NoSuchMethodError启动即崩），改用传统NetworkInfo接口
+        NetworkInfo info = connectivityManager.getActiveNetworkInfo();
+        return info != null && info.isConnected();
     }
     
     private void updateNetworkInfo() {
@@ -1019,26 +1026,47 @@ public class MainActivity extends AppCompatActivity {
         int color = 0xFFE53935;
 
         if (isNetworkAvailable && connectivityManager != null) {
-            Network network = connectivityManager.getActiveNetwork();
-            NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
-            if (capabilities != null) {
-                if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                    networkType = "WiFi";
-                    color = 0xFF43A047;
-                } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
-                    networkType = "移动网络";
-                    color = 0xFFFFA726;
-                } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
-                    networkType = "有线网络";
-                    color = 0xFF43A047;
+            if (Build.VERSION.SDK_INT >= 23) {
+                Network network = connectivityManager.getActiveNetwork();
+                NetworkCapabilities capabilities = connectivityManager.getNetworkCapabilities(network);
+                if (capabilities != null) {
+                    if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                        networkType = "WiFi";
+                        color = 0xFF43A047;
+                    } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                        networkType = "移动网络";
+                        color = 0xFFFFA726;
+                    } else if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                        networkType = "有线网络";
+                        color = 0xFF43A047;
+                    } else {
+                        // 有活动网络但类型未识别（如正在验证）：不误报"无网络"
+                        networkType = "已连接";
+                        color = 0xFF43A047;
+                    }
                 } else {
-                    // 有活动网络但类型未识别（如正在验证）：不误报"无网络"
                     networkType = "已连接";
                     color = 0xFF43A047;
                 }
             } else {
-                networkType = "已连接";
-                color = 0xFF43A047;
+                // API 22及以下没有getActiveNetwork()，用NetworkInfo识别网络类型
+                NetworkInfo info = connectivityManager.getActiveNetworkInfo();
+                if (info != null && info.isConnected()) {
+                    int type = info.getType();
+                    if (type == ConnectivityManager.TYPE_WIFI) {
+                        networkType = "WiFi";
+                        color = 0xFF43A047;
+                    } else if (type == ConnectivityManager.TYPE_MOBILE) {
+                        networkType = "移动网络";
+                        color = 0xFFFFA726;
+                    } else if (type == ConnectivityManager.TYPE_ETHERNET) {
+                        networkType = "有线网络";
+                        color = 0xFF43A047;
+                    } else {
+                        networkType = "已连接";
+                        color = 0xFF43A047;
+                    }
+                }
             }
         }
 
